@@ -883,6 +883,327 @@ def test_the_dashboard_ask_route_refuses_mid_round(tmp_path, monkeypatch):
     assert "ask_user" in body["error"]
 
 
+# ---- the dashboard's Submit button: what it queues is what is in the box ----
+#
+# An AUTHORIZATION gap, not a cosmetic one. `/api/intake/submit` reads the
+# FILE — `submit_draft` re-parses whatever is on disk at that instant — and the
+# textarea is a VIEW of that file. `approved_paths` lives inside it, suggested
+# mechanically by `path_suggest` and authorized by nothing until this click. So
+# a Submit that posted straight to `/api/intake/submit` would file the paths on
+# DISK while the operator was looking at the ones they had just typed over
+# them, and the page would report success. The task then arrives carrying a
+# scope nobody confirmed, which is the circularity `path_suggest`'s docstring
+# and `docs/SECURITY.md` #2 both exist to prevent.
+#
+# Three properties carry the fix, and each is asserted by RUNNING the page's own
+# handler under node rather than by grepping the page for a URL:
+#
+#   * Submit SAVES FIRST, and that save carries the box's exact bytes.
+#   * It queues only AFTER the save succeeded.
+#   * A failed save queues NOTHING and says so, in words that tell the operator
+#     nothing landed — "refuses" and "refuses legibly" are different, and an
+#     operator who sees a bare error presses Submit again.
+#
+# A grep can decide none of them: a handler that posts the two URLs in the
+# wrong order, or sends `{id}` with no `text`, or sends stale text, or ignores
+# the save's status, still contains every string a grep would look for. The
+# assertions are therefore on the exact call SEQUENCE and on the exact PAYLOAD,
+# both by equality — `urls` equals a two-element list, never "contains submit"
+# — because the failure path is the one that passes vacuously if the harness
+# bound nothing and `CALLS` stayed empty.
+#
+# This is one half of the claim. The other half is
+# `test_the_dashboard_reads_and_writes_the_same_file_the_cli_does` above: this
+# proves the button sends the box, that proves the server files what was sent.
+
+
+def intake_panel_js() -> str:
+    """The intake panel's handlers, lifted verbatim out of the served page.
+
+    Between the two markers the only free names are `fetch`, `document`, `JSON`
+    and `LASTJSON`, so the region executes as-is under the stub below. Lifted
+    rather than re-typed: a test that re-implemented the handler would grade
+    its own copy, and the copy is not what the operator presses.
+    """
+    from autoloop.dashboard import PAGE
+
+    script = PAGE.split("<script>", 1)[1]
+    return script.split("// INTAKE_PANEL_START", 1)[1].split("// INTAKE_PANEL_END", 1)[0]
+
+
+def run_js(source: str) -> str:
+    """Run `source` under node and return its stdout.
+
+    A local copy of `test_dashboard.py`'s helper of the same name, because
+    `autoloop/tests/` is not a package and these files duplicate rather than
+    import. Skipped when node is absent rather than faked: a hand-rolled JS
+    interpreter would be grading the interpreter.
+    """
+    import shutil
+    import tempfile
+
+    node = shutil.which("node")
+    if node is None:  # pragma: no cover - environment without node
+        pytest.skip("node is required to run the page's own handlers")
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".js", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(source)
+        path = handle.name
+    result = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"the page's handlers threw:\n{result.stderr[:800]}"
+    return result.stdout
+
+
+#: The stub DOM the region is executed against. One DISTINCT object per id, on
+#: purpose: a shared mock would let each `addEventListener` overwrite the last,
+#: and a test that "clicked Submit" would then be running whatever was bound
+#: most recently while every assertion below still passed.
+_PANEL_HEAD = """
+const CALLS = [];
+let LASTJSON = "untouched";
+const mk = () => ({
+  className: "", textContent: "", value: "", listeners: {},
+  addEventListener(type, fn) { this.listeners[type] = fn; },
+  elements: {id: {value: ""}, idea: {value: ""}},
+  reset() {},
+});
+const NODES = {};
+for (const id of ["iknote", "iktext", "ikstate", "ikid", "intakenew",
+                  "ikload", "ikask", "iksave", "iksubmit"])
+  NODES[id] = mk();
+const document = {getElementById: id => NODES[id]};
+const RESPONSES = __RESPONSES__;
+const fetch = async (url, opts) => {
+  CALLS.push({url: url,
+              body: opts && opts.body ? JSON.parse(opts.body) : null,
+              header: opts && opts.headers ? opts.headers["X-Autoloop"] : null});
+  const reply = RESPONSES[url];
+  // Every url a handler may reach is registered by the test, INCLUDING the
+  // ones it must not reach — so a wrong call lands in CALLS and is asserted
+  // against, rather than throwing something the reader has to interpret.
+  if (!reply) throw new Error("the handler posted to an unregistered url: " + url);
+  // `throws` is a server that is not there at all: `fetch` REJECTS, which is a
+  // different failure from a 4xx and the one a handler is likeliest to drop.
+  if (reply.throws) throw new TypeError(reply.throws);
+  return {ok: reply.ok, json: async () => reply.body};
+};
+"""
+
+_PANEL_TAIL = """
+// The operator types over the mechanically suggested scope, then presses the
+// button. Nothing else touches the textarea.
+NODES.ikid.value = "reader";
+NODES.iktext.value = __TEXT__;
+(async () => {
+  const button = NODES[__BUTTON__];
+  if (!button.listeners.click)
+    throw new Error("no click handler was bound to " + __BUTTON__);
+  await button.listeners.click();
+  console.log(JSON.stringify({
+    urls: CALLS.map(c => c.url),
+    first: CALLS.length ? CALLS[0].body : null,
+    headers: CALLS.map(c => c.header),
+    box: NODES.iktext.value,
+    note: NODES.iknote.textContent,
+    cls: NODES.iknote.className,
+    lastjson: LASTJSON,
+  }));
+})();
+"""
+
+
+def click_intake(button: str, text: str, responses: dict) -> dict:
+    """Press one intake button in the real handler and report what it did."""
+    harness = (
+        _PANEL_HEAD.replace("__RESPONSES__", json.dumps(responses))
+        + intake_panel_js()
+        + _PANEL_TAIL.replace("__TEXT__", json.dumps(text)).replace(
+            "__BUTTON__", json.dumps(button)
+        )
+    )
+    return json.loads(run_js(harness))
+
+
+#: What the operator types over the mechanically suggested scope. The trailing
+#: comment is not decoration: it makes the line impossible to confuse with one
+#: `path_suggest` could have written, so "which scope was sent" is decidable.
+RETYPED_SCOPE = "  - docs/AUTOLOOP.md  # retyped by the operator in the box"
+
+
+def retyped_scope(intake_dir: Path, repo: Path) -> tuple[str, str, str]:
+    """A real ready draft, a copy whose suggested scope was retyped, and the
+    scope line that copy replaced.
+
+    The edit is the one the reviewer named: the operator changes the
+    `approved_paths` list in the box and presses Submit. Only the scope LINE is
+    compared, never the whole text — `READY_IDEA` names `autoloop/dashboard.py`
+    in the idea itself, so a whole-text "is it gone" check would be asserting
+    against the operator's own sentence rather than against the authorization.
+    """
+    text = ready_draft(intake_dir, repo).read_text(encoding="utf-8")
+    lines = text.splitlines()
+    suggested = next(
+        line for line in lines
+        if line.startswith("  - ") and "autoloop/dashboard.py" in line
+    )
+    edited = "\n".join(RETYPED_SCOPE if line == suggested else line for line in lines)
+    edited += "\n"
+    assert RETYPED_SCOPE in edited and RETYPED_SCOPE not in text
+    assert suggested in text and suggested not in edited
+    return text, edited, suggested
+
+
+def test_the_dashboard_submit_button_saves_the_box_before_it_queues(
+    intake_dir, repo
+):
+    """The measured failure, at the handler. The box holds a scope that is not
+    the one on disk; the save must carry those exact bytes, and the queue call
+    must come after it."""
+    on_disk, edited, suggested = retyped_scope(intake_dir, repo)
+    assert on_disk != edited
+
+    out = click_intake(
+        "iksubmit",
+        edited,
+        {
+            "/api/intake/edit": {"ok": True, "body": {"id": "reader", "saved": True}},
+            "/api/intake/submit": {"ok": True, "body": {"queued": ["reader"]}},
+        },
+    )
+
+    assert out["urls"] == ["/api/intake/edit", "/api/intake/submit"], (
+        "the save is a precondition of queueing, so it is the FIRST call"
+    )
+    # …and it carried the box, not the id alone and not the older text. This is
+    # the assertion the ordering one cannot make: a handler that posted
+    # `{id, text: ""}` would order its calls correctly and still discard the
+    # operator's scope.
+    assert out["first"] == {"id": "reader", "text": edited}
+    assert RETYPED_SCOPE in out["first"]["text"], "the retyped scope was sent"
+    assert suggested not in out["first"]["text"], (
+        "the mechanically suggested scope was NOT the one authorized"
+    )
+    # Both calls carry the header the server requires, or the save would have
+    # been refused 403 and this test would be grading a failure it invented.
+    assert out["headers"] == ["1", "1"]
+    assert out["note"] == " ✓ queued reader" and out["cls"] == "saved"
+    assert out["lastjson"] is None, "the success path ran to the end"
+
+
+def test_the_dashboard_submit_button_queues_nothing_when_the_save_fails(
+    intake_dir, repo
+):
+    """The fail-open case. If the save is best-effort, a save that failed leaves
+    the operator's edit on the page and the OLD text on disk — and submitting
+    then authorizes paths nobody confirmed, while the page says "queued".
+
+    `/api/intake/submit` is registered here even though it must not be called:
+    a handler that called it anyway shows up in `urls` and fails on the
+    equality below, instead of throwing.
+    """
+    _, edited, _ = retyped_scope(intake_dir, repo)
+
+    out = click_intake(
+        "iksubmit",
+        edited,
+        {
+            "/api/intake/edit": {"ok": False, "body": {"error": "no such draft"}},
+            "/api/intake/submit": {"ok": True, "body": {"queued": ["reader"]}},
+        },
+    )
+
+    assert out["urls"] == ["/api/intake/edit"], "a failed save must queue nothing"
+    assert out["first"] == {"id": "reader", "text": edited}, (
+        "the save was attempted with the box — an empty CALLS list would pass "
+        "the assertion above for the wrong reason"
+    )
+    assert out["cls"] == "savefail"
+    assert "no such draft" in out["note"]
+    assert "nothing was queued" in out["note"], (
+        "an operator told only 'refused' presses Submit again"
+    )
+    assert out["lastjson"] == "untouched", "the success path did not run"
+    assert out["box"] == edited, "and the edit is still on the page to retry"
+
+
+def test_the_dashboard_submit_button_reports_the_three_quiet_failures(
+    intake_dir, repo
+):
+    """The three ways "it failed" arrives without an error message, all on the
+    same draft so the fixture is built once.
+
+    Each is fail-CLOSED on authorization — nothing is queued in any of them —
+    and each was silent before: a button that does nothing is pressed again.
+    """
+    _, edited, _ = retyped_scope(intake_dir, repo)
+    submit_ok = {"ok": True, "body": {"queued": ["reader"]}}
+
+    # 1. The server is not there at all. `fetch` REJECTS rather than answering,
+    #    which is not a status code and cannot be read off `r.ok`.
+    down = click_intake(
+        "iksubmit",
+        edited,
+        {"/api/intake/edit": {"throws": "Failed to fetch"}, "/api/intake/submit": submit_ok},
+    )
+    assert down["urls"] == ["/api/intake/edit"]
+    assert "Failed to fetch" in down["note"] and "nothing was queued" in down["note"]
+    assert down["cls"] == "savefail" and down["lastjson"] == "untouched"
+
+    # 2. A refusal whose body carries no `error` — a proxy's HTML 502, say.
+    #    `body.error` is undefined and the note would otherwise be " ✗ undefined".
+    mute = click_intake(
+        "iksubmit",
+        edited,
+        {"/api/intake/edit": {"ok": False, "body": {}}, "/api/intake/submit": submit_ok},
+    )
+    assert mute["urls"] == ["/api/intake/edit"]
+    assert mute["note"] == " ✗ could not save — nothing was queued"
+
+    # 3. The save worked and the SUBMIT was refused — the draft is not ready,
+    #    say. The page must not report a queue that never happened.
+    refused = click_intake(
+        "iksubmit",
+        edited,
+        {"/api/intake/edit": {"ok": True, "body": {"saved": True}},
+         "/api/intake/submit": {"ok": False, "body": {"error": "not finished"}}},
+    )
+    assert refused["urls"] == ["/api/intake/edit", "/api/intake/submit"]
+    assert refused["note"] == " ✗ not finished" and refused["cls"] == "savefail"
+    assert refused["lastjson"] == "untouched", "nothing was queued, so nothing refreshes"
+
+
+def test_the_dashboard_ask_button_keeps_the_same_save_first_rule(intake_dir, repo):
+    """Ask and Submit share `iksaveFirst`, so the shared helper is driven from
+    both sides. Ask re-reads the file too and then OVERWRITES the box with the
+    server's copy — which is why an unsaved answer would be lost silently."""
+    _, edited, _ = retyped_scope(intake_dir, repo)
+    ok = {
+        "/api/intake/edit": {"ok": True, "body": {"id": "reader", "saved": True}},
+        "/api/intake/ask": {
+            "ok": True,
+            "body": {"text": "the server's copy\n", "ready": False,
+                     "blockers": [], "pass": {"added_questions": ["? a", "? b"]}},
+        },
+    }
+    asked = click_intake("ikask", edited, ok)
+
+    assert asked["urls"] == ["/api/intake/edit", "/api/intake/ask"]
+    assert asked["first"] == {"id": "reader", "text": edited}
+    assert asked["box"] == "the server's copy\n", "the pass owns the box afterwards"
+    assert asked["note"] == " ✓ 2 new question(s)"
+
+    refused = click_intake(
+        "ikask",
+        edited,
+        {"/api/intake/edit": {"ok": False, "body": {"error": "no such draft"}},
+         "/api/intake/ask": ok["/api/intake/ask"]},
+    )
+    assert refused["urls"] == ["/api/intake/edit"], "a failed save must ask nothing"
+    assert "nothing was asked" in refused["note"] and refused["cls"] == "savefail"
+    assert refused["box"] == edited, "the unsaved answers are still on the page"
+
+
 # ---- the CLI entry point ----------------------------------------------------
 
 

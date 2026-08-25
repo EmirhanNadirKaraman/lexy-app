@@ -4749,7 +4749,8 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       that queues anything, and it queues through the same inbox as the form
       above. The <code>approved_paths</code> in the draft are SUGGESTED
       mechanically and authorize nothing: editing them and submitting is the
-      confirmation.</p>
+      confirmation — so Ask and Submit both write this box out first, and
+      neither goes ahead if that write fails. What you queue is what you see.</p>
   </section>
   <section><h2>Language-app tasks</h2><div id="apptasks" class="scroll"></div></section>
   <section><h2>Blockers</h2><div id="blockers"></div></section>
@@ -6185,6 +6186,13 @@ ntform.addEventListener("submit", async e => {
 // mid-idea leaves a file and nothing else. There is no client-side draft
 // format here on purpose: `autoloop.inbox` parses and renders it, and a second
 // parser on this page would drift from the one that decides what gets filed.
+//
+// Everything between the two markers is lifted out of this page and RUN under
+// node by `test_intake.py::test_the_dashboard_submit_button_*`, with a stub DOM
+// and a stub `fetch`. Keep it self-contained — the only free names it may use
+// are `fetch`, `document`, `JSON` and `LASTJSON` — or those tests stop being
+// able to execute the handler they exist to grade.
+// INTAKE_PANEL_START
 const ikn = document.getElementById("iknote");
 const iktext = document.getElementById("iktext");
 const ikstate = document.getElementById("ikstate");
@@ -6195,11 +6203,20 @@ const iknote = (ok, msg) => {
   ikn.textContent = (ok ? " ✓ " : " ✗ ") + msg;
 };
 const ikpost = async (url, payload) => {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
-    body: JSON.stringify(payload),
-  });
+  let r;
+  try {
+    r = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    // A server that is down is a FAILED call, not an absent one. Every caller
+    // below reads `ok === false` as "stop and say so", so a rejection escaping
+    // here would abort the handler silently — the operator would see a button
+    // that did nothing and press it again.
+    return [false, {error: String(err)}];
+  }
   return [r.ok, await r.json().catch(() => ({}))];
 };
 // `ready` is never computed here — it is whatever the server said, which is
@@ -6240,14 +6257,27 @@ document.getElementById("iksave").addEventListener("click", async () => {
   iknote(ok, ok ? "saved " + id : (body.error || "refused"));
   if (ok) ikload();
 });
+// Ask and Submit BOTH re-read the FILE on the server, so both must write the
+// box out first and both must STOP when that write fails. One helper, because
+// two copies of this rule are two chances for one of them to lose it.
+//
+// Asking with unsaved answers would ask about the previous version and then
+// overwrite the box with it, silently discarding what was typed. Submitting
+// with unsaved edits is worse: `approved_paths` lives in that text, suggested
+// mechanically and authorized by this click — so an operator who NARROWS the
+// suggested scope and presses Submit would file the WIDER paths still on disk,
+// and the page would report success. The save is therefore a precondition of
+// queueing, not a convenience: a failed save queues nothing and says so.
+const iksaveFirst = async (id, undone) => {
+  const [ok, body] = await ikpost("/api/intake/edit", {id, text: iktext.value});
+  if (!ok) iknote(false, (body.error || "could not save") + " — nothing was " + undone);
+  return ok;
+};
 document.getElementById("ikask").addEventListener("click", async () => {
   const id = String(ikid.value || "").trim();
   ikn.className = ""; ikn.textContent = " asking… (this talks to a model)";
-  // Edits are saved FIRST: a pass re-reads the file, so asking with unsaved
-  // answers in the box would ask about the previous version and then overwrite
-  // the box with it — silently discarding what was typed.
-  const [saved, savedBody] = await ikpost("/api/intake/edit", {id, text: iktext.value});
-  if (!saved) return iknote(false, savedBody.error || "could not save before asking");
+  const saved = await iksaveFirst(id, "asked");
+  if (!saved) return;
   const [ok, body] = await ikpost("/api/intake/ask", {id});
   if (!ok) return iknote(false, body.error || "refused");
   ikrender(body);
@@ -6255,11 +6285,14 @@ document.getElementById("ikask").addEventListener("click", async () => {
 });
 document.getElementById("iksubmit").addEventListener("click", async () => {
   const id = String(ikid.value || "").trim();
+  const saved = await iksaveFirst(id, "queued");
+  if (!saved) return;
   const [ok, body] = await ikpost("/api/intake/submit", {id});
   if (!ok) return iknote(false, body.error || "refused");
   iknote(true, "queued " + (body.queued || []).join(", "));
   LASTJSON = null;
 });
+// INTAKE_PANEL_END
 
 // ---- roadmap search + expand-all ---------------------------------------
 // Bound ONCE, here, because both controls are static markup — inside

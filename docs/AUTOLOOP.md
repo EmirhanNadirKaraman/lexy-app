@@ -3573,6 +3573,23 @@ The dashboard's Intake panel does the same four things over
 `/api/intake/submit`, plus `GET /api/intake?id=<slug>` — by calling the same
 functions, with no draft format of its own.
 
+**Its Ask and Submit buttons save the textarea first, and stop if that save
+fails.** Both server routes re-read the FILE — `interview_step` and
+`submit_draft` parse what is on disk at that instant — while the textarea is
+only a view of it. `approved_paths` is inside that text, suggested mechanically
+and authorized by the Submit click, so a Submit that posted straight to
+`/api/intake/submit` would file the paths on DISK while the operator was
+reading the ones they had just typed over them, and the page would say
+"queued". One helper (`iksaveFirst`) carries the rule for both buttons: it
+posts the box to `/api/intake/edit`, and on a failed save it reports that
+nothing was queued (or asked) and returns without calling the second route. A
+`fetch` that REJECTS — the server is not running — counts as a failed call
+rather than an absent one, so the panel says so instead of leaving a button
+that appears to do nothing. The handlers are lifted out of the page between the
+`INTAKE_PANEL` markers and run under node by `test_intake.py`, which asserts
+the call sequence and the first call's payload by equality — a grep cannot tell
+the two orders apart.
+
 ## 4g. The validation-environment boundary (test DB credentials)
 
 **The problem.** A task may declare validation that needs a database — `rt-01`
