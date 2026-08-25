@@ -7005,13 +7005,14 @@ So the rule is stated once, for every handler:
 `push_candidate_unresolvable` therefore has two task-arm outcomes rather than
 one. When the record still names a candidate that resolves — the ordinary
 `push_candidate_stale` shape, "a later round advanced it" — that candidate is
-re-presented and the very next round is approvable. When the record's own
-candidate is the unresolvable one, which is the usual way this code is reached on
-the task arm, there is nothing to re-present and dropping the pointer would
-change none of the causal stale state; the rebuild routes to
-`_rebuild_execution_record_at_head` with its own cause string, inheriting
-recut-01's refusals and `MAX_TASK_RECUTS` rather than adding a third archival
-mechanism.
+re-presented and the very next round is approvable. When **git itself answers
+that the worker repository does not hold** the candidate the record names — the
+usual way this code is reached on the task arm — there is nothing to re-present
+and dropping the pointer would change none of the causal stale state; the rebuild
+routes to `_rebuild_execution_record_at_head` with its own cause string,
+inheriting recut-01's refusals and `MAX_TASK_RECUTS` rather than adding a third
+archival mechanism. Any OTHER outcome of that question parks with the record
+intact — see the tri-state paragraph below, which governs both arms.
 
 `push_candidate_stale`'s other stated cause — "the execution record is gone" —
 splits on the REGISTRY rather than on the record's absence, because absence alone
@@ -7026,8 +7027,9 @@ for a human, so it parks. Reading absence alone halts the loop over a fault whos
 cause was already cleared.
 
 One refusal inside the archive route is switchable, and only on proven evidence:
-`candidate_resolves=False`, set by the push arm after it has read the commit out
-of the worker repository and failed. Without it the route is unreachable for the
+`candidate_resolves=False`, set by the push arm **only when git answered that the
+worker repository's object database does not hold the commit**, never merely
+because a read of it failed. Without it the route is unreachable for the
 shape it exists for — the record's current candidate WAS presented in its own
 round, so `sent_postcommits` names it and `_recut_outstanding_verdict` reports a
 verdict still in flight. That refusal protects work an approval could still
@@ -7046,21 +7048,38 @@ survives. An entry whose candidate git reports it does NOT hold can render no
 packet and could never be published by any approval, so it is dropped — with its
 whole record written to the transcript first, because an operator queued it.
 
-**A question the repository could not answer is not an answer, and this is the
-one arm where getting that wrong destroys something.** `_commit_presence` is
-therefore tri-state: `True` and `False` only when git itself said so, `None`
-when it did not, and only `False` authorizes dropping the entry. `cat-file
-commit` dies with the SAME status for a missing object, a corrupt one, an I/O
-error and a policy refusal, so its failure proves nothing; `GitGateway.
-object_exists` is the one probe whose exit code carries the distinction (0
-present, 1 absent, anything else raises), which is why `cli._candidate_is_
-retired` is built the same way. No gateway at all, a repository that is not
-there, an entry that is not a readable record, and an entry naming no candidate
-all park with the queued review exactly where it was — the state the loop was
-already in when it asked. The first cut had two values here and dropped the
-operator's review on every one of those, i.e. it fail-opened in the destructive
-direction: the record this feature can destroy is the only one that exists
-nowhere else once the state file is rewritten.
+**A question the repository could not answer is not an answer, and BOTH arms that
+can destroy a record go through the same tri-state probe.** `_commit_presence`
+answers `True` or `False` only when git itself said so and `None` when it did
+not, and only `False` authorizes destroying anything. `cat-file commit` dies with
+the SAME status for a missing object, a corrupt one, an I/O error and a policy
+refusal, so its failure proves nothing; `GitGateway.object_exists` is the one
+probe whose exit code carries the distinction (0 present, 1 absent, anything else
+raises), which is why `cli._candidate_is_retired` is built the same way.
+
+* the CHANGESET arm asks the checkout about an operator's queued candidate. No
+  gateway at all, a repository that is not there, an entry that is not a readable
+  record, and an entry naming no candidate all park with the queued review
+  exactly where it was.
+* the TASK arm asks a task's WORKER REPOSITORY about the candidate its execution
+  record names, and its `False` is the more consequential of the two: it archives
+  a live execution record, quarantines the worker, and is the one thing licensed
+  to bypass `_recut_outstanding_verdict`. `None` there parks with the record, the
+  worker, the approval pointers and that refusal all intact.
+
+The same fail-open was shipped twice — the changeset arm in the first cut, the
+task arm surviving the fix to it, where `read_commit`/`tree_of` in one `try`
+turned a transient failure, a policy refusal, a corrupt object, an I/O error or a
+worker directory removed under the loop into "the candidate is gone" and threw
+away work an approval still in flight could publish. Both are fail-opens in the
+DESTRUCTIVE direction, which is why neither is allowed to infer absence.
+
+Presence is asked about the COMMIT only, so an object that exists but does not
+read as one answers `True` — "present" is the fail-closed reading of an
+undiagnosed shape. The task arm's second probe, `tree_of`, is therefore separate
+and REFUSES rather than archives: an unresolvable tree is not git reporting the
+candidate absent. It is still probed, and before dispatch, because the binder
+reads it too and discovering it later would raise inside `_step_ready`.
 
 **Nothing that swaps the outbox leaves the old packet's delivery state behind.**
 Every rebuild goes through `_replace_outbox`, which clears `outbox_diff` and

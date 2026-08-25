@@ -65,6 +65,22 @@ them drops, and it is the one where `git cat-file -e` itself answered no
 unanswered and assert the review is still there. "It parks" is the correct
 outcome for every one of those — the park is the state the loop was already in.
 
+**The third mistake: the SAME fail-open, on the other arm, surviving the fix to
+the first.** The task arm asked its worker repository the same question with the
+same two-value answer — `read_commit`/`tree_of` in one `try`, any failure read as
+"unresolvable" — and its `False` is more consequential than the changeset arm's,
+because it archives a live execution record, quarantines the worker AND is the
+one thing licensed to bypass `_recut_outstanding_verdict`. So a transient git
+failure, a policy refusal, a corrupt object, an I/O error or a worker directory
+that had been removed would each have thrown away a candidate an approval still
+in flight could publish. It now goes through the same `_commit_presence`, and the
+four tests under "the worker-repository presence probe" below are the matrix:
+explicit absence archives; exit 128 parks; an OSError parks; an object that IS
+there but whose tree will not resolve parks. Each park is asserted on the four
+things that must survive it — the record, the worker, the approval pointers and
+the outbox — because "it parked" alone would also pass against code that parked
+after archiving.
+
 Self-contained per this codebase's convention (see `test_blockers.py`) — the
 config/orchestrator helpers are duplicated here rather than imported from
 `test_autonomous_recovery.py` or `test_recut.py`.
@@ -83,6 +99,7 @@ from pathlib import Path
 import pytest
 
 from autoloop import cli
+from autoloop import orchestrator as orchestrator_module
 from autoloop.changeset_review import build_changeset_binding, build_changeset_packet
 from autoloop.blockers import (
     AUTONOMOUS_RECOVERIES,
@@ -102,7 +119,7 @@ from autoloop.blockers import (
 )
 from autoloop.config import AutoloopConfig, AutonomyConfig, BrowserConfig
 from autoloop.contract import Decision, Directive
-from autoloop.errors import GitCommandError, StateCorruptError, TaskGraphError
+from autoloop.errors import StateCorruptError, TaskGraphError
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import (
@@ -419,17 +436,50 @@ def probing_runner(answers):
     unreadable repository). Scripted rather than produced by corrupting a real
     repository, because those failures cannot be produced portably and the code
     under test keys on the exit status either way.
+
+    A value that is an EXCEPTION rather than an exit code is raised instead of
+    returned, which is the one failure shape no exit code can express: the
+    subprocess never ran at all (`OSError` — the working directory is gone, a
+    file handle limit, git not on PATH). `GitGateway._git` does not catch it, so
+    it surfaces from `object_exists` exactly as it would in production, and
+    `_commit_presence` must read it as "unanswered" rather than as "absent".
     """
 
     def run(argv, **kwargs):
-        for prefix, rc in answers.items():
+        for prefix, answer in answers.items():
             if tuple(argv[1:1 + len(prefix)]) == tuple(prefix):
+                if isinstance(answer, BaseException) or (
+                    isinstance(answer, type) and issubclass(answer, BaseException)
+                ):
+                    raise answer
                 return subprocess.CompletedProcess(
-                    argv, rc, stdout="", stderr="fatal: scripted git failure"
+                    argv, answer, stdout="", stderr="fatal: scripted git failure"
                 )
         return subprocess.run(argv, **kwargs)
 
     return run
+
+
+def scripted_worker_gateway(monkeypatch, worker_path, answers):
+    """Script the gateway `_rebuild_task_review_at_head` builds for THIS worker
+    repository, and leave every other gateway in the process real.
+
+    That handler constructs its own `GitGateway(Path(execution.worktree_path),
+    self._policy)` — there is no runner seam to inject through, deliberately, so
+    the test reaches the module-level name instead of the class. Narrowed by
+    repository root because the archive path that may run afterwards
+    (`release_task_to_pending` → `WorkerRepoManager.retire`) touches git too, and
+    a process-wide script would be answering for commands this test is not
+    about.
+    """
+    real = orchestrator_module.GitGateway
+
+    def factory(repo_root, policy, *args, **kwargs):
+        if Path(repo_root) == Path(worker_path):
+            kwargs.setdefault("runner", probing_runner(answers))
+        return real(repo_root, policy, *args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "GitGateway", factory)
 
 
 class ChangesetWiring:
@@ -623,9 +673,14 @@ class PostcommitWiring:
         #: The candidate an APPROVAL names — the one a later round advanced past.
         #: A real commit, so nothing here passes for want of a resolvable object.
         self.approved_sha = self.base_sha
+        # `ABSENT_SHA`, never the null oid: since the presence probe is
+        # tri-state, "missing" has to mean the shape `git cat-file -e` answers
+        # exit 1 to. The all-zeros name is git-special and can die 128 instead,
+        # which is not an answer — that would turn this case into a park for a
+        # reason having nothing to do with what it is testing.
         self.recorded_sha = {
             "commit": self.candidate_sha,
-            "missing": "0" * 40,
+            "missing": ABSENT_SHA,
             "": "",
         }[candidate]
 
@@ -1078,17 +1133,22 @@ def test_push_candidate_unresolvable_on_the_task_arm_archives_and_requeues(
     because that seam is how this refusal is reachable at all (a prune, a
     corrupt object): `is_descendant` RAISES rather than returning False for an
     object git cannot resolve, so a sha that was never there would never get
-    this far."""
+    this far.
+
+    **Scripted at BOTH probes, and that is the whole point of the rewrite.** The
+    earlier version made `read_commit` raise and left the object in place, so it
+    proved only "a read failed" — under a tri-state probe `cat-file -e` then
+    answers 0 and the correct outcome is a rebuild, not an archive. Archiving is
+    authorized here because git ANSWERS exit 1: the object database does not hold
+    it. `("cat-file", "commit"): 128` is the prune's own shape (`cat-file commit`
+    dies identically for a missing object and a corrupt one), and
+    `("cat-file", "-e"): 1` is git's answer to the question that follows."""
     wiring = PostcommitWiring(tmp_path)
-    real_read_commit = GitGateway.read_commit
-    vanished = wiring.candidate_sha
-
-    def pruned(self, oid):
-        if oid == vanished:
-            raise GitCommandError(f"git cat-file commit {oid} failed: bad object")
-        return real_read_commit(self, oid)
-
-    monkeypatch.setattr(GitGateway, "read_commit", pruned)
+    scripted_worker_gateway(
+        monkeypatch,
+        wiring.worker_path,
+        {("cat-file", "commit"): 128, ("cat-file", "-e"): 1},
+    )
 
     wiring.refuse_at_the_real_site(candidate_sha=wiring.candidate_sha)
 
@@ -1108,6 +1168,178 @@ def test_push_candidate_unresolvable_on_the_task_arm_archives_and_requeues(
     assert orch.state.task_execution is None
     entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
     assert entry["stale_record"] == STALE_EXECUTION_RECORD
+
+
+# =============================================================================
+# 5b. the worker-repository presence probe — what may archive a live record
+#
+# The task arm's counterpart to the changeset arm's seven tests below, and the
+# same fail-open one arm later. Its `False` is the more consequential of the two:
+# it archives a live execution record, quarantines the worker AND is the one
+# thing licensed to bypass `_recut_outstanding_verdict`, so a candidate an
+# approval still in flight could publish is destroyed by it. Exactly one answer
+# authorizes that — `git cat-file -e` returning 1 — and the three tests after it
+# put the probe in states where the question went UNANSWERED and assert that
+# everything the archive would have consumed is still there.
+# =============================================================================
+
+
+def assert_parked_with_everything_intact(wiring, tmp_path, *, reason_fragment):
+    """The four things a park must leave standing, asserted together so no test
+    here can prove "it parked" while the record was already gone.
+
+    "It parked" alone would also pass against code that archived the record,
+    quarantined the worker and THEN parked — which is the failure mode being
+    excluded, not a hypothetical: the archival is durable before the payload is
+    built, so a park after it is a park with the work destroyed.
+    """
+    orch = wiring.orch
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.pending_request is None
+    # 1. the execution record, unarchived and naming the same candidate.
+    record = wiring.execution_store.load("t1")
+    assert record is not None
+    assert record.candidate_sha == wiring.recorded_sha
+    assert not (wiring.execution_store.directory / "archive").exists()
+    # 2. the worker repository, where it was and not in quarantine.
+    assert wiring.worker_path.exists()
+    assert not (tmp_path / "quarantine").exists()
+    # 3. the approval bindings — including `alr-presented`, which is what the
+    #    outstanding-verdict refusal reads. Its survival IS the protection.
+    assert [r["request_id"] for r in orch.state.sent_postcommits] == [
+        "alr-old", "alr-presented", "alr-other"
+    ]
+    assert orch.state.carry_postcommit == {
+        "task_id": "t1", "candidate_sha": wiring.approved_sha
+    }
+    # 4. the task, still in flight and never charged a recut.
+    reloaded = TaskStore(wiring.config.tasks_file).load()
+    assert reloaded.state_of("t1") is TaskState.IN_PROGRESS
+    assert reloaded.get("t1").recut_count == 0
+    # …and nothing claimed a rebuild happened.
+    assert "autonomous_rebuild" not in transcript_types(wiring.config)
+    reasons = [
+        e["reason"] for e in transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    ]
+    assert any(reason_fragment in reason for reason in reasons)
+
+
+def test_a_probe_that_dies_never_archives_the_tasks_execution_record(
+    tmp_path, monkeypatch
+):
+    """Exit 128 is not an answer. A corrupt object, an unreadable repository, an
+    I/O error inside git and a policy refusal all die with it, and every one of
+    them used to read as "the candidate is unresolvable" — archiving a live
+    record, quarantining its worker and bypassing the outstanding-verdict
+    refusal on evidence that was never gathered.
+
+    The ledger entry `alr-presented` is what makes this more than tidiness: the
+    record's candidate WAS presented in its own round, so a verdict on it is
+    outstanding, and the bypass this park prevents is the bypass of that."""
+    wiring = PostcommitWiring(tmp_path)
+    wiring.orch.state.outbox = "the packet that was already queued"
+    scripted_worker_gateway(
+        monkeypatch,
+        wiring.worker_path,
+        {("cat-file", "commit"): 128, ("cat-file", "-e"): 128},
+    )
+
+    wiring.refuse_at_the_real_site(candidate_sha=wiring.candidate_sha)
+
+    assert wiring.orch.state.outbox == "the packet that was already queued"
+    assert_parked_with_everything_intact(
+        wiring, tmp_path, reason_fragment="did not answer whether candidate"
+    )
+
+
+def test_a_probe_that_cannot_run_at_all_never_archives_the_record(
+    tmp_path, monkeypatch
+):
+    """The failure no exit code can express: the subprocess never ran. A worker
+    directory that has been removed under the loop, a file-handle limit, git
+    missing from PATH — `subprocess.run` raises `OSError` and `GitGateway` does
+    not catch it.
+
+    Its own arm, because `_commit_presence` catches `(GitError, OSError)` in two
+    separate places and a fix that only handled `GitError` would leave this one
+    escaping out of a park handler — replacing a recoverable park with a crashed
+    process, in the one place a second failure has nowhere to go.
+
+    Reached by the `push_candidate_stale` road (the approval names a different
+    sha), and that is forced rather than chosen: `_dispatch_task_push` catches
+    only `GitCommandError` around its own `read_commit`, so an `OSError` on the
+    UNRESOLVABLE road escapes that site before any recovery is consulted. Noted
+    here because it is a real gap at `orchestrator.py`'s push site rather than in
+    the handler under test, and widening this change to it is not this round's
+    job. The recovery reads the same record through the same probe either way."""
+    wiring = PostcommitWiring(tmp_path)
+    wiring.orch.state.outbox = "the packet that was already queued"
+    scripted_worker_gateway(
+        monkeypatch,
+        wiring.worker_path,
+        {
+            ("cat-file", "commit"): OSError("worker repository is gone"),
+            ("cat-file", "-e"): OSError("worker repository is gone"),
+        },
+    )
+
+    wiring.refuse_at_the_real_site()
+
+    assert wiring.orch.state.outbox == "the packet that was already queued"
+    assert_parked_with_everything_intact(
+        wiring, tmp_path, reason_fragment="did not answer whether candidate"
+    )
+
+
+def test_a_candidate_whose_tree_will_not_resolve_parks_rather_than_archiving(
+    tmp_path, monkeypatch
+):
+    """`_commit_presence` answers only about the COMMIT, and deliberately says
+    `True` for an object that is there but does not read as one. The binder reads
+    the tree as well, so it is probed separately — and its failure REFUSES.
+
+    A tree that will not resolve is an undiagnosed shape, not git reporting the
+    candidate absent, and archiving a record over it would be the same fail-open
+    wearing different clothes. It parks instead, which is also what keeps the
+    unresolvable tree from being discovered later as a raise inside
+    `_step_ready`."""
+    wiring = PostcommitWiring(tmp_path)
+    scripted_worker_gateway(
+        monkeypatch, wiring.worker_path, {("rev-parse",): 128}
+    )
+
+    wiring.refuse_at_the_real_site(candidate_sha=wiring.approved_sha)
+
+    assert_parked_with_everything_intact(
+        wiring, tmp_path, reason_fragment="tree could not be resolved"
+    )
+
+
+def test_only_gits_own_absent_answer_archives_the_record(tmp_path, monkeypatch):
+    """The positive half of the same line, stated as the discrimination rather
+    than as an outcome: the four probe states above differ ONLY in what git said,
+    and exactly one of them destroys anything.
+
+    Written as one test over both answers so the pair cannot drift apart — a
+    later edit that made 128 archive would have to delete an assertion here, not
+    merely fail to add one."""
+    outcomes = {}
+    for label, rc in (("absent", 1), ("unanswered", 128)):
+        with monkeypatch.context() as patch:
+            wiring = PostcommitWiring(tmp_path / label)
+            scripted_worker_gateway(
+                patch,
+                wiring.worker_path,
+                {("cat-file", "commit"): 128, ("cat-file", "-e"): rc},
+            )
+            wiring.refuse_at_the_real_site(candidate_sha=wiring.candidate_sha)
+            outcomes[label] = (
+                wiring.orch.state.phase,
+                wiring.execution_store.load("t1") is None,
+            )
+
+    assert outcomes["absent"] == (Phase.READY.value, True)
+    assert outcomes["unanswered"] == (Phase.NEEDS_USER.value, False)
 
 
 @pytest.mark.parametrize("candidate", ["missing", ""])

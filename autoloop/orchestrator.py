@@ -10648,8 +10648,9 @@ class Orchestrator:
     # unreadable record, a published candidate, a verdict still in flight, a
     # spent recut cap, a retirement that left residue on disk, a queued
     # changeset missing an identifier, no git gateway to render a packet with
-    # or to ask about a commit, a repository that did not answer whether a
-    # commit exists, and a packet that cannot be rendered or that comes back
+    # or to ask about a commit, EITHER repository — the checkout or a worker —
+    # not answering whether a commit exists, a candidate whose tree will not
+    # resolve, and a packet that cannot be rendered or that comes back
     # unbindable.
     #
     # **A REBUILD THAT LEAVES THE LOOP UNABLE TO PUBLISH IS NOT A REBUILD**, and
@@ -10677,11 +10678,13 @@ class Orchestrator:
     #
     # "Rebuild" is not a synonym for "discard". `_replace_outbox` is the only way
     # any of them swaps the payload, so a displaced packet's chunking leftovers
-    # cannot ride onto the next request; and a record is dropped only where
-    # nothing could be rebuilt from it AND that has been established rather than
-    # inferred — an audit unit nobody minted, a changeset candidate git itself
-    # reports its object database does not hold (`_commit_presence`). A question
-    # the repository could not answer is not an answer, and parks.
+    # cannot ride onto the next request; and a record is dropped or archived only
+    # where nothing could be rebuilt from it AND that has been established rather
+    # than inferred — an audit unit nobody minted, a changeset candidate or a
+    # task candidate git itself reports its object database does not hold. BOTH
+    # of the latter go through `_commit_presence`, the changeset one against the
+    # checkout and the task one against that task's worker repository: a question
+    # either repository could not answer is not an answer, and parks.
 
     def _autonomous_rebuild(self, plan, blocker, *, code: str) -> bool:
         """Archive `plan`'s stale record, rebuild at the current head and leave
@@ -10739,7 +10742,11 @@ class Orchestrator:
 
         `candidate_resolves=False` is the ONE refusal a caller may switch off,
         and only on PROVEN evidence — `_rebuild_task_review_at_head` sets it
-        after reading the candidate out of the worker repository and failing.
+        ONLY when git itself answered that the worker repository's object
+        database does not hold the candidate (`_commit_presence` returning
+        `False`), never merely because a read of it failed. A failed read proves
+        the question went unanswered, not that the object is gone, and that
+        caller parks on it with everything below intact.
         The outstanding-verdict refusal exists because an approval for a packet
         still in flight could arrive and publish that work; when the commit
         cannot be resolved, `_dispatch_task_push` refuses that very approval as
@@ -10981,19 +10988,28 @@ class Orchestrator:
            and the outbox becomes a freshly rendered review packet. This is the
            `push_candidate_stale` case in practice: a later round advanced the
            candidate, and the current one has never been reviewed.
-        2. *Archived and requeued* — the candidate the RECORD names cannot be
-           resolved in the worker repository (this is `push_candidate_
-           unresolvable` reached on the task arm, where the approved sha and the
-           record's own sha are usually the same commit). There is nothing to
-           re-present, so the remedy is the one recut-01 already implements and
-           `_rebuild_execution_record_at_head` is called with its own cause
-           string. It carries recut-01's refusals and `MAX_TASK_RECUTS`, so this
-           is not a second archival mechanism.
-        3. *Refused* — and the loop parks with the question it always had. A
-           packet that cannot be RENDERED is deliberately in this arm rather than
-           in (2): an oversized range-diff is not evidence the candidate is bad,
-           and archiving work over a rendering failure is the budget-01 shape
-           with the loop in the operator's seat.
+        2. *Archived and requeued* — **git itself answered that the worker
+           repository does not hold the candidate the RECORD names** (this is
+           `push_candidate_unresolvable` reached on the task arm, where the
+           approved sha and the record's own sha are usually the same commit).
+           There is nothing to re-present, so the remedy is the one recut-01
+           already implements and `_rebuild_execution_record_at_head` is called
+           with its own cause string. It carries recut-01's refusals and
+           `MAX_TASK_RECUTS`, so this is not a second archival mechanism.
+        3. *Refused* — and the loop parks with the question it always had. THREE
+           shapes are deliberately in this arm rather than in (2), and each was a
+           fail-open in the destructive direction before it was:
+           * the presence question going UNANSWERED — a transient git failure, a
+             policy refusal, a corrupt object, an I/O error, a worker repository
+             no longer on disk. Reading any of those as "gone" archived a live
+             record and bypassed the outstanding-verdict refusal on evidence
+             nobody gathered, which is the changeset arm's own bug wearing the
+             task arm's clothes;
+           * a candidate whose TREE will not resolve though the object is there
+             — undiagnosed, not absent;
+           * a packet that cannot be RENDERED — an oversized range-diff is not
+             evidence the candidate is bad, and archiving work over a rendering
+             failure is the budget-01 shape with the loop in the operator's seat.
 
         TWO cases neither rebuild nor archive, because in each the candidate an
         approval could have published is gone in a way that leaves nothing for a
@@ -11035,24 +11051,60 @@ class Orchestrator:
             return self._rebuild_execution_record_at_head(
                 task_id, code=code, cause=UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE
             )
+        # Constructing a gateway cannot fail: `GitGateway.__init__` stores
+        # `Path(repo_root)`, the policy and the runner and touches no
+        # filesystem, so a worker directory that has been deleted or made
+        # unreadable surfaces at the PROBE below — where it is an unanswered
+        # question — rather than as a raise out of a park handler.
         worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
-        try:
-            # The same two objects `_current_pending_postcommit` will read when
-            # it binds the rebuilt packet, probed here so an unresolvable
-            # candidate is ROUTED (to the archive path) rather than discovered
-            # later as a raise inside `_step_ready`.
-            worktree_git.read_commit(execution.candidate_sha)
-            worktree_git.tree_of(execution.candidate_sha)
-        except (GitError, OSError):
-            # PROVEN unresolvable, which is the one thing that lets the archive
-            # route past the outstanding-verdict refusal — see that method. An
-            # approval for the packet that presented this commit could not
-            # publish it either.
+        # THE object `_current_pending_postcommit` will read when it binds the
+        # rebuilt packet, asked about here so an absent candidate is ROUTED (to
+        # the archive path) rather than discovered later as a raise inside
+        # `_step_ready`. Tri-state, through the SAME `_commit_presence` the
+        # changeset arm uses, and for the same reason it is tri-state there:
+        # this is the one call site on this arm that can authorize DESTROYING a
+        # record, so it must not read "git could not look" as "git said no".
+        present = self._commit_presence(worktree_git, execution.candidate_sha)
+        if present is None:
+            # NOT evidence about the candidate. A transient failure, a policy
+            # refusal, a corrupt object, an I/O error and a worker repository
+            # that is no longer on disk all land here, and every one of them
+            # would — before this revision — have archived a live execution
+            # record, quarantined its worker and bypassed the outstanding-
+            # verdict refusal on evidence nobody gathered. The record, the
+            # worker, the approval bindings and that refusal all stay exactly
+            # as they are, and the loop parks with the question it always had.
+            return self._refuse_rebuild(
+                code,
+                "the worker repository did not answer whether candidate "
+                f"{execution.candidate_sha[:12]} exists, so its absence is not "
+                "established",
+            )
+        if not present:
+            # PROVEN unresolvable — git's own "the object database does not hold
+            # this" — which is the one thing that lets the archive route past the
+            # outstanding-verdict refusal; see that method. An approval for the
+            # packet that presented this commit could not publish it either.
             return self._rebuild_execution_record_at_head(
                 task_id,
                 code=code,
                 cause=UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE,
                 candidate_resolves=False,
+            )
+        try:
+            # The binder reads the TREE as well, and `_commit_presence` does not
+            # ask about it — it answers `True` for an object that exists but does
+            # not read as a commit, deliberately, because "present" is the
+            # fail-closed reading of an undiagnosed shape. So the second object
+            # is probed separately and its failure REFUSES rather than archives:
+            # a tree that will not resolve is not git saying the candidate is
+            # absent, and destroying a record over it is the exact fail-open this
+            # revision closes.
+            worktree_git.tree_of(execution.candidate_sha)
+        except (GitError, OSError) as exc:
+            return self._refuse_rebuild(
+                code,
+                f"the candidate's tree could not be resolved ({type(exc).__name__})",
             )
         if not self._registry.has(task_id):
             # `build_review_packet_with_diff` renders the task's id and title,
@@ -11424,6 +11476,17 @@ class Orchestrator:
         DESTROYS them, so absence of a repository, an I/O error, a policy
         refusal and a name git will not parse each came back as "gone" and took
         an operator's queued review with them.
+
+        **TWO callers, one against each kind of repository**, because the same
+        fail-open existed twice in the same change and only one half was fixed
+        first. `_rebuild_changeset_review_at_head` asks the CHECKOUT about an
+        operator's queued candidate, and destroying that record deletes a review
+        nobody else holds. `_rebuild_task_review_at_head` asks a task's WORKER
+        REPOSITORY about the candidate its execution record names, and the
+        answer authorizes archiving that record, quarantining the worker and —
+        uniquely on that road — bypassing the outstanding-verdict refusal. The
+        second is if anything the more consequential, so it gets the same probe
+        rather than a private twin of it.
 
         The shape is `cli._candidate_is_retired`'s, and it is that shape there
         for the same reason: `cat-file commit` dies with the SAME status for a
