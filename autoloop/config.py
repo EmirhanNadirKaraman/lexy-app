@@ -633,6 +633,12 @@ class AutoloopConfig:
     def audit_dir(self) -> Path:
         return self.state_dir / "audit"
 
+    #: CALLER-LESS since brw-16 (2026-08-25). `cli._cmd_smoke_browser` was its
+    #: only reader, and that command is retired — it reads no config at all now.
+    #: Kept rather than deleted for two reasons: an operator's `.autoloop/smoke/`
+    #: still exists on disk and this is what names it, and if the loop ever wants
+    #: a one-round-trip smoke of `conversation.provider` (a new command, with its
+    #: own review — deliberately NOT this one renamed) this is where it lives.
     @property
     def smoke_dir(self) -> Path:
         return self.state_dir / "smoke"

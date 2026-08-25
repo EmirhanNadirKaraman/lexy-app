@@ -63,7 +63,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Audit executor | `audit/` | The read-only production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner, tool set now a constructor param — see §7b), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. Dispatched as a task-shaped unit of work (`Orchestrator._resolve_audit_task`), so it runs through §4b like any other task. |
 | Implement executor | `implement_executor.py` | The write-capable production executor (§7b): `ImplementExecutor` runs ONE `Edit`/`Write`-capable subagent (`implement_agent_runner`, built on the SAME `audit.agents.ClaudeCliRunner` the audit uses, configured with a different tool set) against a task's own worker repo, derives `changed_paths` from the worker repo's real `git status`, then re-runs validation. `cli._build_executor`'s `_DispatchingExecutor` routes `implement`/`revise`-of-a-real-task here; `audit`/`revise("audit")` still go to `AuditExecutor`. |
 | State / transcript | `state.py`, `transcript.py` | Atomic crash-safe state; append-only JSONL audit log. |
-| CLI | `cli.py` | `run [--continuous] status tasks next-task blockers answer retire release doctor smoke-browser pause resume unlock reset reprovision-publisher` (§8/§9). |
+| CLI | `cli.py` | `run [--continuous] status tasks next-task blockers answer retire release doctor pause resume unlock reset reprovision-publisher` (§8/§9). `smoke-browser` is still registered but RETIRED (brw-16, 2026-08-25): it prints why and exits 2, running nothing — §6. |
 
 ---
 
@@ -102,9 +102,12 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
 
 ## 3. Single-instance locking
 
-`run`, `resume`, `reset` and `smoke-browser` hold `.autoloop/LOCK` (atomic
+`run`, `resume` and `reset` hold `.autoloop/LOCK` (atomic
 `O_CREAT|O_EXCL`; records pid, hostname, start time, run id, state dir).
 `status` / `tasks` / `doctor` / `pause` stay available while locked.
+`smoke-browser` held it too until brw-16 (2026-08-25) retired the command; it
+now takes no lock at all, which is asserted rather than assumed — a retired
+command that still locked would block a live run in order to print a sentence.
 
 * Live owner (same host, pid alive — or any foreign host, which can't be
   verified) → **fail closed**; wait or stop that process.
@@ -775,10 +778,11 @@ loads the same state file and prepares the same request. A merge touching only
 * **Only the `run` paths are offered the boundary at all.** The record lives
   under `state_dir`, so any orchestrator built against that directory could
   see it; `Orchestrator(self_upgrade_enabled=…)` defaults OFF and is enabled in
-  exactly one place, `cli._build_orchestrator`. `smoke-browser` builds its own
-  orchestrator, starts it at `ready` with no pending request — the boundary
-  shape exactly — and reports PASS only for a clean contract stop, so an
-  unrelated pending upgrade would fail a diagnostic while diagnosing nothing.
+  exactly one place, `cli._build_orchestrator`. Every other construction —
+  tests, embedders, and (until brw-16, 2026-08-25, retired the command)
+  `smoke-browser`'s own, which started at `ready` with no pending request, the
+  boundary shape exactly — must SEE the record and ignore it, or an unrelated
+  pending upgrade would end a round that had nothing to do with it.
 
 The replacement re-runs `python -m autoloop <same args>`, so per-run budgets
 (`state.rotations`, cleared by `_reset_run_scoped_budgets`) start fresh — an
@@ -1271,10 +1275,10 @@ is seconds. Child agents are deliberately left to exit on their own.
 
 This lives on `LoopLock` (installed by `acquire`, restored by `release`),
 not at one call site, so it covers every holder listed above rather than
-whichever ones a wrapper was remembered on — `smoke-browser` waits on a live
-round-trip through the configured transport (it drove a real browser until
-brw-16) and `review-changeset` waits on a reviewer, both long enough to be
-running when a machine goes down.
+whichever ones a wrapper was remembered on — `review-changeset` waits on a
+reviewer, long enough to be running when a machine goes down. (`smoke-browser`
+was the other long holder, waiting on a live browser round-trip; brw-16 retired
+the command and it now takes no lock at all.)
 
 What each way of stopping costs:
 
@@ -4635,9 +4639,9 @@ allowance runs out.
 > `config.example.toml` ships `fallback_provider = ""`. A config still naming the
 > retired provider there is read as `""` for the run, with a notice. The failover
 > MACHINERY is untouched and is what a future second-budget adapter arrives
-> through. `smoke-browser` was pinned to `browser_chatgpt` for the reason above
-> and is now pinned to nothing: it smokes `conversation.provider`, and refuses
-> with a message naming the registry when asked for a provider that is not in it.
+> through. `smoke-browser` was pinned to `browser_chatgpt` for the reason above;
+> with that seat gone the command has no subject, so it is RETIRED rather than
+> repointed at `conversation.provider` — see §6.
 
 ---
 
@@ -5266,7 +5270,7 @@ quality — `rotation_failed` 11, `submission_ambiguous` 6,
 | `conversation._PROVIDERS` | `browser_chatgpt`, `codex_cli`, `codex_app_server` | `codex_cli`, `codex_app_server` |
 | `conversation._BROWSER_BACKED` | `{"browser_chatgpt"}` | `set()` — populated only by `register_provider(..., browser_backed=True)` |
 | `[browser]` in the config | required (`conversation_url` refused when empty) | optional, defaulted, validated, unread |
-| `smoke-browser --provider` | defaulted to `browser_chatgpt` | defaults to `conversation.provider`; an unregistered name is refused before the lock |
+| `smoke-browser` | one real round-trip through `browser_chatgpt` | RETIRED: prints why, exits 2, reads no config, builds no provider, takes no lock, touches no smoke state |
 
 **What did NOT change, and this is the part to preserve.** `LLMConversation`,
 `register_provider` and the `browser_backed=True` declaration are untouched: an
@@ -5321,21 +5325,11 @@ Removing files is an operator action.
 
 ---
 
-## 6. Preflight: `doctor` and the live smoke test
+## 6. Preflight: `doctor` (and the retired smoke test)
 
 ```bash
 python -m autoloop doctor         # never submits anything
-python -m autoloop smoke-browser  # submits exactly ONE harmless request
 ```
-
-The second command's NAME is historical. Since brw-16 (2026-08-25) it no longer
-defaults to a browser provider — there is none registered — and instead smokes
-whatever `conversation.provider` names, or the `--provider` you pass. Asked for a
-provider that is not registered, it refuses before taking the loop lock and
-before archiving the previous smoke state, printing the name it could not build
-and the names it could. It was NOT renamed: the command, its flags and its
-PASS/FAIL contract are otherwise unchanged, and renaming it would break every
-runbook and shell history that types it.
 
 `doctor` checks: config validity, state-dir writability, lock state, git
 identity, branch policy (warns when pushes would be denied), **worker
@@ -5355,22 +5349,40 @@ target repo's own history — the probe worker repo and publisher provisioning
 are both scoped entirely under `config.state_dir`, the same category of side
 effect as the pre-existing state-dir-writable probe file.
 
-`smoke-browser` runs the full normal machinery (request id, CONTEXT stamp,
-parser, transcript, diagnostics-on-failure) against an **isolated** smoke
-state (`.autoloop/smoke/`), sending one prompt that identifies itself as a
-smoke test and demands a contract-v3 `stop`. PASS = the loop terminal state is
-`stopped`. It is **exactly one round-trip**: `max_iterations=1`,
-`max_parse_retries=0`, `max_policy_denials=0`, `max_consecutive_failures=1`, so a
-malformed reply is a FAILURE rather than a corrective re-prompt in a reserved
-channel. It can never invoke an executor (a guard executor raises if
-dispatch were ever reached) and never touches the main session state. Its waits
-are tightened (reply bounds in minutes, one browser failure ends it) so a broken
-channel fails fast instead of grinding through retries, and any previously
-parked smoke session is archived rather than resumed.
+**`smoke-browser` is RETIRED (brw-16, 2026-08-25).** It existed to prove the
+BROWSER transport before a real run needed it: one harmless request through a
+live Chrome, against an isolated smoke state under `.autoloop/smoke/`, to a
+PASS/FAIL verdict. No browser-backed provider is registered any more (§5g), so
+the seat it smoked does not exist.
 
-Manual prerequisites for both live commands: the dedicated Chrome profile
-running with `--remote-debugging-port=9222`, logged into chatgpt.com, and
-`browser.conversation_url` pointing at your persistent conversation.
+It now prints why and exits 2, and each clause of "refuses plainly" is a
+failure mode ruled out rather than a description: **no config is loaded** (so
+the refusal is identical on a missing, malformed or unreadable `--config`, and
+cannot fail with a `ConfigError` about a file it had no reason to open), **no
+provider is constructed**, **the loop lock is not taken** (a retired command
+that still locked would block a live run in order to print a sentence), and
+`.autoloop/smoke/` is neither archived, written nor read. `--provider` is still
+accepted and is inert, so the invocation a runbook or a shell history holds
+reaches that sentence instead of argparse's "unrecognized arguments", which
+exits with the same code and none of the explanation.
+
+Two things it deliberately is NOT. It is not DELETED: an unknown subcommand
+also exits 2, from argparse, on stderr, saying "invalid choice" — keeping the
+registration is what turns that into an explanation. And it is not REPOINTED at
+`conversation.provider`, which a first candidate for brw-16 shipped and review
+refused: a browser-named command that silently smokes something else is a
+different command wearing this one's name, and it reports PASS about a
+transport nobody asked it for. If the loop wants one round-trip through the
+configured provider, that is a new command with its own name and its own
+review. `doctor` is meanwhile unchanged and still reaches the configured
+provider without submitting anything.
+
+`doctor`'s CDP-reachability, Playwright-presence and conversation-URL checks
+still run unconditionally, so on a machine with no Chrome they FAIL — that is
+pre-existing and outside brw-16's approved paths, not part of the retirement.
+Until they are removed, the manual prerequisites for a fully green `doctor` are
+still the dedicated Chrome profile running with `--remote-debugging-port=9222`,
+logged into chatgpt.com, and `browser.conversation_url` set.
 
 ---
 
@@ -5836,9 +5848,12 @@ sit under that, so the two move together or not at all.
 
 ```bash
 python -m autoloop doctor          # fix anything red
-python -m autoloop smoke-browser   # optional but recommended: one live round-trip
 python -m autoloop run --kickoff-audit
 ```
+
+The live round-trip that used to sit between those two was `smoke-browser`,
+retired with the transport it smoked (§6). There is no replacement: the first
+real `run` is now the first live exchange.
 
 `--kickoff-audit` opens the session by offering ChatGPT the audit; on its
 `audit` reply the executor runs (agents take minutes), the commit happens
@@ -5957,10 +5972,12 @@ knowing:
 * `run --continuous` STOPS on it (exit 2) instead of treating `stopped` as a
   clean boundary — otherwise the selection policy would start a fresh session
   into the identical wall on the next pass;
-* `smoke-browser` and plain `run` both read `stop_kind` rather than the phase,
-  so a run that died this way is never reported as a completed one. A
+* plain `run` reads `stop_kind` rather than the phase, so a run that died this
+  way is never reported as a completed one. A
   reviewer's own `stop` carries `stop_kind="contract"`; a state file written
   before this existed carries `""` and is read as an ordinary clean boundary.
+  (`smoke-browser` was the other such reader, gating PASS on the positive
+  value, until brw-16 retired it.)
 
   The sibling budgets deliberately still PARK, though all three spend the same
   `state.policy_denials` counter: a rejected plan is about an operator-owned
@@ -6971,10 +6988,12 @@ would be the natural next step and was out of this task's approved scope.
   change, but a long-lived deployment will still accumulate one remote
   branch per approved audit round over time; branch cleanup on the remote is
   an operator task today, not something autoloop does for you.
-* `doctor`'s live check and `smoke-browser` reach the real configured
-  transport (the dedicated browser until brw-16, 2026-08-25; `codex` since);
-  hermetic tests mock them, so "implemented" ≠ "live verified" until
-  smoke-browser has actually passed on your machine.
+* `doctor`'s live check is now the ONLY command that reaches the real
+  configured transport (the dedicated browser until brw-16, 2026-08-25;
+  `codex` since). `smoke-browser` was the other, and its retirement makes this
+  gap wider, not narrower: hermetic tests mock the transport, so
+  "implemented" ≠ "live verified", and the first live exchange is now the
+  first real `run`.
 * `doctor` still runs its `cdp` and `playwright` checks unconditionally, so
   both report FAIL on a host with no Chrome — expected on a codex-only
   deployment, and pre-existing rather than introduced by brw-16.

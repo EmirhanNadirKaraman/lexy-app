@@ -9,9 +9,10 @@
     python -m autoloop retire <task-id> [--superseded-by ID ...] [--reason TEXT]
                                         [--rewrite-dependents]
     python -m autoloop smoke-browser [--config PATH] [--provider NAME]
-                            (one round-trip through conversation.provider; the
-                             name is historical — no browser provider is
-                             registered since brw-16, 2026-08-25)
+                            (RETIRED, brw-16 2026-08-25: it smoked the browser
+                             transport, and no browser-backed provider is
+                             registered any more. Prints why and exits 2 —
+                             loads nothing, locks nothing, runs nothing)
     python -m autoloop pause | resume | unlock | reset --yes [--tasks]
     python -m autoloop merge-window [--wait] | merge-backlog
     python -m autoloop shipped-report [--repo PATH] [--base REV]  (read-only)
@@ -19,7 +20,7 @@
     python -m autoloop reprovision-publisher --confirm
     python -m autoloop review-changeset --base <sha> --candidate <sha> [--packet FILE]
 
-Locking: run / resume / reset / smoke-browser / answer / retire / release /
+Locking: run / resume / reset / answer / retire / release /
 merge-backlog take
 the single-instance lock on the state directory (fail closed against a live
 process; `unlock` is the only stale-lock recovery, and it refuses live locks).
@@ -67,13 +68,12 @@ from .blockers import NO_TASK, Blocker, BlockerStore, by_severity
 from .changeset_review import build_changeset_binding, build_changeset_packet
 from .config import AutoloopConfig, load_config as _read_config_file
 from .contract import AUDIT_TASK_ID, Decision, Directive
-from .conversation import available_providers, create_conversation
+from .conversation import create_conversation
 from . import health, heartbeat
 from .doctor import DoctorProbes, _default_probe_cdp, exit_code, run_doctor
 from .errors import (
     AutoloopError,
     ConfigError,
-    ExecutorError,
     GitError,
     LockHeldError,
     StaleLockError,
@@ -551,9 +551,10 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         # the default, which is where `DEFAULT_CONFIG` points.
         config_path=Path(getattr(args, "config", None) or DEFAULT_CONFIG),
         # The ONE construction allowed to end a round for a self-upgrade, and
-        # it covers both `run` paths. `smoke-browser` builds its own
-        # orchestrator against the same state dir and would otherwise report a
-        # false failure over an upgrade it cannot perform — see the constructor.
+        # it covers both `run` paths. Every other orchestrator built against the
+        # same state dir — tests, embedders, and until brw-16 (2026-08-25)
+        # `smoke-browser`'s own — sees the pending record and must ignore it
+        # rather than fail on an upgrade it cannot perform; see the constructor.
         self_upgrade_enabled=True,
     )
 
@@ -1095,9 +1096,11 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
     # "finished" the moment the loop could end itself on a wall
     # (`orchestrator._to_fault_stop`), and a wrapper script or cron job reading
     # the exit code must not be told a run that died on the denial budget
-    # succeeded. Same reasoning as `_cmd_smoke_browser`'s positive `stop_kind`
-    # gate; `_report_fault_stop` prints the summary itself, so this returns
-    # rather than falling through to a second one.
+    # succeeded. Gated on the POSITIVE `stop_kind` for the same reason every
+    # other reader of that field is (see `LoopState.stop_kind`), so an
+    # unclassified stop reads as the failure it is; `_report_fault_stop` prints
+    # the summary itself, so this returns rather than falling through to a
+    # second one.
     if _is_fault_stop(orchestrator.state):
         return _report_fault_stop(config, orchestrator.state, registry)
     if outcome == SELF_UPGRADE:
@@ -2737,111 +2740,55 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return code
 
 
-class _SmokeNeverExecutor:
-    """The smoke test must never execute tasks — fail loud if dispatch tries."""
-
-    def execute(self, directive, task):
-        raise ExecutorError(
-            "smoke test attempted to execute a task — this must never happen"
-        )
+#: What `smoke-browser` prints now, and the whole of what it does.
+#:
+#: One string rather than an f-string built at call time, because there is
+#: nothing to interpolate: the command reads no config, so it knows no state
+#: dir, no provider name and no diagnostics path. That is the point — see
+#: `_cmd_smoke_browser`.
+SMOKE_BROWSER_RETIRED = (
+    "smoke-browser: RETIRED — this command existed to prove the BROWSER "
+    "transport before a real run needed it, and no browser-backed conversation "
+    "provider is registered any more (brw-16, 2026-08-25). Nothing ran: no "
+    "config was read, no provider was built, the loop lock was not taken and "
+    "the smoke state under `<state_dir>/smoke/` was not touched. For preflight "
+    "checks against the transport the loop DOES use, run `python -m autoloop "
+    "doctor`, which reaches the configured provider without submitting "
+    "anything."
+)
 
 
 def _cmd_smoke_browser(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
-    # NO BROWSER DEFAULT since brw-16 (2026-08-25). This command used to default
-    # to `browser_chatgpt` regardless of `conversation.provider`, on the reasoning
-    # that the browser was the fallback and therefore the seat most worth proving
-    # before it was needed. That provider is no longer registered, so the old
-    # default would make every bare `smoke-browser` fail on a name nothing can
-    # build — a command silently unable to work, which is the outcome this had to
-    # avoid. It now smokes the transport the loop actually uses, and `--provider`
-    # still names any registered one explicitly.
-    smoke_provider = getattr(args, "provider", None) or config.conversation.provider
-    if smoke_provider not in available_providers():
-        # Refused HERE, before the lock and before any state is archived: a run
-        # that cannot build a client has nothing to smoke, and taking the loop
-        # lock to discover that would block a real run for no reason.
-        print(
-            f"smoke-browser: FAIL — conversation provider {smoke_provider!r} is not "
-            f"registered. Available: {', '.join(available_providers()) or '(none)'}. "
-            "No browser-backed provider ships any more (brw-16, 2026-08-25); this "
-            "command smokes whatever conversation.provider names, or the "
-            "--provider you pass."
-        )
-        return 2
-    with LoopLock(config.state_dir):
-        store = StateStore(config.smoke_dir / "state.json")
-        store.archive()  # every smoke run starts fresh
-        state = LoopState.new(config.browser.conversation_url)
-        state.outbox = TEMPLATES["smoke_test"].render()
-        store.save(state)
-        # A smoke test must fail fast and must not grind through retries: one
-        # browser failure ends it, and the reply bounds are minutes, not the
-        # 15-minute audit-grade ceiling.
-        # A smoke test is exactly ONE round-trip: one message, one reply. No
-        # corrective re-prompts (parse retries), no second iteration, one
-        # browser failure ends it. A malformed reply is a smoke FAILURE, not
-        # something to negotiate over several messages in a reserved channel.
-        smoke_policy = dataclasses.replace(
-            config.policy,
-            max_iterations=1,
-            max_consecutive_failures=1,
-            max_parse_retries=0,
-            max_policy_denials=0,
-        )
-        smoke_config = dataclasses.replace(
-            config,
-            browser=dataclasses.replace(
-                config.browser,
-                response_start_timeout_seconds=min(
-                    config.browser.response_start_timeout_seconds, 90.0
-                ),
-                response_timeout_seconds=min(config.browser.response_timeout_seconds, 120.0),
-            ),
-        )
-        policy = PolicyEngine(smoke_policy)
-        orchestrator = Orchestrator(
-            config=smoke_config,
-            store=store,
-            state=state,
-            policy=policy,
-            git=GitGateway(Path.cwd(), policy),
-            executor=_SmokeNeverExecutor(),
-            transcript=TranscriptLogger(config.transcript_file),
-            # `--provider`, or `conversation.provider` when none was given.
-            # Checked against the registry above, so this cannot be a name
-            # nothing can build.
-            client_factory=lambda: create_conversation(smoke_provider, smoke_config),
-            registry=TaskRegistry(),
-            task_store=TaskStore(config.smoke_dir / "tasks.json"),
-            manifest_store=ManifestStore(config.smoke_dir / "manifests"),
-        )
-        outcome = orchestrator.run()
-    # BOTH conditions, and the second is load-bearing rather than belt-and-
-    # braces: `stopped` is reachable two ways since the policy-denial budget
-    # started ending the run instead of parking (`orchestrator._to_fault_stop`),
-    # and the smoke policy sets `max_policy_denials=0`, so the FIRST denied
-    # reply reaches that terminal. Phase alone would therefore report PASS —
-    # "received a valid contract stop" — for a reviewer that answered
-    # `ask_user`, `implement`, or a commit approval, which is the exact
-    # misbehaviour this command exists to catch. Gated on the POSITIVE value so
-    # an unclassified stop (a legacy state file, a future fault site nobody
-    # classified) reads as a failure.
-    if outcome == Phase.STOPPED.value and state.stop_kind == "contract":
-        print(
-            "smoke-browser: PASS — submitted one request through the real "
-            f"conversation and received a valid contract stop ({state.stop_reason!r})"
-        )
-        return 0
-    # Named in the failure line because "ended in 'stopped'" is otherwise the
-    # same words a PASS would print, and the operator's next question is
-    # exactly which kind it was.
-    kind = f" ({state.stop_kind} stop)" if state.stop_kind else ""
-    print(
-        f"smoke-browser: FAIL — loop ended in '{outcome}'{kind} "
-        f"(question: {state.question!r}, stop_reason: {state.stop_reason!r}). "
-        f"Diagnostics (if any) under {config.diagnostics_dir}."
-    )
+    """RETIRED since brw-16 (2026-08-25). Prints why, exits 2, does nothing else.
+
+    It used to default to `browser_chatgpt` regardless of
+    `conversation.provider` — the browser was the fallback, so it was the seat
+    most worth proving before it was needed — archive the previous smoke state
+    under `.autoloop/smoke/`, take the loop lock, and drive one real round-trip
+    (request id, CONTEXT stamp, parser, transcript) to a PASS/FAIL verdict.
+    There is no browser-backed provider to build any more, so the seat it
+    smoked does not exist.
+
+    REFUSES PLAINLY, and each clause of that is a failure mode ruled out:
+
+    * No config is loaded — so the refusal is the same on a missing, malformed
+      or unreadable `--config`, and cannot fail with a `ConfigError` about a
+      file it had no reason to open.
+    * No provider is constructed, so nothing dials a transport.
+    * The loop lock is NOT taken, so this can never block a live run, and
+      `.autoloop/smoke/` is not archived, written or read.
+
+    NOT repurposed into a generic smoke of `conversation.provider`, which is
+    the shape a previous round shipped: that is a different command wearing
+    this one's name, it would report PASS about a transport nobody asked it
+    for, and it turns a browser-named command into something an operator's
+    runbook silently mis-describes. If the loop wants one round-trip through
+    the configured provider, that is a new command with its own name and its
+    own review — not a rename by silence. Kept registered rather than deleted
+    so a typed-from-memory invocation gets this sentence instead of an argparse
+    usage error, and `args` is ignored for the same reason.
+    """
+    print(SMOKE_BROWSER_RETIRED)
     return 2
 
 
@@ -3165,8 +3112,9 @@ def _cmd_release(args: argparse.Namespace) -> int:
 #: task it was running. Its own value rather than `"contract"` or
 #: `PREEMPTION_STOP_KIND`, because every reader of that field gates on the
 #: POSITIVE value it wants (see `LoopState.stop_kind`): reusing `"contract"`
-#: would make `smoke-browser` report PASS for a session no reviewer ever
-#: answered, and reusing `"preempted"` would make `_is_preemption_stop` print a
+#: would make every "did a reviewer really answer?" gate say yes for a session
+#: no reviewer ever answered, and reusing `"preempted"` would make
+#: `_is_preemption_stop` print a
 #: displacement that never happened. Unrecognised-by-everything is the correct
 #: reading — `_run_continuous` treats it as the clean boundary it is, because
 #: only `"fault"` stops the loop.
@@ -5482,8 +5430,8 @@ def build_parser() -> argparse.ArgumentParser:
         (
             "smoke-browser",
             _cmd_smoke_browser,
-            "submit ONE harmless smoke request through the configured transport "
-            "(no browser provider is registered; --provider names another)",
+            "RETIRED: smoked the browser transport, which is no longer "
+            "registered — prints why and exits 2, running nothing",
         ),
         ("unlock", _cmd_unlock, "remove a verifiably-stale lock (refuses live locks)"),
         ("pause", _cmd_pause, "ask a running loop to stop after its current phase"),
@@ -5499,18 +5447,16 @@ def build_parser() -> argparse.ArgumentParser:
                 help="profile an archived transcript instead of the configured one",
             )
         if name == "smoke-browser":
-            # No default of its own since brw-16 (2026-08-25): it used to name
-            # the browser provider regardless of `conversation.provider`, and
-            # that provider is no longer registered. Empty means "whatever
-            # conversation.provider names", which is the transport a real run
-            # would use; any registered provider can still be smoked by name.
+            # Still ACCEPTED, and deliberately inert, since brw-16 (2026-08-25).
+            # The command is retired; the flag survives only so that a typed
+            # `smoke-browser --provider browser_chatgpt` — the invocation a
+            # runbook or a shell history holds — reaches the retirement notice
+            # instead of dying on argparse's "unrecognized arguments" with the
+            # same exit code and none of the explanation.
             p.add_argument(
                 "--provider",
                 default="",
-                help=(
-                    "conversation provider to smoke (default: whatever "
-                    "conversation.provider names)"
-                ),
+                help="ignored — the command is retired and smokes nothing",
             )
         p.set_defaults(func=func)
 
