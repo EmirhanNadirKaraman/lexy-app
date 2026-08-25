@@ -53,6 +53,18 @@ for this could look convincing and prove nothing:
   rebuild now preserves on the success path too — so they would have gone
   vacuous and stayed green whatever the flag did. They key on the outbox.
 
+**The second mistake, caught in review of the first fix and pinned here.** A
+rebuild that DESTROYS a record must act on what was established, not on what was
+merely attempted. The changeset arm asked "does this candidate resolve?" with a
+two-value answer, so no gateway, an unreadable repository, an I/O error and a
+name git will not parse all read as "gone" — and each of them deleted an
+operator's queued review, the one record in this feature that exists nowhere
+else afterwards. Seven consecutive tests below hold that line: exactly one of
+them drops, and it is the one where `git cat-file -e` itself answered no
+(`ABSENT_SHA`); the other six put the arm in a state where the question went
+unanswered and assert the review is still there. "It parks" is the correct
+outcome for every one of those — the park is the state the loop was already in.
+
 Self-contained per this codebase's convention (see `test_blockers.py`) — the
 config/orchestrator helpers are duplicated here rather than imported from
 `test_autonomous_recovery.py` or `test_recut.py`.
@@ -64,6 +76,7 @@ import ast
 import dataclasses
 import inspect
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -385,6 +398,38 @@ class RealWiring:
 # helpers — a real operator changeset, for the one rebuild that re-renders a
 # packet from git objects
 # =============================================================================
+
+
+#: A well-formed 40-hex object name that no repository built here holds. It is
+#: the ONE shape `git cat-file -e` answers "no" to (exit 1); a short or
+#: malformed name dies with 128 instead, which is not an answer — see
+#: `GitGateway.object_exists`. Every test that needs git to have ANSWERED gone
+#: uses this, and the tests that need it not to have answered use the others.
+ABSENT_SHA = "0" * 39 + "1"
+
+
+def probing_runner(answers):
+    """`subprocess.run` with some git subcommands SCRIPTED and everything else
+    real, through `GitGateway`'s own `runner` seam.
+
+    `answers` maps an argument prefix — `("cat-file", "-e")` — to the exit code
+    git should report for it. That is the only thing the presence probe reads,
+    and the only thing that distinguishes "git says the object is not here"
+    (exit 1) from "git could not look" (128: a corrupt object, an I/O error, an
+    unreadable repository). Scripted rather than produced by corrupting a real
+    repository, because those failures cannot be produced portably and the code
+    under test keys on the exit status either way.
+    """
+
+    def run(argv, **kwargs):
+        for prefix, rc in answers.items():
+            if tuple(argv[1:1 + len(prefix)]) == tuple(prefix):
+                return subprocess.CompletedProcess(
+                    argv, rc, stdout="", stderr="fatal: scripted git failure"
+                )
+        return subprocess.run(argv, **kwargs)
+
+    return run
 
 
 class ChangesetWiring:
@@ -1208,34 +1253,197 @@ def test_a_task_arm_rebuild_refused_for_want_of_its_task_parks_unbound_free(tmp_
     assert any("not in the registry" in reason for reason in reasons)
 
 
-def test_push_candidate_unresolvable_on_the_changeset_arm_drops_the_queued_review(
+def test_the_changeset_arm_drops_the_queued_review_when_git_says_the_commit_is_gone(
     tmp_path
 ):
     """The second producer, which names NO task — `_dispatch_changeset_push`.
     A test that only covered the task arm would pass while the changeset arm
     still halted the loop.
 
-    Dropping is the arm taken when the QUEUE ENTRY's own candidate cannot be
-    resolved (here there is no gateway to resolve it with at all), which is the
-    case where no packet could be rendered and no approval could ever
-    publish."""
-    orch, config, _, _, _ = build(tmp_path, enabled=True, in_flight=None)
+    Dropping is the arm taken when GIT ITSELF reports that its object database
+    does not hold the QUEUE ENTRY's own candidate: then no packet could be
+    rendered from it and no approval could ever publish it. `ABSENT_SHA` is
+    what makes that an answer rather than a guess — a well-formed name `cat-file
+    -e` returns 1 for, on a repository that is right there and readable. The six
+    tests that follow it put the same arm in a state where that question went
+    UNANSWERED, and each asserts the review is still where it was."""
+    wiring = ChangesetWiring(tmp_path)
+    wiring.state.changeset = {**wiring.queued, "candidate_sha": ABSENT_SHA}
+
+    wiring.orch._to_needs_user(
+        "changeset push refused — the candidate no longer resolves",
+        kind="loop_fatal", code="push_candidate_unresolvable",
+    )
+
+    assert wiring.orch.state.phase == Phase.READY.value
+    assert wiring.orch.state.changeset is None
+    entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
+    # The whole queued record survives in the transcript — an operator's
+    # changeset must never evaporate with nothing saying so.
+    assert entry["discarded_changeset"]["candidate_sha"] == ABSENT_SHA
+    assert entry["discarded_changeset"]["dest_ref"] == wiring.queued["dest_ref"]
+    # And the line says which question was answered to authorize the deletion.
+    assert entry["candidate_absent_per"] == "git cat-file -e"
+
+
+def test_no_git_gateway_is_not_evidence_that_the_queued_candidate_is_gone(tmp_path):
+    """THE fail-open this arm shipped with, in the destructive direction: with
+    no gateway to ask, the first cut read "cannot resolve" off its own missing
+    collaborator and DELETED an operator's queued review — the one record here
+    that exists nowhere else once the state file is rewritten.
+
+    Nobody to ask is the shape of unverifiability, not of absence. The loop
+    parks with the review exactly where it was, which is the state it was
+    already in."""
+    orch, config, _, _, _ = build(tmp_path, enabled=True, in_flight=None)  # git=None
     orch.state.phase = Phase.EXECUTING.value
-    orch.state.changeset = {
-        "candidate_sha": "cafe", "base_sha": "beef",
-        "branch": "main", "dest_ref": "refs/heads/main",
-    }
+    queued = {"candidate_sha": "c" * 40, "base_sha": "b" * 40,
+              "branch": "feature/x", "dest_ref": "refs/heads/feature/x"}
+    orch.state.changeset = dict(queued)
 
     orch._to_needs_user("changeset push refused — the candidate no longer resolves",
                         kind="loop_fatal", code="push_candidate_unresolvable")
 
-    assert orch.state.phase == Phase.READY.value
-    assert orch.state.changeset is None
-    entry = transcript_entries(config, "autonomous_rebuild")[0]
-    # The whole queued record survives in the transcript — an operator's
-    # changeset must never evaporate with nothing saying so.
-    assert entry["discarded_changeset"]["candidate_sha"] == "cafe"
-    assert entry["discarded_changeset"]["dest_ref"] == "refs/heads/main"
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.changeset == queued          # UNTOUCHED
+    reasons = [
+        e["reason"] for e in transcript_entries(config, "autonomous_rebuild_refused")
+    ]
+    assert reasons and "no git gateway" in reasons[0]
+    # Nothing was rebuilt, so nothing may claim to have been.
+    assert "autonomous_rebuild" not in transcript_types(config)
+
+
+def test_a_probe_that_dies_leaves_the_queued_review_where_it_was(tmp_path):
+    """A die is not an answer. `cat-file` exits 128 for a corrupt object, an
+    I/O error, a policy refusal and a repository it cannot open — the same
+    status for four causes, none of which is "this commit was never here". A
+    repository having a bad day must cost the loop a park, never an operator's
+    queued review."""
+    wiring = ChangesetWiring(tmp_path)
+    wiring.state.changeset = {**wiring.queued, "candidate_sha": ABSENT_SHA}
+    wiring.orch._git = GitGateway(
+        wiring.repo_root,
+        wiring.policy,
+        runner=probing_runner({("cat-file", "commit"): 128, ("cat-file", "-e"): 128}),
+    )
+
+    wiring.orch._to_needs_user(
+        "changeset push refused — the candidate no longer resolves",
+        kind="loop_fatal", code="push_candidate_unresolvable",
+    )
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.changeset == {
+        **wiring.queued, "candidate_sha": ABSENT_SHA
+    }
+    reasons = [
+        e["reason"]
+        for e in transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    ]
+    assert reasons and "did not answer" in reasons[0]
+    assert "autonomous_rebuild" not in transcript_types(wiring.config)
+
+
+def test_a_repository_that_is_no_longer_there_parks_rather_than_dropping(tmp_path):
+    """The same rule against a REAL environment fault rather than a scripted
+    one: the checkout is gone, so every probe raises `OSError` before git is
+    even reached. The queued review survives that, because "we could not look"
+    is not "it is not there" — and a park handler is the one place a second
+    failure has nowhere to go, so it must come back as a refusal rather than as
+    an exception out of `_to_needs_user`."""
+    wiring = ChangesetWiring(tmp_path)
+    queued = {**wiring.queued, "candidate_sha": ABSENT_SHA}
+    wiring.state.changeset = dict(queued)
+    shutil.rmtree(wiring.repo_root)
+
+    wiring.orch._to_needs_user(
+        "changeset push refused — the candidate no longer resolves",
+        kind="loop_fatal", code="push_candidate_unresolvable",
+    )
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.changeset == queued
+    reasons = [
+        e["reason"]
+        for e in transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    ]
+    assert reasons and "did not answer" in reasons[0]
+
+
+def test_an_object_git_holds_but_cannot_read_as_a_commit_is_kept_not_dropped(tmp_path):
+    """PRESENT is the fail-closed reading of an object git holds but will not
+    hand back as a commit — a tree named by mistake, a corrupt object, an
+    unreadable one. `_commit_presence` answers True on `cat-file -e`, the
+    rebuild is attempted, and the render refuses. The record stays for a human
+    either way; what must not happen is destroying it over a shape nobody has
+    diagnosed."""
+    wiring = ChangesetWiring(tmp_path)
+    queued = {**wiring.queued, "candidate_sha": ABSENT_SHA}
+    wiring.state.changeset = dict(queued)
+    wiring.orch._git = GitGateway(
+        wiring.repo_root,
+        wiring.policy,
+        # git says it HOLDS the object and refuses to read it as a commit.
+        runner=probing_runner({("cat-file", "commit"): 128, ("cat-file", "-e"): 0}),
+    )
+
+    wiring.orch._to_needs_user(
+        "changeset push refused — the candidate no longer resolves",
+        kind="loop_fatal", code="push_candidate_unresolvable",
+    )
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.changeset == queued
+    reasons = [
+        e["reason"]
+        for e in transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    ]
+    assert reasons and "could not be re-rendered" in reasons[0]
+
+
+def test_a_queued_changeset_naming_no_candidate_is_kept_not_dropped(tmp_path):
+    """An entry that names no commit has no commit whose absence could be
+    established — there is nothing to prove and so nothing may be destroyed on
+    it. Same refusal `_rebuild_changeset_packet_at_head` makes for any missing
+    identifier, for the same reason: the four come off the stored entry or the
+    rebuild declines."""
+    wiring = ChangesetWiring(tmp_path)
+    queued = {k: v for k, v in wiring.queued.items() if k != "candidate_sha"}
+    wiring.state.changeset = dict(queued)
+
+    wiring.orch._to_needs_user(
+        "changeset push refused — the candidate no longer resolves",
+        kind="loop_fatal", code="push_candidate_unresolvable",
+    )
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.changeset == queued
+    reasons = [
+        e["reason"]
+        for e in transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    ]
+    assert reasons and reasons[0] == "the queued changeset carries no candidate_sha"
+
+
+def test_a_changeset_entry_that_is_not_a_record_parks_instead_of_raising(tmp_path):
+    """A hand-edited state file is the one caller that can put something other
+    than a dict here, and `queued.get(...)` on it is an `AttributeError` inside
+    a park handler — a crashed process instead of a park. It is also not a thing
+    to delete: nothing here can read it well enough to say what it was."""
+    orch, config, _, _, _ = build(tmp_path, enabled=True, in_flight=None)
+    orch.state.phase = Phase.EXECUTING.value
+    orch.state.changeset = "queued by hand, badly"
+
+    orch._to_needs_user("changeset push refused — the candidate no longer resolves",
+                        kind="loop_fatal", code="push_candidate_unresolvable")
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.changeset == "queued by hand, badly"
+    reasons = [
+        e["reason"] for e in transcript_entries(config, "autonomous_rebuild_refused")
+    ]
+    assert reasons and "not a record this can read" in reasons[0]
 
 
 def test_the_changeset_arm_rebuilds_a_queued_review_whose_candidate_still_resolves(
@@ -1548,30 +1756,38 @@ def test_the_changeset_arm_is_not_captured_by_an_unrelated_task_in_flight(tmp_pa
     at any moment. With the in-flight fallback consulted, the rebuild took the
     TASK branch: it forgot an innocent task's approval binding and left the
     queued changeset, the record that had actually gone stale, exactly where it
-    was. Wrong twice — it damaged approvable work AND did not fix the fault."""
-    orch, config, _, _, _ = build(tmp_path, enabled=True, in_flight="t1")
-    orch.state.phase = Phase.EXECUTING.value
-    orch.state.sent_postcommits = [
+    was. Wrong twice — it damaged approvable work AND did not fix the fault.
+
+    Driven off `ChangesetWiring` since the halt-03 revision, because the drop
+    now requires git to have ANSWERED that the object is gone: the hand-built
+    dict this used to carry named a short sha on a loop with no gateway, which
+    is the unverifiable case and now parks. The routing claim is unchanged and
+    is what is asserted."""
+    wiring = ChangesetWiring(tmp_path, tasks=("t1",))
+    wiring.state.task_execution = {"task_id": "t1"}
+    wiring.state.phase = Phase.EXECUTING.value
+    wiring.state.sent_postcommits = [
         {"request_id": "alr-live",
          "postcommit": {"task_id": "t1", "candidate_sha": "live"}},
     ]
-    orch.state.carry_postcommit = {"task_id": "t1", "candidate_sha": "live"}
-    orch.state.changeset = {"candidate_sha": "cafe", "base_sha": "beef",
-                            "branch": "main", "dest_ref": "refs/heads/main"}
+    wiring.state.carry_postcommit = {"task_id": "t1", "candidate_sha": "live"}
+    wiring.state.changeset = {**wiring.queued, "candidate_sha": ABSENT_SHA}
 
-    orch._to_needs_user("changeset push refused — the reviewed candidate no "
-                        "longer resolves", kind="loop_fatal",
-                        code="push_candidate_unresolvable")
+    wiring.orch._to_needs_user("changeset push refused — the reviewed candidate "
+                               "no longer resolves", kind="loop_fatal",
+                               code="push_candidate_unresolvable")
 
-    assert orch.state.phase == Phase.READY.value
+    assert wiring.orch.state.phase == Phase.READY.value
     # The record that was stale is gone...
-    assert orch.state.changeset is None
+    assert wiring.orch.state.changeset is None
     # ...and the innocent task's approvable binding is untouched.
-    assert [r["request_id"] for r in orch.state.sent_postcommits] == ["alr-live"]
-    assert orch.state.carry_postcommit == {"task_id": "t1", "candidate_sha": "live"}
-    entry = transcript_entries(config, "autonomous_rebuild")[0]
+    assert [r["request_id"] for r in wiring.orch.state.sent_postcommits] == ["alr-live"]
+    assert wiring.orch.state.carry_postcommit == {
+        "task_id": "t1", "candidate_sha": "live"
+    }
+    entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
     assert entry["task_id"] == NO_TASK
-    assert entry["discarded_changeset"]["candidate_sha"] == "cafe"
+    assert entry["discarded_changeset"]["candidate_sha"] == ABSENT_SHA
 
 
 def test_a_refused_task_free_rebuild_quarantines_nobody(tmp_path):

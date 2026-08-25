@@ -10647,8 +10647,10 @@ class Orchestrator:
     # record kind, a missing store, a registry that refuses the move, an
     # unreadable record, a published candidate, a verdict still in flight, a
     # spent recut cap, a retirement that left residue on disk, a queued
-    # changeset missing an identifier, no git gateway to render a packet with,
-    # and a packet that cannot be rendered or that comes back unbindable.
+    # changeset missing an identifier, no git gateway to render a packet with
+    # or to ask about a commit, a repository that did not answer whether a
+    # commit exists, and a packet that cannot be rendered or that comes back
+    # unbindable.
     #
     # **A REBUILD THAT LEAVES THE LOOP UNABLE TO PUBLISH IS NOT A REBUILD**, and
     # the first cut of halt-03 got that wrong twice in the same shape. Both times
@@ -10676,8 +10678,10 @@ class Orchestrator:
     # "Rebuild" is not a synonym for "discard". `_replace_outbox` is the only way
     # any of them swaps the payload, so a displaced packet's chunking leftovers
     # cannot ride onto the next request; and a record is dropped only where
-    # nothing could be rebuilt from it — an audit unit nobody minted, a
-    # changeset candidate that does not resolve.
+    # nothing could be rebuilt from it AND that has been established rather than
+    # inferred — an audit unit nobody minted, a changeset candidate git itself
+    # reports its object database does not hold (`_commit_presence`). A question
+    # the repository could not answer is not an answer, and parks.
 
     def _autonomous_rebuild(self, plan, blocker, *, code: str) -> bool:
         """Archive `plan`'s stale record, rebuild at the current head and leave
@@ -11294,22 +11298,39 @@ class Orchestrator:
         approval.** The binding that failed and the entry an operator queued can
         name different commits — the approval carries whatever was bound when
         the packet went out, and `review-changeset` can have been run again
-        since. So this asks the repository about the ENTRY's own candidate:
+        since. So this asks the repository about the ENTRY's own candidate, and
+        acts on THREE answers rather than two:
 
-        * it still resolves → the entry is fine and only the packet standing in
-          front of it is stale, which is `_rebuild_changeset_packet_at_head`'s
-          case exactly. Reused rather than re-implemented, so the operator's
-          review survives and the four identifiers still come only from the
-          stored entry.
-        * it does not resolve (or there is no gateway to ask) → no packet can be
-          rendered from it and no approval could ever publish it, so dropping is
-          the only truthful action left. The WHOLE record goes to the transcript
-          first, because an operator queued it and the state file is about to be
+        * git says the commit IS there → the entry is fine and only the packet
+          standing in front of it is stale, which is
+          `_rebuild_changeset_packet_at_head`'s case exactly. Reused rather than
+          re-implemented, so the operator's review survives and the four
+          identifiers still come only from the stored entry.
+        * git says the commit is NOT there → no packet can be rendered from it
+          and no approval could ever publish it, so dropping is the only
+          truthful action left. The WHOLE record goes to the transcript first,
+          because an operator queued it and the state file is about to be
           rewritten.
+        * **the question went UNANSWERED → park, with the queued review
+          untouched.** This is the third answer an earlier cut of halt-03 did
+          not have, and its absence was a fail-open in the destructive
+          direction: no git gateway, a repository that is not there, an I/O
+          error, a policy refusal and a name git will not parse all read as
+          "does not resolve", and each of them DELETED an operator's queued
+          review on evidence that was never gathered. Only git's own "the object
+          database does not hold this" destroys a record here; anything else
+          leaves it exactly where it was for an operator to see, which is the
+          park this feature is allowed to fail back to. See `_commit_presence`
+          for how the three answers are told apart.
 
-        Refuses when there is no queued changeset at all: re-dispatching without
-        having changed anything is theatre that costs a round and arrives at the
-        same park.
+        Refuses when there is no queued changeset at all, when it is not a
+        record this can read, and when it carries no `candidate_sha` — the last
+        for the same reason `_rebuild_changeset_packet_at_head` refuses a
+        missing identifier rather than re-deriving one: an entry that names no
+        commit has no commit whose absence could be established, so there is
+        nothing to prove and nothing may be destroyed on it. Re-dispatching
+        without having changed anything is theatre that costs a round and
+        arrives at the same park.
         """
         state = self.state
         queued = state.changeset
@@ -11317,12 +11338,41 @@ class Orchestrator:
             return self._refuse_rebuild(
                 code, "there is no task and no queued changeset to drop"
             )
-        candidate = (
-            str(queued.get("candidate_sha") or "") if isinstance(queued, dict) else ""
-        )
-        if candidate and self._git is not None and self._object_resolves(self._git, candidate):
+        if not isinstance(queued, dict):
+            # A hand-edited state file, and the one shape this cannot read at
+            # all. Parking keeps it; `queued.get` below would raise inside a
+            # park handler, which is the one place a second failure has nowhere
+            # to go.
+            return self._refuse_rebuild(
+                code,
+                "the queued changeset is not a record this can read "
+                f"({type(queued).__name__})",
+            )
+        candidate = str(queued.get("candidate_sha") or "")
+        if not candidate:
+            return self._refuse_rebuild(
+                code, "the queued changeset carries no candidate_sha"
+            )
+        if self._git is None:
+            # NOT evidence about the commit. "Nobody to ask" is the shape of
+            # unverifiability, not of absence, and dropping the entry here would
+            # destroy an operator's review on the strength of this loop's own
+            # missing collaborator.
+            return self._refuse_rebuild(
+                code,
+                "this loop has no git gateway to ask whether the reviewed "
+                f"candidate {candidate[:12]} still exists",
+            )
+        present = self._commit_presence(self._git, candidate)
+        if present is None:
+            return self._refuse_rebuild(
+                code,
+                f"the repository did not answer whether {candidate[:12]} exists, "
+                "so its absence is not established",
+            )
+        if present:
             return self._rebuild_changeset_packet_at_head(code=code)
-        discarded_changeset = dict(queued) if isinstance(queued, dict) else str(queued)
+        discarded_changeset = dict(queued)
         state.changeset = None
         self._log(
             "autonomous_rebuild",
@@ -11335,16 +11385,20 @@ class Orchestrator:
                 # the only surviving copy of an operator's changeset once the
                 # state file is rewritten below.
                 "discarded_changeset": discarded_changeset,
+                # WHAT was established, not merely what was tried: this record
+                # is destroyed only on git's own `cat-file -e` "no", and the
+                # line says which question was answered to authorize it.
+                "candidate_absent_per": "git cat-file -e",
             },
         )
         state.last_response = None
         self._replace_outbox(state, (
             "STALE APPROVAL BINDING DISCARDED — the queued changeset review.\n\n"
-            "The reviewed candidate an approval named no longer resolves in this "
-            "repository, so no packet could be rebuilt from it and no approval "
-            "could ever publish it. The loop dropped the queued review rather "
-            "than waiting for an operator to. Nothing was pushed; its full "
-            "record is in the transcript.\n\n"
+            "The reviewed candidate this repository's object database does not "
+            "hold, so no packet could be rebuilt from it and no approval could "
+            "ever publish it. The loop dropped the queued review rather than "
+            "waiting for an operator to. Nothing was pushed; its full record is "
+            "in the transcript.\n\n"
             "Re-queue with `review-changeset` if the candidate still exists "
             "under another id."
         ))
@@ -11352,16 +11406,48 @@ class Orchestrator:
         return True
 
     @staticmethod
-    def _object_resolves(git: GitGateway, oid: str) -> bool:
-        """Does `oid` name a commit this gateway can read? False for every
-        failure, including a repository that is not there (`OSError`) — the
-        fail-closed direction, since the only thing this answer authorizes is
-        KEEPING a record rather than acting on one."""
+    def _commit_presence(git: GitGateway, oid: str) -> bool | None:
+        """Does this repository hold `oid`? `True` / `False` ONLY when git
+        itself answered; `None` when the question went unanswered.
+
+        **What each answer authorizes, which is the whole reason this is
+        tri-state.** `True` authorizes rebuilding a packet for the record it is
+        about — and that rebuild verifies its own result before dispatching it.
+        `False` — git's own "the object database does not hold this" — is the
+        only answer that authorizes DESTROYING that record. `None` authorizes
+        nothing at all: the caller parks with the record untouched, which is the
+        state the loop is already in when it asks.
+
+        It replaces halt-03's `_object_resolves`, whose two-value answer folded
+        "git says no" together with "git could not look". That was written as
+        fail-closed for a caller that KEEPS records and read by one that
+        DESTROYS them, so absence of a repository, an I/O error, a policy
+        refusal and a name git will not parse each came back as "gone" and took
+        an operator's queued review with them.
+
+        The shape is `cli._candidate_is_retired`'s, and it is that shape there
+        for the same reason: `cat-file commit` dies with the SAME status for a
+        missing object, a corrupt one, an I/O error and a policy refusal, so its
+        failure proves only that the question went unanswered. `GitGateway.
+        object_exists` is the one probe whose exit code carries the distinction
+        (0 present, 1 absent, anything else raises rather than guessing), so a
+        raise from `read_commit` leads to one MORE question rather than to a
+        verdict.
+
+        An object that exists but is not a readable commit therefore answers
+        `True`, not `False` — "present" is the fail-closed reading of it, and
+        the caller's rebuild refuses on the render that follows rather than
+        destroying a record over a shape nobody has diagnosed.
+        """
         try:
             git.read_commit(oid)
+            return True
         except (GitError, OSError):
-            return False
-        return True
+            pass
+        try:
+            return git.object_exists(oid)
+        except (GitError, OSError):
+            return None
 
     def _rebuild_changeset_packet_at_head(self, *, code: str) -> bool:
         """`changeset_binding_missing`: KEEP the operator's queued changeset and

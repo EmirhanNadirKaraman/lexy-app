@@ -434,11 +434,16 @@ STALE_RECORD_RECOVERIES: dict[str, AutonomousRecovery] = {
                 "record's own candidate is usually that same unresolvable "
                 "commit, so there is nothing to re-present and the rebuild routes "
                 "to the archive-and-recut path rather than emitting an unbound "
-                "request. On the CHANGESET arm the queue entry decides: its "
-                "candidate still resolving means only the packet was stale, so "
-                "the packet is rebuilt around it; a candidate that does not "
-                "resolve is dropped, after its whole record is written to the "
-                "transcript. Nothing is pushed on this path, ever."
+                "request. On the CHANGESET arm the queue entry decides, and only "
+                "on GIT'S OWN answer about it: a candidate the repository "
+                "reports it holds means only the packet was stale, so the packet "
+                "is rebuilt around it; one the repository reports it does not "
+                "hold is dropped, after its whole record is written to the "
+                "transcript. A question that went unanswered — no gateway, a "
+                "probe that died, a repository that is not there — is neither, "
+                "and parks with the operator's review untouched, because that "
+                "record exists nowhere else afterwards. Nothing is pushed on "
+                "this path, ever."
             ),
         ),
         AutonomousRecovery(

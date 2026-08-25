@@ -7040,11 +7040,27 @@ unconditional.
 Its CHANGESET arm asks the queue entry, not the approval, which record is stale —
 the two can name different commits, since the binding is whatever was bound when
 the packet went out and `review-changeset` may have been run again since. An
-entry whose candidate still resolves is a fine review standing behind a stale
-packet, so it goes through `_rebuild_changeset_packet_at_head` and survives. An
-entry whose candidate does not resolve can render no packet and could never be
-published by any approval, so it is dropped — with its whole record written to
-the transcript first, because an operator queued it.
+entry whose candidate git reports it HOLDS is a fine review standing behind a
+stale packet, so it goes through `_rebuild_changeset_packet_at_head` and
+survives. An entry whose candidate git reports it does NOT hold can render no
+packet and could never be published by any approval, so it is dropped — with its
+whole record written to the transcript first, because an operator queued it.
+
+**A question the repository could not answer is not an answer, and this is the
+one arm where getting that wrong destroys something.** `_commit_presence` is
+therefore tri-state: `True` and `False` only when git itself said so, `None`
+when it did not, and only `False` authorizes dropping the entry. `cat-file
+commit` dies with the SAME status for a missing object, a corrupt one, an I/O
+error and a policy refusal, so its failure proves nothing; `GitGateway.
+object_exists` is the one probe whose exit code carries the distinction (0
+present, 1 absent, anything else raises), which is why `cli._candidate_is_
+retired` is built the same way. No gateway at all, a repository that is not
+there, an entry that is not a readable record, and an entry naming no candidate
+all park with the queued review exactly where it was — the state the loop was
+already in when it asked. The first cut had two values here and dropped the
+operator's review on every one of those, i.e. it fail-opened in the destructive
+direction: the record this feature can destroy is the only one that exists
+nowhere else once the state file is rewritten.
 
 **Nothing that swaps the outbox leaves the old packet's delivery state behind.**
 Every rebuild goes through `_replace_outbox`, which clears `outbox_diff` and

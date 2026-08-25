@@ -413,6 +413,15 @@ test_selection = "reachable"
 # to a destination nobody named — and a packet that cannot be rendered, or that
 # comes back without them, parks instead of being sent.
 #
+# The one path that CAN drop a queued review is the changeset arm of
+# push_candidate_unresolvable, and it acts only on git's own answer: the
+# repository must report that its object database does not hold the reviewed
+# candidate. No gateway to ask, a probe that died, a checkout that is not there,
+# an entry nothing can read or one naming no candidate at all are UNANSWERED
+# questions rather than answers, and each parks with the review exactly where it
+# was. That record exists nowhere else once the state file is rewritten, so it is
+# destroyed on evidence or not at all.
+#
 # AND NOTHING IS LEFT UNPUBLISHABLE. The two push_candidate_* codes hold a stale
 # APPROVAL BINDING rather than a record, and dropping one is only half a remedy:
 # the candidate the task still holds would have no packet a later approval could
