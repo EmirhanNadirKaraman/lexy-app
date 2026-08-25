@@ -2,7 +2,7 @@
 marker that lets a crash between "commit ran" and "the SHA was persisted" be
 reconciled safely.
 
-Two things live here.
+Three things live here.
 
 **`TaskExecution`** is the per-task bookkeeping record: which branch and
 worktree the task ran in, the base sha recorded BEFORE any implementation
@@ -23,6 +23,16 @@ commit may or may not have happened. `git commit_and_capture` (in
 — never predicting or precomputing the sha — so if the process dies between
 "commit exited 0" and "the candidate sha was saved", the intent file is the
 only durable evidence that a commit was ATTEMPTED and what it was attempting.
+
+**`SplitIntent`** is the same idea one level up, for an operation that spans
+THREE stores rather than a file and a git repository: accepting a
+decomposition at the attempt ceiling has to move the task registry, the
+parent's execution record and the parent's worker repository, and nothing can
+write all three at once. The marker is written before the first of them and
+cleared after the last, and `reconcile_split_acceptance` reads it at startup
+and finishes — or discards — whatever a crash left in between. See the section
+at the bottom of this module for why the marker is a durable INTENT rather
+than a tighter write ordering.
 
 **Why identity and the commit message cannot tell a loop commit from a human
 one (F8).** The loop uses one git identity and one message convention for
@@ -64,7 +74,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Sequence
 
-from .errors import StateCorruptError
+from .errors import GitError, StateCorruptError, StateError
 from .state import utcnow_iso
 
 
@@ -1182,3 +1192,318 @@ def reconcile_after_crash(
         # subset of the plan", it is not the planned work at all.
         return Reconciliation.AMBIGUOUS
     return Reconciliation.RECOVERABLE
+
+
+# ---------------------------------------------------------------------------
+# Split acceptance across three stores
+# ---------------------------------------------------------------------------
+#
+# Accepting a decomposition at the attempt ceiling
+# (`orchestrator._dispatch_ceiling_split`) has to move THREE things that live in
+# three different places and cannot be written in one operation:
+#
+#   1. the TASK REGISTRY — the children are added and the parent is retired into
+#      them (`tasks.json`, one atomic `os.replace`, so those two land together);
+#   2. the parent's EXECUTION RECORD — archived to `executions/archive/`;
+#   3. the parent's WORKER REPOSITORY — moved to `quarantine/`.
+#
+# A process that dies between (1) and (2) leaves the registry saying the parent
+# is retired while its record still sits in `executions/*.json` holding the
+# repository-wide merge window shut (`cli._merge_window_blockers`) and its worker
+# still sits at `workers/<parent>`. That state is CONTRADICTORY, and it is silent:
+# nothing announces it, and the parent will never be dispatched again, so nothing
+# will ever notice on its own.
+#
+# THREE WAYS TO ANSWER THAT, AND WHY THIS IS THE ONE. Ordering the writes so
+# every crash point is merely STALE is what the code already did — registry,
+# then record, then worker, each ordered against the loudness of the residue it
+# would leave — and the interval above is what that ordering still produces.
+# There is no fourth store to order it against and no commit point the three
+# share, so no ordering closes it. Shrinking the window is not a bound either:
+# the interval can be made small and cannot be made empty, and a rare
+# contradiction that nothing reports is worse than a common one that does.
+#
+# So the answer here is the shape the pre-commit marker above already uses for a
+# commit that may or may not have landed: write a durable INTENT first, and
+# RECONCILE against it at startup. The reconciliation is idempotent — it can run
+# any number of times, on a state that is already finished, and change nothing —
+# which is what makes "crash during recovery" merely another crash rather than a
+# new failure mode.
+#
+# THE MARKER IS NOT THE AUTHORITY. It says only that a split of `parent_id` into
+# `child_ids` was ATTEMPTED. Whether it actually happened is read from the
+# REGISTRY, every time, and the registry has the last word:
+#
+#   * parent not retired  -> the registry write never landed. Nothing durable
+#     happened, the parent still owns its record and its worker, and the marker
+#     is discarded WITHOUT touching either. (This also covers the synchronous
+#     half-applied park, where the children persisted and the retirement was
+#     refused — there the parent is deliberately still live.)
+#   * parent retired into exactly these children -> the registry write landed.
+#     Finish the artefact half, idempotently, and discard the marker.
+#   * anything else — no such task, retired into a DIFFERENT successor set —
+#     touch nothing, keep the marker, and report. A marker that cannot prove it
+#     describes what the registry recorded must never move a task's artefacts.
+#
+# That last rule is the fail-closed one, and it is the reason this reads the
+# registry rather than trusting the file it just found on disk.
+
+
+#: Where `SplitIntentStore` keeps its markers, as a child of the loop's state
+#: directory. Spelled here, beside the store, so the on-disk layout has exactly
+#: one speller — the same reason `TaskExecutionStore.archive` owns `archive/`.
+SPLIT_INTENTS_DIRNAME = "split-intents"
+
+
+def split_intents_dir(state_dir: Path) -> Path:
+    """Where `SplitIntentStore` keeps one marker per split being accepted."""
+    return Path(state_dir) / SPLIT_INTENTS_DIRNAME
+
+
+#: The retirement `reason` a reconciliation falls back to when the marker it is
+#: finishing carries none — a hand-written one, or one written before the field
+#: existed. Never reached for a marker this loop wrote:
+#: `orchestrator._dispatch_ceiling_split` always records
+#: `CEILING_SPLIT_RETIREMENT_REASON`, and re-using the marker's own reason is
+#: what keeps the archived record and the quarantined worker findable from one
+#: another afterwards (they are `<task_id>-<reason>-<stamp>`, and a recovery
+#: necessarily runs at a different second than the attempt it is finishing).
+DEFAULT_SPLIT_RETIREMENT_REASON = "split-accepted"
+
+
+@dataclass
+class SplitIntent:
+    """A decomposition acceptance that is in flight across the three stores.
+
+    Written durably BEFORE the first of them moves and cleared only after the
+    last one has, so its presence means exactly one thing: a split of
+    `parent_id` was attempted and this process did not see it through to the
+    end. It is deliberately tiny — everything else needed to finish the job is
+    read from the stores themselves, because a marker that carried a copy of
+    the registry's answer could disagree with it.
+    """
+
+    parent_id: str
+    child_ids: tuple[str, ...]
+    #: The `reason` half of the retirement label, so a recovery files the two
+    #: surviving halves under the same reason the attempt used.
+    reason: str = ""
+    created_at: str = field(default_factory=utcnow_iso)
+
+
+class SplitIntentStore:
+    """One JSON file per PARENT task id under `directory`.
+
+    Same durability and same failure discipline as `IntentStore`: written with
+    `_atomic_write_json` (temp file + `os.replace`, both fsync'd), and a file
+    that cannot be parsed RAISES `StateCorruptError` rather than reading as
+    absent. The second half is the load-bearing one — absence here means "no
+    split was in flight", so a corrupt marker read as absent would leave the
+    contradictory state in place with nothing left to notice it, which is the
+    alarm silently switching itself off.
+    """
+
+    def __init__(self, directory: Path):
+        self.directory = Path(directory)
+
+    def _path(self, parent_id: str) -> Path:
+        return self.directory / f"{parent_id}.json"
+
+    def path_for(self, parent_id: str) -> Path:
+        """Where this store keeps `parent_id`'s marker, whether or not one is
+        there. Read-only; nothing here creates or removes anything."""
+        return self._path(parent_id)
+
+    def save(self, intent: SplitIntent) -> None:
+        data = asdict(intent)
+        data["child_ids"] = list(intent.child_ids)
+        _atomic_write_json(self._path(intent.parent_id), data)
+
+    def load(self, parent_id: str) -> SplitIntent | None:
+        path = self._path(parent_id)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise StateCorruptError(f"split intent {path} is unreadable: {exc}") from exc
+        if not isinstance(data, dict):
+            raise StateCorruptError(
+                f"split intent {path} is not a JSON object ({type(data).__name__})"
+            )
+        children = data.get("child_ids", ())
+        if isinstance(children, str) or not isinstance(children, (list, tuple)):
+            # The same trap `tasks._persisted_superseded_by` documents: a bare
+            # string is iterable, so `tuple("t1-a")` would load as five
+            # single-character "children" and the set comparison below would
+            # then never match — the marker would sit there forever while the
+            # reconciliation reported AMBIGUOUS every startup.
+            raise StateCorruptError(
+                f"split intent {path} has child_ids {children!r}, which is not a "
+                "list of task ids"
+            )
+        data["child_ids"] = tuple(str(child) for child in children)
+        if str(data.get("parent_id", "")) != parent_id:
+            # Acting on this would retire the record and worker of a task the
+            # marker does not describe, which is the one irreversible mistake
+            # available here. Refused rather than trusted either way.
+            raise StateCorruptError(
+                f"split intent {path} names parent {data.get('parent_id')!r} but is "
+                f"filed under {parent_id!r}"
+            )
+        try:
+            return SplitIntent(**data)
+        except TypeError as exc:
+            raise StateCorruptError(f"split intent {path} is unreadable: {exc}") from exc
+
+    def clear(self, parent_id: str) -> None:
+        self._path(parent_id).unlink(missing_ok=True)
+
+    def pending(self) -> tuple[str, ...]:
+        """Every parent id this store currently holds a marker for, sorted.
+
+        Filenames only — nothing is parsed here, so one corrupt marker does not
+        hide the others from the sweep. A directory that does not exist yet is
+        the ordinary case (no split has ever been accepted) and answers `()`.
+        """
+        if not self.directory.is_dir():
+            return ()
+        names = sorted(
+            path.name for path in self.directory.glob("*.json") if path.is_file()
+        )
+        return tuple(name[: -len(".json")] for name in names)
+
+
+class SplitAcceptance(str, Enum):
+    #: The registry never recorded the retirement, so nothing durable happened
+    #: to the artefacts and the marker is spent. Nothing was touched.
+    UNAPPLIED = "unapplied"
+    #: The registry recorded the retirement and the artefact half is now done —
+    #: either finished by this call, or already finished before it. The marker
+    #: is spent.
+    COMPLETED = "completed"
+    #: The registry recorded the retirement and the artefact half could not be
+    #: finished. The marker is KEPT so the next start tries again.
+    FAILED = "failed"
+    #: The marker cannot be shown to describe what the registry recorded, or
+    #: this run cannot act on it at all. Nothing was touched and the marker is
+    #: KEPT. The wide, fail-closed bucket, exactly like `Reconciliation`'s.
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class SplitReconciliation:
+    """What one `reconcile_split_acceptance` call decided, and what it moved."""
+
+    parent_id: str
+    outcome: SplitAcceptance
+    #: Why, in words, for the transcript and for an operator-facing blocker.
+    #: Empty exactly when there is nothing to explain (a clean COMPLETED).
+    detail: str = ""
+    #: The artefacts this call actually filed away, when it filed any.
+    retirement: Retirement | None = None
+
+    @property
+    def intent_is_spent(self) -> bool:
+        """May the caller delete the marker?
+
+        True only for the two outcomes that PROVED what happened. `FAILED` and
+        `AMBIGUOUS` both keep it, because a marker deleted on either would take
+        the last durable record of an unfinished split with it.
+        """
+        return self.outcome in (SplitAcceptance.UNAPPLIED, SplitAcceptance.COMPLETED)
+
+
+def reconcile_split_acceptance(
+    intent: SplitIntent, registry, execution_store, worker_repos
+) -> SplitReconciliation:
+    """Finish, discard, or refuse to act on one in-flight split acceptance.
+
+    IDEMPOTENT. Running it twice on the same state produces the same answer and
+    the same disk: `TaskExecutionStore.archive` returns `None` when there is no
+    live record left to file, and `WorkerRepoManager.quarantine` is only reached
+    when the worker directory still exists. So a crash DURING a recovery is just
+    another crash, and the next start finishes from wherever it got to.
+
+    `registry` is duck-typed (`has`/`get` returning a row with `status` and
+    `superseded_by`) rather than imported, so this module keeps its current
+    import surface and the reconciliation stays testable against a stub.
+
+    **Deliberately NOT routed through `orchestrator.release_task_to_pending`,**
+    even though that is otherwise THE release path. Two reasons, and the first
+    is a correctness one: that function's `_repair_orphaned_record` puts the
+    execution record BACK beside a worker the next dispatch could resume — and a
+    split parent's worker passes that probe, while the parent itself is retired
+    and will never be dispatched again. Routing a recovery through it would
+    archive the record and then restore it, holding the merge window shut, which
+    is the exact harm being repaired. Second, the STATUS half is already done
+    here by definition: this only runs when the registry says so.
+    """
+    parent_id = intent.parent_id
+    if execution_store is None or worker_repos is None:
+        return SplitReconciliation(
+            parent_id,
+            SplitAcceptance.AMBIGUOUS,
+            "this run has no execution store and worker-repository manager, so the "
+            "parent's record and worker cannot be retired — the marker is kept for "
+            "a run that can",
+        )
+    if not registry.has(parent_id):
+        return SplitReconciliation(
+            parent_id,
+            SplitAcceptance.AMBIGUOUS,
+            f"the task registry does not hold '{parent_id}', so whether its "
+            "decomposition was recorded cannot be established",
+        )
+    task = registry.get(parent_id)
+    status = getattr(task, "status", "")
+    if status != "retired":
+        return SplitReconciliation(
+            parent_id,
+            SplitAcceptance.UNAPPLIED,
+            f"'{parent_id}' is {status or '(no status)'} rather than retired, so the "
+            "registry write never landed and its execution record and worker "
+            "repository are still its own",
+        )
+    recorded = {str(child) for child in getattr(task, "superseded_by", ())}
+    wanted = {str(child) for child in intent.child_ids}
+    # Compared as SETS: `superseded_by` round-trips through JSON in the order it
+    # was written, so exact-tuple equality would hold today — and would start
+    # silently failing (permanently AMBIGUOUS, and so permanently unreconciled)
+    # the first time anything normalised that order. Order carries no meaning
+    # for a successor list, so nothing is given up by not requiring it.
+    if not wanted or recorded != wanted:
+        return SplitReconciliation(
+            parent_id,
+            SplitAcceptance.AMBIGUOUS,
+            f"'{parent_id}' is retired into "
+            f"{', '.join(sorted(recorded)) or '(no successor recorded)'}, but the "
+            f"marker describes a split into "
+            f"{', '.join(sorted(wanted)) or '(no children recorded)'} — this marker "
+            "cannot be shown to describe that retirement",
+        )
+    reason = intent.reason or DEFAULT_SPLIT_RETIREMENT_REASON
+    problems: list[str] = []
+    # ONE RETRY under a distinct label, for the same reason
+    # `orchestrator.release_task_to_pending` has one: `retire_execution` derives
+    # its label from the reason plus a WHOLE-SECOND timestamp, so a recovery
+    # landing in the same second as a destination that already exists collides
+    # by construction. Safe to repeat because both halves are absence-tolerant.
+    for attempt_reason in (reason, f"{reason}-retry"):
+        try:
+            retirement = retire_execution(
+                parent_id, execution_store, worker_repos, reason=attempt_reason
+            )
+        except (GitError, StateError, OSError) as exc:
+            problems.append(str(exc))
+            continue
+        return SplitReconciliation(
+            parent_id, SplitAcceptance.COMPLETED, retirement=retirement
+        )
+    return SplitReconciliation(
+        parent_id,
+        SplitAcceptance.FAILED,
+        f"'{parent_id}' is retired into {', '.join(sorted(wanted))}, but its "
+        f"execution record and worker repository could not be retired: "
+        + "; then ".join(problems),
+    )

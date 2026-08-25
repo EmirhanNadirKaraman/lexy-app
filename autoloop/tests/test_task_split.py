@@ -23,7 +23,10 @@ The four things that break it if left untested, one section each below:
   * the new plan must be REQUIRED to differ from the stored one, because the
     planner is the same reviewer that just refused the work five times — and the
     request itself shows it the stored plan, so handing it straight back is an
-    echo rather than a classification.
+    echo rather than a classification;
+  * accepting a split must be CRASH-CONSISTENT (split-04) — it moves three
+    stores that share no commit point, so the last section grades what is left
+    behind when the process does not survive doing it.
 
 Real git and real worker repos throughout, with the `run_git` / executor / build
 helpers duplicated per this suite's self-contained convention (the same shape
@@ -40,9 +43,15 @@ from pathlib import Path
 
 import pytest
 
+from autoloop.blockers import BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Decomposition, parse_response
-from autoloop.errors import StateCorruptError, StateError, TaskGraphError
+from autoloop.errors import (
+    GitCommandError,
+    StateCorruptError,
+    StateError,
+    TaskGraphError,
+)
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
@@ -54,6 +63,7 @@ from autoloop.orchestrator import (
     MAX_TASK_ATTEMPTS,
     MIN_CEILING_SPLIT_TASKS,
     MIN_CHILD_ATTEMPTS,
+    SPLIT_ACCEPTANCE_UNRECONCILED,
     Orchestrator,
     release_task_to_pending,
 )
@@ -64,9 +74,13 @@ from autoloop.transcript import TranscriptLogger
 from autoloop.worker_env import WorkerRepoManager
 from autoloop.worktask import (
     IntentStore,
+    SplitAcceptance,
+    SplitIntent,
     TaskExecution,
     TaskExecutionStore,
     preserve_execution,
+    reconcile_split_acceptance,
+    split_intents_dir,
 )
 
 URL = "https://chatgpt.com/c/test-conversation"
@@ -1585,3 +1599,490 @@ def test_the_decision_vocabulary_is_unchanged(tmp_path):
         "stop",
         "ask_user",
     }
+
+
+# ---------------------------------------------------------------------------
+# accepting a split is crash-consistent across all three stores (split-04)
+# ---------------------------------------------------------------------------
+#
+# Everything above grades WHAT a split does. This section grades what is left
+# behind when the process does not survive doing it.
+#
+# Acceptance moves three stores that share no commit point: the task registry
+# (`tasks.json`), the parent's execution record (`executions/<id>.json`) and the
+# parent's worker repository (`workers/<id>`). A process that dies after the
+# registry save and before `retire_execution` leaves the registry saying the
+# parent is retired while both artefacts are still live — a state that is not
+# merely stale but CONTRADICTORY, and silent: the surviving record holds the
+# repository-wide merge window shut (`cli._merge_window_blockers`) and the
+# retired parent is never dispatched again for anything to notice.
+#
+# The claim these tests grade: a crash at ANY write boundary leaves a state the
+# next start reconciles, and the three stores then agree. Every one of them
+# reloads from DISK through `reopen` before asserting anything — an assertion
+# against the crashed process's own in-memory registry would pass without
+# checking that a single byte was durable.
+
+
+class Boom(RuntimeError):
+    """A crash, not a failure.
+
+    Deliberately NOT one of the types `release_task_to_pending` or
+    `_dispatch_ceiling_split` catch. A caught exception is the SYNCHRONOUS error
+    path — those are already handled, and are tested separately below. What is
+    being simulated here is the process going away mid-sequence, and the closest
+    a test can get to that is an exception nothing on the path is prepared for.
+    """
+
+
+def marker(wiring, task_id="t1") -> Path:
+    """The split-acceptance marker's path, through the SAME helper the loop
+    resolves it with. A second speller here is how a test starts passing against
+    a directory production stopped using."""
+    return split_intents_dir(wiring.config.state_dir) / f"{task_id}.json"
+
+
+def live_record(wiring, task_id="t1") -> bool:
+    return (wiring.tmp_path / "executions" / f"{task_id}.json").exists()
+
+
+def live_worker(wiring, task_id="t1") -> bool:
+    return (wiring.tmp_path / "workers" / task_id).exists()
+
+
+def archived_records(wiring, task_id="t1"):
+    return sorted((wiring.tmp_path / "executions" / "archive").glob(f"{task_id}-*.json"))
+
+
+def quarantined_workers(wiring, task_id="t1"):
+    return sorted((wiring.tmp_path / "quarantine").glob(f"{task_id}-*"))
+
+
+def open_codes(wiring):
+    return [b.code for b in BlockerStore(wiring.config.blockers_dir).open_blockers()]
+
+
+def reopen(wiring, responses=()) -> Wiring:
+    """A SECOND process over the same state directory.
+
+    Every store is rebuilt and the registry is RE-READ from `tasks.json`. That
+    is the whole point of the helper: reusing the crashed process's in-memory
+    registry would assert nothing about what is durable, and is the likeliest
+    way a crash-recovery test passes while checking nothing. It also puts the
+    round trip through `_persisted_superseded_by` on every assertion about which
+    children the parent was retired into.
+
+    Unlike `build`, this wires a real `BlockerStore`, because the failure
+    endings below report through one.
+    """
+    config = wiring.config
+    git = GitGateway(wiring.tmp_path / "repo", PolicyEngine(config.policy))
+    worker_repos = WorkerRepoManager(
+        wiring.tmp_path / "workers", wiring.tmp_path / "worker-hooks"
+    )
+    execution_store = TaskExecutionStore(wiring.tmp_path / "executions")
+    task_store = TaskStore(config.tasks_file)
+    registry = task_store.load()
+    assert registry is not None, "tasks.json was never written"
+    store = StateStore(config.state_file)
+    state = store.load() or LoopState.new(URL)
+    executor = WritingExecutor(worker_repos.root_dir)
+    client = FakeClient(responses)
+    orch = Orchestrator(
+        config=config,
+        store=store,
+        state=state,
+        policy=PolicyEngine(config.policy),
+        git=git,
+        executor=executor,
+        transcript=TranscriptLogger(config.transcript_file),
+        client_factory=lambda: client,
+        registry=registry,
+        task_store=task_store,
+        manifest_store=ManifestStore(config.manifests_dir),
+        worker_repos=worker_repos,
+        execution_store=execution_store,
+        intent_store=IntentStore(wiring.tmp_path / "intents"),
+        blocker_store=BlockerStore(config.blockers_dir),
+        validation_runner=ok_validation,
+    )
+    return Wiring(
+        orch=orch,
+        git=git,
+        registry=registry,
+        task_store=task_store,
+        execution_store=execution_store,
+        worker_repos=worker_repos,
+        executor=executor,
+        config=config,
+        store=store,
+        client=client,
+        tmp_path=wiring.tmp_path,
+    )
+
+
+def _die(message):
+    def boom(*_args, **_kwargs):
+        raise Boom(message)
+
+    return boom
+
+
+def break_add_many(wiring):
+    wiring.registry.add_many = _die("died before the children were added")
+
+
+def break_retire(wiring):
+    wiring.registry.retire = _die("died before the parent was retired")
+
+
+def break_archive(wiring):
+    wiring.execution_store.archive = _die("died before the record was archived")
+
+
+def break_quarantine(wiring):
+    wiring.worker_repos.quarantine = _die("died before the worker was quarantined")
+
+
+def break_marker_clear(wiring):
+    wiring.orch._split_intents.clear = _die("died before the marker was dropped")
+
+
+#: Every durable write boundary in `_dispatch_ceiling_split`, in order, with the
+#: state each crash point provably produces: `retired` says whether the REGISTRY
+#: write had landed by then, which is the only thing that decides whether the
+#: parent's artefacts may be moved afterwards.
+CRASH_BOUNDARIES = [
+    pytest.param(break_add_many, False, id="before-the-children-are-added"),
+    pytest.param(break_retire, False, id="before-the-parent-is-retired"),
+    pytest.param(break_archive, True, id="after-the-registry-save"),
+    pytest.param(break_quarantine, True, id="after-the-record-is-archived"),
+    pytest.param(break_marker_clear, True, id="after-both-artefacts-moved"),
+]
+
+
+def crash_at(tmp_path, injector) -> Wiring:
+    """Drive a real split acceptance and kill it at one write boundary."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+    injector(wiring)
+    with pytest.raises(Boom):
+        dispatch(wiring, plan_block([child_spec("t1-a"), child_spec("t1-b")]))
+    assert marker(wiring).exists(), "the crash left no durable record of the split"
+    return wiring
+
+
+def assert_stores_agree(wiring, retired: bool):
+    """THE predicate, identical at every boundary.
+
+    Not "the parent is retired and its artefacts are gone" — that is false at
+    the two boundaries before the registry write lands, and a predicate that
+    only describes the late crashes would grade half the sequence. What has to
+    hold everywhere is that the three stores tell ONE story, and that no
+    unfinished split is still recorded.
+    """
+    parent = wiring.registry.get("t1")
+    assert not marker(wiring).exists(), "an unfinished split is still recorded"
+    if retired:
+        assert parent.status == "retired"
+        assert set(parent.superseded_by) == {"t1-a", "t1-b"}
+        assert not live_record(wiring), "the retired parent still holds the window"
+        assert not live_worker(wiring), "the retired parent still owns a worker"
+        # Exactly one of each: the recovery must FINISH the retirement, never
+        # file a second copy of a half it already moved.
+        assert len(archived_records(wiring)) == 1
+        assert len(quarantined_workers(wiring)) == 1
+    else:
+        assert parent.status != "retired"
+        assert live_record(wiring), "a live task's execution record was retired"
+        assert live_worker(wiring), "a live task's worker repository was retired"
+        assert archived_records(wiring) == []
+        assert quarantined_workers(wiring) == []
+
+
+@pytest.mark.parametrize("injector,retired", CRASH_BOUNDARIES)
+def test_a_crash_at_any_write_boundary_is_reconcilable(tmp_path, injector, retired):
+    """THE claim. One predicate, five boundaries, every assertion made against
+    stores re-read from disk by a second process."""
+    crashed = crash_at(tmp_path, injector)
+    fresh = reopen(crashed)
+
+    fresh.orch._reconcile_split_acceptance()
+
+    assert_stores_agree(fresh, retired)
+
+
+def test_without_the_reconciliation_the_crash_really_does_leave_them_disagreeing(
+    tmp_path,
+):
+    """The counter-pin, without which the test above grades nothing: the state
+    a crash after the registry save actually leaves IS contradictory, and the
+    surviving record is the half that costs every other task its merge window."""
+    crashed = crash_at(tmp_path, break_archive)
+    fresh = reopen(crashed)
+
+    assert fresh.registry.get("t1").status == "retired"
+    assert live_record(fresh)
+    assert live_worker(fresh)
+
+
+def test_the_reconciliation_runs_at_startup_and_not_only_on_demand(tmp_path):
+    """A crash mid-split leaves the phase wherever the dying round had it, so a
+    per-round sweep would settle this behind an arbitrary amount of other work
+    while `merge-window` reads the contradictory record in the meantime.
+    `run()` is the entry point, and this asserts it rather than the method."""
+    crashed = crash_at(tmp_path, break_archive)
+    fresh = reopen(crashed)
+    fresh.orch.state.phase = Phase.STOPPED.value
+
+    assert fresh.orch.run() == Phase.STOPPED.value
+
+    assert_stores_agree(fresh, True)
+
+
+def test_reconciling_a_second_time_changes_nothing(tmp_path):
+    """Idempotence is what makes a crash DURING a recovery merely another crash
+    rather than a new failure mode."""
+    crashed = crash_at(tmp_path, break_archive)
+    fresh = reopen(crashed)
+    fresh.orch._reconcile_split_acceptance()
+    settled = (
+        [p.name for p in archived_records(fresh)],
+        [p.name for p in quarantined_workers(fresh)],
+    )
+
+    fresh.orch._reconcile_split_acceptance()
+
+    assert (
+        [p.name for p in archived_records(fresh)],
+        [p.name for p in quarantined_workers(fresh)],
+    ) == settled
+    assert_stores_agree(fresh, True)
+
+
+def test_a_split_that_completes_leaves_no_marker_behind(tmp_path):
+    """The ordinary path. A marker that outlived its own split would have every
+    later start reconcile a decomposition that finished cleanly."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+
+    dispatch(wiring, plan_block([child_spec("t1-a"), child_spec("t1-b")]))
+
+    assert not marker(wiring).exists()
+    assert split_intents_dir(wiring.config.state_dir).is_dir()
+    fresh = reopen(wiring)
+    fresh.orch._reconcile_split_acceptance()
+    assert records(fresh, "split_acceptance_reconciled") == []
+
+
+def test_a_start_with_nothing_in_flight_reconciles_nothing(tmp_path):
+    """The bound. This runs at every start, including the overwhelming majority
+    that have never accepted a split at all."""
+    wiring = build(tmp_path, tasks=[ready_task("t1")])
+
+    wiring.orch._reconcile_split_acceptance()
+
+    assert records(wiring, "split_acceptance_reconciled") == []
+    assert records(wiring, "split_acceptance_unreconciled") == []
+
+
+def test_a_refused_retirement_parks_and_records_no_unfinished_split(tmp_path):
+    """The SYNCHRONOUS half-applied ending, which is consistent rather than
+    contradictory: the children exist and the parent is deliberately still live,
+    so its record and worker are still its own. The marker must be dropped here
+    — a recovery that "finished" this state would retire the artefacts of a task
+    the registry says is running."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+
+    def refuse(*_args, **_kwargs):
+        raise TaskGraphError("task_in_progress", "a dependent is running")
+
+    wiring.registry.retire = refuse
+    dispatch(wiring, plan_block([child_spec("t1-a"), child_spec("t1-b")]))
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert [r["code"] for r in records(wiring, "needs_user")] == [
+        "ceiling_split_parent_not_retired"
+    ]
+    assert not marker(wiring).exists()
+    fresh = reopen(wiring)
+    fresh.orch._reconcile_split_acceptance()
+    assert {"t1-a", "t1-b"} <= {t.id for t in fresh.registry.all_tasks()}
+    assert_stores_agree(fresh, False)
+
+
+def test_a_marker_that_cannot_be_written_refuses_the_split(tmp_path):
+    """Fail CLOSED. Continuing without the marker would leave the split exactly
+    as crash-unsafe as it was before this existed, and nothing would say so."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("read-only state directory")
+
+    wiring.orch._split_intents.save = refuse
+    dispatch(wiring, plan_block([child_spec("t1-a"), child_spec("t1-b")]))
+
+    assert "ceiling_split_intent_unwritable" in denial_codes(wiring)
+    assert sorted(t.id for t in wiring.registry.all_tasks()) == ["t1"]
+    assert wiring.registry.get("t1").status == "in_progress"
+    assert live_record(wiring) and live_worker(wiring)
+    assert not marker(wiring).exists()
+
+
+def test_a_corrupt_marker_is_reported_rather_than_read_as_absent(tmp_path):
+    """The fail-open this must not have. A marker that reads as absent leaves
+    the contradictory state in place AND discards the last durable thing that
+    knew about it — the alarm switching itself off."""
+    crashed = crash_at(tmp_path, break_archive)
+    marker(crashed).write_text("{not json", encoding="utf-8")
+    fresh = reopen(crashed)
+
+    fresh.orch._reconcile_split_acceptance()
+
+    assert marker(fresh).exists(), "a marker it could not read was thrown away"
+    assert live_record(fresh) and live_worker(fresh)
+    assert SPLIT_ACCEPTANCE_UNRECONCILED in open_codes(fresh)
+
+
+def test_a_marker_whose_children_are_a_bare_string_is_refused(tmp_path):
+    """`tuple("t1-a")` is five single-character "children", which is the silent
+    per-character split `tasks._persisted_superseded_by` exists to refuse. Read
+    that way the set comparison could never match, so the marker would sit there
+    forever reporting AMBIGUOUS — a permanent non-recovery with a green log."""
+    crashed = crash_at(tmp_path, break_archive)
+    marker(crashed).write_text(
+        json.dumps({"parent_id": "t1", "child_ids": "t1-a", "reason": "x"}),
+        encoding="utf-8",
+    )
+    fresh = reopen(crashed)
+
+    fresh.orch._reconcile_split_acceptance()
+
+    assert marker(fresh).exists()
+    assert live_record(fresh) and live_worker(fresh)
+    assert SPLIT_ACCEPTANCE_UNRECONCILED in open_codes(fresh)
+
+
+def test_a_marker_that_names_other_children_moves_nothing(tmp_path):
+    """The fail-closed rule: the marker only says a split was ATTEMPTED, and
+    what the REGISTRY recorded decides. One that cannot be shown to describe
+    that retirement must never move a task's artefacts."""
+    crashed = crash_at(tmp_path, break_archive)
+    marker(crashed).write_text(
+        json.dumps(
+            {"parent_id": "t1", "child_ids": ["someone-else"], "reason": "x"}
+        ),
+        encoding="utf-8",
+    )
+    fresh = reopen(crashed)
+
+    fresh.orch._reconcile_split_acceptance()
+
+    assert marker(fresh).exists()
+    assert live_record(fresh) and live_worker(fresh)
+    assert SPLIT_ACCEPTANCE_UNRECONCILED in open_codes(fresh)
+
+
+def test_every_start_reports_an_unreconciled_split_even_with_the_blocker_open(
+    tmp_path,
+):
+    """The blocker is upserted ONCE; the transcript entry is written every start.
+
+    `_report_strand_blocker` returns early once its blocker is open, and copying
+    that here would be a fail-open: the parent in every shape that reaches this
+    method is RETIRED, and `cli._reconcile_retired_blockers` resolves open
+    blockers naming a retired task. A report living only in the blocker store
+    could therefore be closed out from under the condition it describes,
+    leaving the marker in place with nothing at all saying so.
+    """
+    crashed = crash_at(tmp_path, break_archive)
+    marker(crashed).write_text(
+        json.dumps({"parent_id": "t1", "child_ids": ["someone-else"], "reason": "x"}),
+        encoding="utf-8",
+    )
+    first = reopen(crashed)
+    first.orch._reconcile_split_acceptance()
+    second = reopen(crashed)
+    second.orch._reconcile_split_acceptance()
+
+    reports = records(second, "split_acceptance_unreconciled")
+    assert [r["task_id"] for r in reports] == ["t1", "t1"]
+    assert len(BlockerStore(second.config.blockers_dir).open_blockers()) == 1
+
+
+def test_the_recorded_children_are_matched_as_a_set_not_in_order(tmp_path):
+    """`superseded_by` round-trips through JSON in the order it was written, so
+    exact-tuple equality would hold today and would start failing silently — as
+    a permanent AMBIGUOUS, i.e. a recovery that never runs — the first time
+    anything normalised that order. Order carries no meaning for a successor
+    list, so nothing is given up by not requiring it."""
+    crashed = crash_at(tmp_path, break_archive)
+    marker(crashed).write_text(
+        json.dumps(
+            {
+                "parent_id": "t1",
+                "child_ids": ["t1-b", "t1-a"],
+                "reason": CEILING_SPLIT_RETIREMENT_REASON,
+            }
+        ),
+        encoding="utf-8",
+    )
+    fresh = reopen(crashed)
+
+    fresh.orch._reconcile_split_acceptance()
+
+    assert fresh.registry.get("t1").superseded_by == ("t1-a", "t1-b")
+    assert_stores_agree(fresh, True)
+
+
+def test_a_retirement_that_still_fails_keeps_the_marker_and_names_the_task(tmp_path):
+    """A recovery that cannot finish must not clear the marker: doing so would
+    take the last durable record of an unfinished split with it. The partial
+    progress it DID make is kept — the record is out of the merge window even
+    though the worker could not move — and the next start finishes the rest."""
+    crashed = crash_at(tmp_path, break_archive)
+    stuck = reopen(crashed)
+
+    def refuse(*_args, **_kwargs):
+        raise GitCommandError("quarantine destination already exists")
+
+    stuck.worker_repos.quarantine = refuse
+    stuck.orch._reconcile_split_acceptance()
+
+    assert marker(stuck).exists()
+    assert SPLIT_ACCEPTANCE_UNRECONCILED in open_codes(stuck)
+    assert not live_record(stuck)  # the half that DID move stayed moved
+    assert live_worker(stuck)
+
+    recovered = reopen(crashed)
+    recovered.orch._reconcile_split_acceptance()
+    assert_stores_agree(recovered, True)
+
+
+def test_a_run_with_no_stores_keeps_the_marker_instead_of_clearing_it(tmp_path):
+    """An Orchestrator wired without an execution store or worker repositories
+    cannot retire anything. Answering "nothing to do" and dropping the marker
+    would silently discard the split for the properly-wired run that follows."""
+
+    class Row:
+        status = "retired"
+        superseded_by = ("t1-a", "t1-b")
+
+    class Registry:
+        def has(self, _task_id):
+            return True
+
+        def get(self, _task_id):
+            return Row()
+
+    result = reconcile_split_acceptance(
+        SplitIntent(parent_id="t1", child_ids=("t1-a", "t1-b")),
+        Registry(),
+        None,
+        None,
+    )
+
+    assert result.outcome is SplitAcceptance.AMBIGUOUS
+    assert result.intent_is_spent is False

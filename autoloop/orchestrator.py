@@ -387,6 +387,8 @@ from .worktask import (
     IntentStore,
     Reconciliation,
     Retirement,
+    SplitIntent,
+    SplitIntentStore,
     TaskExecution,
     TaskExecutionStore,
     accumulate_assumptions,
@@ -394,8 +396,10 @@ from .worktask import (
     compose_reason,
     format_attempt,
     reconcile_after_crash,
+    reconcile_split_acceptance,
     retire_execution,
     split_attempt,
+    split_intents_dir,
 )
 from .worktree import WorktreeManager
 
@@ -534,6 +538,20 @@ MIN_CEILING_SPLIT_TASKS = 2
 #: human reading either one can tell the round was decomposed rather than
 #: released, recut or displaced.
 CEILING_SPLIT_RETIREMENT_REASON = "split-at-attempt-ceiling"
+
+#: `blockers.Blocker.code` for a split acceptance the startup reconciliation
+#: could NOT settle by itself (split-04, 2026-08-25) — the marker is unreadable,
+#: it cannot be shown to describe what the registry recorded, or the parent's
+#: record and worker refused to move.
+#:
+#: Recorded WITHOUT parking, like `blockers.STRANDED_AFTER_FAULT` and for the
+#: same reason: the loop is working, on other tasks, and what is being reported
+#: is one retired parent's leftover artefacts. Both of the consequences that
+#: constant documents apply here too — it is invisible to
+#: `test_m1_hardening._emitted_blocker_codes` (which AST-walks `_to_needs_user`
+#: and `_to_fault_stop` only), so it is deliberately absent from
+#: `cli._RESOLUTION_PRECONDITIONS`, and it never changes a task's status.
+SPLIT_ACCEPTANCE_UNRECONCILED = "split_acceptance_unreconciled"
 
 #: Longest any single evidence section of the ceiling classification request may
 #: be. The request deliberately carries NO range diff — `packet
@@ -1319,6 +1337,16 @@ class Orchestrator:
         self._wanted_decisions = WantedDecisionTally(
             wanted_decisions_file(config.state_dir)
         )
+        #: In-flight split acceptances (`worktask.SplitIntentStore`). DERIVED
+        #: from `config.state_dir` for exactly the reason the two stores above
+        #: are, and here the argument is at its sharpest: this marker is the
+        #: ONLY durable evidence that a decomposition was half-applied, so a
+        #: store a construction site can forget to pass is a recovery that
+        #: silently never runs — and the state it recovers from is invisible by
+        #: construction (a retired parent nothing will dispatch again). Nothing
+        #: to pass, nothing to forget: every Orchestrator that ran `__init__`
+        #: reconciles.
+        self._split_intents = SplitIntentStore(split_intents_dir(config.state_dir))
         #: Persisted operator-facing blocker records (`blockers.py`).
         #: Optional, like every other produce-then-review collaborator:
         #: `None` (many existing tests that hand-build a minimal
@@ -1439,6 +1467,14 @@ class Orchestrator:
 
     def run(self, max_steps: int | None = None) -> str:
         """Run until a terminal phase, a pause request, or max_steps."""
+        # STARTUP, before the first step and before anything reads the state
+        # directory: a decomposition this process's predecessor half-applied
+        # leaves the registry describing a retired parent whose execution record
+        # is still live, which holds the repository-wide merge window shut and
+        # announces nothing. See `_reconcile_split_acceptance`. Costs one
+        # `is_dir()` when no split has ever been accepted, which is the ordinary
+        # case, and never raises.
+        self._reconcile_split_acceptance()
         steps = 0
         while True:
             # BOTH locations: the flag moved outside the checkout (see
@@ -7925,12 +7961,29 @@ class Orchestrator:
     def _dispatch_ceiling_split(self, directive: Directive, parent: Task) -> None:
         """Apply a `plan` that answers `parent`'s attempt-ceiling request.
 
-        EVERY refusal happens before anything moves, and the two writes that do
-        move are ordered so a crash cannot leave the registry describing a task
-        that no longer exists: the children are added and the parent retired into
-        them by `release_task_to_pending`, which persists the registry ONCE
-        (children + retirement in the same file write) before it touches the
-        execution record or the worker repo on disk.
+        EVERY refusal happens before anything moves, and the writes that do move
+        are ordered so the residue a crash leaves is the loudest one available:
+        the children are added and the parent retired into them by
+        `release_task_to_pending`, which persists the registry ONCE (children +
+        retirement in the same file write) before it touches the execution
+        record or the worker repo on disk.
+
+        **ORDERING IS NOT ENOUGH, AND THIS IS WHERE THE DURABLE MARKER COMES
+        IN.** Acceptance spans three stores — the registry, the execution record
+        and the worker repository — and there is no point at which all three
+        commit together. So a process that dies after the registry save and
+        before `retire_execution` leaves `tasks.json` saying the parent is
+        retired while its record and worker are still live: not stale, but
+        CONTRADICTORY, and silent, since the record holds the repository-wide
+        merge window shut (`cli._merge_window_blockers`) and the parent will
+        never be dispatched again for anything to notice.
+
+        A `SplitIntent` is therefore written durably immediately below — after
+        the last refusal, before the first mutation — and cleared only once all
+        three agree. `Orchestrator.run` reconciles against it at startup
+        (`_reconcile_split_acceptance`), which FINISHES a registry write that
+        landed and DISCARDS a marker for one that did not. The registry, never
+        the marker, decides which of those it is.
 
         There is no bespoke split mechanism here on purpose. `add_many` is
         atomic, `retire(superseded_by=...)` is the registry's own supersession
@@ -8072,11 +8125,45 @@ class Orchestrator:
             )
             for s in specs
         ]
+        child_ids = tuple(child.id for child in children)
+        # THE DURABLE MARKER, and it goes HERE — after the last refusal above
+        # (every one of which says "Nothing was changed", and would be made a
+        # liar by a marker claiming a split was in flight) and before the first
+        # mutation below. From this line until the marker is cleared, a crash at
+        # any point is reconcilable from disk; see `_reconcile_split_acceptance`
+        # and the section at the bottom of `worktask.py`.
+        #
+        # A marker that cannot be WRITTEN refuses the split outright. Continuing
+        # without it is the fail-open reading: the split would then be exactly as
+        # crash-unsafe as it was before this existed, with nothing saying so.
+        try:
+            self._split_intents.save(
+                SplitIntent(
+                    parent_id=parent.id,
+                    child_ids=child_ids,
+                    reason=CEILING_SPLIT_RETIREMENT_REASON,
+                )
+            )
+        except OSError as exc:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_intent_unwritable",
+                    f"the durable marker recording this decomposition of "
+                    f"'{parent.id}' could not be written ({exc}), and without it a "
+                    "crash partway through would leave the registry describing a "
+                    "task whose execution record and worker repository still "
+                    "exist, with nothing able to find it afterwards. Nothing was "
+                    "changed.",
+                ),
+            )
+            return
         try:
             self._registry.add_many(children)
         except TaskGraphError as exc:
             # `add_many` is atomic, so the registry is exactly as it was and the
             # parent is still waiting: this is a denial, not a park.
+            self._clear_split_intent(parent.id)
             self._log("plan_rejected", data={"code": exc.code, "error": str(exc)})
             self._handle_policy_denial(
                 directive,
@@ -8087,7 +8174,6 @@ class Orchestrator:
                 ),
             )
             return
-        child_ids = tuple(child.id for child in children)
         self._registry.clear_ceiling_plan_request(parent.id)
         try:
             release = release_task_to_pending(
@@ -8112,6 +8198,14 @@ class Orchestrator:
             # Persist that — it is what is true — and park loudly rather than
             # leaving a half-applied split only this process knows about.
             self._task_store.save(self._registry)
+            # The marker is SPENT, and dropping it here is not optional. This
+            # state is half-applied but it is not contradictory: the parent is
+            # still live and still owns its record and its worker, which is
+            # precisely what the park below tells the operator. A marker left
+            # standing would have the next start's reconciliation read a live
+            # parent, answer UNAPPLIED and drop it anyway — so this is the same
+            # decision, taken where the fact is already known.
+            self._clear_split_intent(parent.id)
             state.last_response = None
             self._to_needs_user(
                 f"task {parent.id}: its decomposition into "
@@ -8156,6 +8250,15 @@ class Orchestrator:
                 "obstacle": release.obstacle,
             },
         )
+        if release.artifacts_retired:
+            # All three stores agree, so the marker has nothing left to say.
+            # KEPT when they do not — the branch at the bottom of this method —
+            # because that residue is exactly what the next start's
+            # reconciliation is for: the parent IS retired in the registry, so a
+            # record still sitting in `executions/*.json` is holding the
+            # repository-wide merge window shut on work nobody will ever
+            # dispatch again.
+            self._clear_split_intent(parent.id)
         # The parent's bookkeeping is gone; so must every pointer this session
         # still holds to it — the same cleanup a recut does, and for the same
         # reason: a later approval naming the retired packet would otherwise
@@ -8191,7 +8294,9 @@ class Orchestrator:
                     else ""
                 )
                 + "Move them aside by hand. The subtasks are in the roadmap and "
-                "can be dispatched once that is done.",
+                "can be dispatched once that is done. The split-acceptance "
+                "marker is deliberately KEPT, so the next start retries the "
+                "retirement by itself once the obstacle is gone.",
                 kind="task_fatal",
                 code="ceiling_split_retirement_failed",
                 task_id=parent.id,
@@ -8267,6 +8372,226 @@ class Orchestrator:
             f"{MAX_SPLIT_DEPTH}).\n\n"
             "Each subtask needs its own `decomposition` on the `implement` that "
             "starts it, and cannot be dispatched at all without `approved_paths`."
+        )
+
+    # ---- split acceptance: the startup half ---------------------------------
+
+    def _clear_split_intent(self, parent_id: str) -> None:
+        """Drop `parent_id`'s split-acceptance marker. Never raises.
+
+        The marker is bookkeeping about work that is already decided, so a
+        state directory that refuses the unlink must not take down the dispatch
+        that just succeeded — the worst case is one stale marker, and the next
+        start's reconciliation reads the REGISTRY rather than the marker, so a
+        stale one is answered correctly (UNAPPLIED or an idempotent COMPLETED)
+        and dropped then.
+        """
+        try:
+            self._split_intents.clear(parent_id)
+        except OSError as exc:  # pragma: no cover - unwritable state dir
+            self._log(
+                "split_acceptance_marker_not_cleared",
+                data={"task_id": parent_id, "error": str(exc)},
+            )
+
+    def _reconcile_split_acceptance(self) -> None:
+        """Finish, or discard, every split acceptance a crash left in flight.
+
+        THE invariant this exists for: after `_dispatch_ceiling_split` has
+        started, the task registry, the parent's execution record and the
+        parent's worker repository are either all in agreement, or a durable
+        marker names the parent and the next start settles it. There is no third
+        state, and before split-04 there was: a process that died between the
+        registry save and `retire_execution` left `tasks.json` saying the parent
+        was retired while `executions/<parent>.json` still described live
+        unpublished work — which shuts the repository-wide merge window
+        (`cli._merge_window_blockers`) for every other task, with nothing
+        reporting it and no dispatch of the retired parent ever coming to
+        notice.
+
+        **Run from `run()`, before the first step, and that is startup rather
+        than a per-round sweep.** A crash mid-split leaves the phase wherever the
+        dying round had it, so waiting for `_step_ready` would delay this behind
+        an arbitrary amount of other work — and the merge window is read by
+        other commands in the meantime. It is cheap enough to sit there: one
+        `is_dir()` when nothing is in flight, which is every start but the ones
+        that need it.
+
+        **The registry decides, never the marker** (`worktask.
+        reconcile_split_acceptance`). A marker only says a split was ATTEMPTED;
+        whether it happened is read from the parent's row, every time. So a
+        registry write that never landed discards the marker and touches no
+        artefact, one that landed finishes the artefact half idempotently, and
+        anything that cannot be shown to be either touches nothing and reports.
+
+        Nothing here raises. This runs before the loop's own error handling is
+        in play, and a recovery that took the process down would be worse than
+        the state it recovers from.
+        """
+        try:
+            pending = self._split_intents.pending()
+        except OSError as exc:  # pragma: no cover - unreadable state dir
+            self._log("split_acceptance_scan_failed", data={"error": str(exc)})
+            return
+        for parent_id in pending:
+            try:
+                intent = self._split_intents.load(parent_id)
+            except (StateError, OSError) as exc:
+                # Reported, never skipped, and the marker is KEPT. A corrupt
+                # marker read as absent is the alarm switching itself off: the
+                # contradictory state it points at would stay, with the last
+                # thing that knew about it now discarded.
+                self._report_split_blocker(
+                    parent_id,
+                    "its split-acceptance marker is on disk but unreadable "
+                    f"({exc}), so what was half-applied cannot be established",
+                )
+                continue
+            if intent is None:  # pragma: no cover - removed between the two calls
+                continue
+            try:
+                result = reconcile_split_acceptance(
+                    intent, self._registry, self._execution_store, self._worker_repos
+                )
+            except (StateError, GitError, TaskGraphError, OSError) as exc:
+                # `reconcile_split_acceptance` catches the retirement's own
+                # failures and reports them as FAILED; this covers a registry or
+                # store that misbehaves in some way it does not model. Same
+                # ending either way — keep the marker, name the task.
+                self._report_split_blocker(
+                    parent_id,
+                    f"its split acceptance could not be reconciled ({exc})",
+                )
+                continue
+            if not result.intent_is_spent:
+                self._report_split_blocker(parent_id, result.detail)
+                continue
+            self._clear_split_intent(parent_id)
+            retirement = result.retirement
+            self._log(
+                "split_acceptance_reconciled",
+                data={
+                    "task_id": parent_id,
+                    "outcome": result.outcome.value,
+                    "children": list(intent.child_ids),
+                    "detail": result.detail,
+                    "label": retirement.label if retirement is not None else "",
+                    "archived_record": (
+                        str(retirement.record_path)
+                        if retirement is not None
+                        and retirement.record_path is not None
+                        else ""
+                    ),
+                    "quarantined_worker": (
+                        str(retirement.worker_path)
+                        if retirement is not None
+                        and retirement.worker_path is not None
+                        else ""
+                    ),
+                },
+            )
+
+    def _report_split_blocker(self, parent_id: str, obstacle: str) -> None:
+        """File (or retain) an OPEN blocker naming a split acceptance this
+        start could not settle, and say so in the transcript.
+
+        The other half of the invariant, and the same shape
+        `_report_strand_blocker` uses for the same reason: what is being
+        reported is INVISIBLE otherwise. A retired parent is never dispatched,
+        so nothing else will ever look at it again — and if its execution record
+        survived, the cost is a merge window that stays shut for every other
+        task in the repository.
+
+        **Retains the BLOCKER rather than re-recording it, and logs anyway.** An
+        open blocker for the same `(task_id, code)` is left exactly as it is
+        (`BlockerStore.record` bumps `recurrences`, which means "this condition
+        re-parked", not "a start looked at it again") — but the transcript entry
+        is written every start regardless. See the comment at that call for why
+        the early return `_report_strand_blocker` uses would be a fail-open
+        here: the parent is retired, and a retired task's open blockers are
+        resolved automatically.
+
+        **Never changes the task's status, and never parks the loop.** The task
+        is already retired; the loop is working, on other tasks. Reporting is
+        the whole action.
+
+        Best-effort on the store, loud in the transcript — a blocker directory
+        that cannot be read or written must not take down a start, so the
+        transcript entry is written either way and carries what went wrong.
+        """
+        blocker_id = ""
+        note = ""
+        if self._blocker_store is None:
+            note = "no blocker store configured — this is reported here only"
+        else:
+            question = (
+                f"task {parent_id} was decomposed at its attempt ceiling and the "
+                f"acceptance could not be finished automatically: {obstacle}. Its "
+                "subtasks are in the roadmap and can be dispatched. What is left "
+                f"is the parent's own leftovers — look for "
+                f"{self._execution_store.path_for(parent_id) if self._execution_store is not None else 'its execution record'} "
+                "and its worker repository. A surviving execution record holds the "
+                "merge window shut for EVERY task, so it is the half worth moving "
+                "first. Answering this blocker records your decision; it does NOT "
+                "move anything."
+            )
+            detail = (
+                f"obstacle={obstacle} "
+                f"marker={self._split_intents.path_for(parent_id)}"
+            )
+            # TWO try blocks, not one, and the split is deliberate: the LOOKUP is
+            # a de-duplication convenience and the RECORD is the report. A
+            # blocker directory this cannot read must not therefore go
+            # unreported — a duplicate blocker is a nuisance, a missing one is
+            # the invisibility this whole sweep exists to end.
+            try:
+                existing = next(
+                    (
+                        blocker
+                        for blocker in self._blocker_store.open_blockers()
+                        if blocker.task_id == parent_id
+                        and blocker.code == SPLIT_ACCEPTANCE_UNRECONCILED
+                    ),
+                    None,
+                )
+            except (StateError, OSError) as exc:
+                existing = None
+                note = f"the open blockers could not be read ({exc}) — recording anyway"
+            if existing is not None:
+                blocker_id = existing.id
+                note = "an open blocker for this already exists"
+            else:
+                try:
+                    blocker_id = self._blocker_store.record(
+                        task_id=parent_id,
+                        kind="task_fatal",
+                        code=SPLIT_ACCEPTANCE_UNRECONCILED,
+                        question=question,
+                        detail=detail,
+                        phase=self.state.phase,
+                        now=utcnow_iso(),
+                        session_id=self.state.session_id or "",
+                    ).id
+                except (StateError, OSError) as exc:
+                    note = f"the blocker could not be recorded ({exc})"
+        # WRITTEN EVERY START, deliberately unlike `_report_strand_blocker`,
+        # which returns early once its blocker is open. Two reasons that one
+        # does not transfer. This runs once per process START, not once per
+        # round, so the recurrence-noise argument does not apply. And the
+        # blocker here may not survive: `cli._reconcile_retired_blockers`
+        # resolves open blockers naming a RETIRED task, and the parent is
+        # retired in every shape that reaches this method — so a report living
+        # only in the blocker store could be closed out from under the
+        # condition it describes, leaving the marker in place with nothing
+        # saying so. The transcript is the durable half nothing else closes.
+        self._log(
+            "split_acceptance_unreconciled",
+            data={
+                "task_id": parent_id,
+                "obstacle": obstacle,
+                "blocker_id": blocker_id,
+                "note": note,
+            },
         )
 
     def _park_round_cap(
