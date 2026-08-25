@@ -201,8 +201,22 @@ RECOVER_BY_REBUILDING_AT_HEAD = "rebuild_at_head"
 STALE_EXECUTION_RECORD = "execution_record"
 
 #: A postcommit / changeset APPROVAL BINDING naming a candidate that is no
-#: longer this task's current one, or that no longer resolves at all. Dropped;
-#: the execution record underneath is not touched.
+#: longer this task's current one, or that no longer resolves at all. The
+#: binding is dropped and the REVIEW IT WAS STANDING IN FRONT OF IS REBUILT:
+#: `orchestrator._rebuild_task_review_at_head` re-presents the candidate the
+#: execution record actually holds as a fresh, verified-bindable
+#: `postcommit_review` packet, so the very next round can be approved and
+#: published. Dropping the binding alone — which the first cut of halt-03 did —
+#: leaves the next request carrying none of the identifiers an approval binds
+#: by, and a candidate nothing can publish is a park performed rather than
+#: avoided.
+#:
+#: The execution record underneath is still not archived in the ordinary case,
+#: for the reason the `push_candidate_stale` entry gives. The exception is the
+#: shape where nothing can be rebuilt at all — the record's OWN candidate does
+#: not resolve — and there the rebuild routes to `STALE_EXECUTION_RECORD`'s
+#: path, recut-01's refusals and cap included, rather than emitting an unbound
+#: request.
 STALE_PUSH_BINDING = "push_binding"
 
 #: The PACKET standing between an operator-queued changeset review
@@ -392,12 +406,18 @@ STALE_RECORD_RECOVERIES: dict[str, AutonomousRecovery] = {
             why=(
                 "The park says it in its own words: 'a later round advanced it, "
                 "or the execution record is gone'. The stale thing is the "
-                "APPROVAL BINDING, and the execution record underneath it may "
-                "hold a live candidate a reviewer is about to approve — so this "
-                "drops the binding and the ledger entries that could re-resolve "
-                "it, and touches no record on disk. The remedy the park asks "
+                "APPROVAL BINDING, and the execution record underneath it "
+                "usually holds a live candidate a reviewer is about to approve — "
+                "so this drops the binding and the ledger entries that could "
+                "re-resolve it, and archives nothing. The remedy the park asks "
                 "for, 're-review the current state before approving again', is "
-                "then simply the next round."
+                "then PERFORMED rather than requested: the record's current "
+                "candidate is re-rendered as a `postcommit_review` packet, "
+                "verified to carry the four identifiers `_current_pending_"
+                "postcommit` binds on, and dispatched — so the next round is a "
+                "real review whose approval publishes. Dropping the binding and "
+                "queueing a sentence, as the first cut did, left that candidate "
+                "unpublishable for the session."
             ),
         ),
         AutonomousRecovery(
@@ -410,8 +430,14 @@ STALE_RECORD_RECOVERIES: dict[str, AutonomousRecovery] = {
                 "other road: the approved sha does not resolve at all. TWO park "
                 "sites emit it — the task push, which names a task, and the "
                 "changeset push, which names none — so the rebuild has to handle "
-                "a binding with no task behind it, and does: it drops the queued "
-                "changeset instead, after writing its identifiers to the "
+                "a binding with no task behind it, and does. On the TASK arm the "
+                "record's own candidate is usually that same unresolvable "
+                "commit, so there is nothing to re-present and the rebuild routes "
+                "to the archive-and-recut path rather than emitting an unbound "
+                "request. On the CHANGESET arm the queue entry decides: its "
+                "candidate still resolving means only the packet was stale, so "
+                "the packet is rebuilt around it; a candidate that does not "
+                "resolve is dropped, after its whole record is written to the "
                 "transcript. Nothing is pushed on this path, ever."
             ),
         ),

@@ -505,6 +505,32 @@ RECUT_RETIREMENT_REASON = "recut-by-reviewer"
 #: do not share a label.
 AUTONOMOUS_REBUILD_RETIREMENT_REASON = "rebuilt-at-head-autonomously"
 
+#: WHY an execution record was archived, in the words the next request carries.
+#: One constant per reason rather than one sentence with a branch in it: two
+#: codes now reach `_rebuild_execution_record_at_head` and they arrive for
+#: genuinely different reasons, so a payload that described both as "the base
+#: fell behind the head" would be telling the reviewer something untrue about
+#: half the cuts it reports.
+BASE_BEHIND_HEAD_REBUILD_CAUSE = (
+    "Its recorded base had fallen behind the branch head and the reviewed "
+    "candidate could not be carried past it, so the loop archived the "
+    "execution record and returned the task to the queue rather than waiting "
+    "for an operator to do the same by hand."
+)
+
+#: The push arm's reason (halt-03 revision). Reached only when the candidate
+#: the EXECUTION RECORD itself names cannot be resolved in the worker
+#: repository — the record describes work that is not there, so there is no
+#: state left to re-review and re-presenting it is impossible rather than
+#: merely unhelpful.
+UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE = (
+    "An approval named a candidate this task no longer has, and the candidate "
+    "its own execution record names could not be resolved in the worker "
+    "repository either — so no review packet could be rebuilt from it, and the "
+    "loop archived the record and returned the task to the queue rather than "
+    "waiting for an operator to do the same by hand."
+)
+
 #: The four identifiers an approval binds an operator changeset by, named ONCE
 #: (halt-03, 2026-08-25). Three places ask the same question of them — the
 #: producer of `changeset_binding_missing` in `_step_ready`, which reports the
@@ -10624,12 +10650,34 @@ class Orchestrator:
     # changeset missing an identifier, no git gateway to render a packet with,
     # and a packet that cannot be rendered or that comes back unbindable.
     #
-    # "Rebuild" is not a synonym for "discard", and the two live in one place
-    # each. `_replace_outbox` is the only way any of them swaps the payload, so
-    # a displaced packet's chunking leftovers cannot ride onto the next request;
-    # and the ONE handler whose record turned out to be the packet rather than
-    # the queue entry (`_rebuild_changeset_packet_at_head`) keeps what an
-    # operator queued and rebuilds around it.
+    # **A REBUILD THAT LEAVES THE LOOP UNABLE TO PUBLISH IS NOT A REBUILD**, and
+    # the first cut of halt-03 got that wrong twice in the same shape. Both times
+    # a handler dropped the stale record and queued an explanatory sentence, and
+    # a sentence carries none of the identifiers an approval binds by — so the
+    # next request went out UNBOUND and the candidate underneath became
+    # unpublishable for the rest of the session. `changeset_binding_missing` was
+    # fixed first (keep the operator's queue entry, rebuild the packet around
+    # it); the push arms are fixed here, and the rule is now stated once for all
+    # of them:
+    #
+    #   * a handler that returns True must leave `state.outbox` carrying the
+    #     identifiers the next `_step_ready` binds on, and must VERIFY that
+    #     before it returns — `_rebuild_task_review_at_head` and
+    #     `_rebuild_changeset_packet_at_head` each re-apply the exact check
+    #     their binder will apply, and refuse rather than dispatch a payload
+    #     already known not to bind;
+    #   * the exceptions are stated positively rather than left as a gap:
+    #     `_rebuild_execution_record_at_head` has just archived the candidate, so
+    #     there is deliberately nothing to bind; `_drop_published_push_binding`'s
+    #     candidate has already been published; and `_drop_recordless_push_
+    #     binding`'s execution record is gone for a task that is no longer in
+    #     flight. In all three, nothing a binding could name still exists.
+    #
+    # "Rebuild" is not a synonym for "discard". `_replace_outbox` is the only way
+    # any of them swaps the payload, so a displaced packet's chunking leftovers
+    # cannot ride onto the next request; and a record is dropped only where
+    # nothing could be rebuilt from it — an audit unit nobody minted, a
+    # changeset candidate that does not resolve.
 
     def _autonomous_rebuild(self, plan, blocker, *, code: str) -> bool:
         """Archive `plan`'s stale record, rebuild at the current head and leave
@@ -10650,7 +10698,7 @@ class Orchestrator:
         if record == STALE_EXECUTION_RECORD:
             return self._rebuild_execution_record_at_head(task_id, code=code)
         if record == STALE_PUSH_BINDING:
-            return self._discard_stale_push_binding(task_id, code=code)
+            return self._rebuild_stale_push_binding(task_id, code=code)
         if record == STALE_QUEUED_REVIEW:
             return self._rebuild_changeset_packet_at_head(code=code)
         if record == STALE_AUDIT_POINTER:
@@ -10663,10 +10711,42 @@ class Orchestrator:
         )
         return False
 
-    def _rebuild_execution_record_at_head(self, task_id: str, *, code: str) -> bool:
+    def _rebuild_execution_record_at_head(
+        self,
+        task_id: str,
+        *,
+        code: str,
+        cause: str = BASE_BEHIND_HEAD_REBUILD_CAUSE,
+        candidate_resolves: bool = True,
+    ) -> bool:
         """`task_base_behind_head`: archive the execution record whose base is
         behind the head, and return the task to the queue so its next dispatch
         is cut fresh at the current head.
+
+        **TWO callers since the halt-03 revision, one path.** `_rebuild_task_
+        review_at_head` routes here for the push arm's genuinely unrecoverable
+        shape — the candidate the execution record itself names cannot be
+        resolved — because that is the same remedy reached by the other road,
+        and the alternative was a second archival mechanism that would have had
+        to re-earn every refusal below. `cause` is the ONE thing that differs:
+        it is what the rebuilt request tells the reviewer, and describing an
+        unresolvable candidate as a base that fell behind the head would be a
+        false report of the loop's own action.
+
+        `candidate_resolves=False` is the ONE refusal a caller may switch off,
+        and only on PROVEN evidence — `_rebuild_task_review_at_head` sets it
+        after reading the candidate out of the worker repository and failing.
+        The outstanding-verdict refusal exists because an approval for a packet
+        still in flight could arrive and publish that work; when the commit
+        cannot be resolved, `_dispatch_task_push` refuses that very approval as
+        `push_candidate_unresolvable`, so there is no work left to protect and
+        the refusal would only trade a park for a park. It matters in practice
+        rather than in theory: the record's current candidate WAS presented in
+        its own round, so `sent_postcommits` holds an entry naming it, and
+        without this the archive route would be unreachable for exactly the
+        shape it was built for. Everything else — the cap, the operator hold,
+        the published-candidate and unreadable-record refusals, the archival
+        itself — is the caller's regardless.
 
         **Every refusal recut-01 makes, made here, in its order.** They are not
         re-derived — `_recut_count_for` and `_recut_outstanding_verdict` are the
@@ -10727,13 +10807,14 @@ class Orchestrator:
             return self._refuse_rebuild(
                 code, f"its candidate {execution.published_sha[:12]} is already published"
             )
-        outstanding = self._recut_outstanding_verdict(
-            state, task_id, execution.candidate_sha
-        )
-        if outstanding:
-            return self._refuse_rebuild(
-                code, f"a verdict on it is still outstanding under '{outstanding}'"
+        if candidate_resolves:
+            outstanding = self._recut_outstanding_verdict(
+                state, task_id, execution.candidate_sha
             )
+            if outstanding:
+                return self._refuse_rebuild(
+                    code, f"a verdict on it is still outstanding under '{outstanding}'"
+                )
         task = self._registry.get(task_id)
         spent = self._recut_count_for(task, execution)
         if spent >= MAX_TASK_RECUTS:
@@ -10823,12 +10904,9 @@ class Orchestrator:
         state.last_response = None
         self._replace_outbox(state, (
             f"REBUILT AT HEAD — task {task_id} is back in the queue.\n\n"
-            f"Its recorded base {discarded_base[:12] or '(none)'} had fallen "
-            "behind the branch head and the reviewed candidate "
-            f"{discarded_candidate[:12] or '(none committed)'} could not be "
-            "carried past it, so the loop archived the execution record and "
-            "returned the task to the queue rather than waiting for an "
-            "operator to do the same by hand.\n"
+            f"{cause}\n"
+            f"The archived record named base {discarded_base[:12] or '(none)'} "
+            f"and candidate {discarded_candidate[:12] or '(none committed)'}.\n"
             "Nothing was deleted: the record was archived to "
             f"{retirement.record_path if retirement and retirement.record_path else '(no record on disk)'} "
             "and the worker repository quarantined at "
@@ -10842,38 +10920,342 @@ class Orchestrator:
         state.phase = Phase.READY.value
         return True
 
-    def _discard_stale_push_binding(self, task_id: str, *, code: str) -> bool:
+    def _rebuild_stale_push_binding(self, task_id: str, *, code: str) -> bool:
         """`push_candidate_stale` / `push_candidate_unresolvable`: drop the
         approval binding that names a candidate which has moved or no longer
-        resolves, and re-dispatch so the current state can be re-reviewed.
+        resolves, and REBUILD the review it was standing in front of.
 
-        **The execution record is NOT touched, and that is the whole design.**
-        The park's own words for the task arm are "a later round advanced it" —
-        so the record underneath may hold a live candidate a reviewer is about
-        to approve, and archiving it would be the budget-01 shape with the loop
-        in the operator's seat. What is stale is the POINTER: `resp.postcommit`
-        (dropped with `state.last_response`), the `sent_postcommits` ledger
-        entries that could re-resolve it, and a `carry_postcommit` naming the
-        same task.
+        **Dropping the binding is half a remedy, and the first cut of halt-03
+        shipped only that half.** It cleared `last_response`, the ledger entries
+        and the carry, then queued an explanatory sentence — a payload carrying
+        none of the candidate's identifiers. `_current_pending_postcommit` binds
+        such a payload to nothing, so the next request went out UNBOUND and no
+        approval to it (or to anything after it, the ledger having been
+        forgotten) could publish the candidate the task actually holds. The park
+        this feature exists to avoid was not avoided, it was performed: the loop
+        moved, the operator still had to intervene, and the intervention was now
+        harder because the packet the approval would have named was gone.
 
-        The changeset arm names no task at all. There the binding lives on the
-        queued review, so that is what goes — with its identifiers written to
-        the transcript first, because an operator queued it.
+        So the two arms below both REBUILD, and each rebuild is verified to bind
+        before it is dispatched:
 
-        **Why THIS handler drops the queued changeset while
-        `_rebuild_changeset_packet_at_head` preserves it**, since the two sit a
-        page apart and look like the same decision made twice. They are not the
-        same case. There the packet is stale and the candidate is fine, so a
-        packet can be rebuilt around it. Here the park is
-        `push_candidate_unresolvable` raised by `_dispatch_changeset_push`: the
-        reviewed candidate does not resolve in this repository at all, so no
-        packet can be rendered from it and no approval to one could ever be
-        published. Dropping it is the only truthful action left, and it is what
-        an operator does with a commit that is gone.
+        * `_rebuild_task_review_at_head` — the task arm. The stale record is the
+          approval POINTER; the execution record underneath usually holds a live
+          candidate ("a later round advanced it", in the park's own words), so it
+          is not archived. It is re-presented, as a real `postcommit_review`
+          packet rendered from the immutable git objects, which is what makes the
+          very next round bindable and publishable again.
+        * `_rebuild_changeset_review_at_head` — the changeset arm, which names no
+          task at all.
 
-        Returns False when there was nothing to drop and no task to attribute
-        the drop to: re-dispatching without having changed anything is theatre
-        that costs a round and arrives at the same park.
+        `_autonomous_rebuild` routes here for both codes and both arms; the split
+        is on `task_id` alone, because that is exactly what distinguishes the two
+        park sites (`_dispatch_task_push` passes `binding.task_id`,
+        `_dispatch_changeset_push` passes nothing).
+        """
+        if not task_id:
+            return self._rebuild_changeset_review_at_head(code=code)
+        return self._rebuild_task_review_at_head(task_id, code=code)
+
+    def _rebuild_task_review_at_head(self, task_id: str, *, code: str) -> bool:
+        """The task arm: drop the stale approval binding and re-present the
+        candidate this task's execution record ACTUALLY holds, under a packet
+        the next `_step_ready` can bind and a later `push` can publish.
+
+        **Every decision is made before anything is mutated.** A refusal returns
+        False and `_to_needs_user` then parks — and saves the state it parks
+        with — so a half-applied rebuild would be persisted alongside the park
+        that says nothing happened. Nothing below writes to `state` until the
+        packet exists and has been verified.
+
+        **The three outcomes, and why each is the one it is.**
+
+        1. *Rebuilt* — the record names a candidate that resolves. The stale
+           pointers go (`last_response`, this task's `sent_postcommits`, a
+           `carry_postcommit` naming it), `state.task_execution` is refreshed
+           from the record so `_current_pending_postcommit` can bind against it,
+           and the outbox becomes a freshly rendered review packet. This is the
+           `push_candidate_stale` case in practice: a later round advanced the
+           candidate, and the current one has never been reviewed.
+        2. *Archived and requeued* — the candidate the RECORD names cannot be
+           resolved in the worker repository (this is `push_candidate_
+           unresolvable` reached on the task arm, where the approved sha and the
+           record's own sha are usually the same commit). There is nothing to
+           re-present, so the remedy is the one recut-01 already implements and
+           `_rebuild_execution_record_at_head` is called with its own cause
+           string. It carries recut-01's refusals and `MAX_TASK_RECUTS`, so this
+           is not a second archival mechanism.
+        3. *Refused* — and the loop parks with the question it always had. A
+           packet that cannot be RENDERED is deliberately in this arm rather than
+           in (2): an oversized range-diff is not evidence the candidate is bad,
+           and archiving work over a rendering failure is the budget-01 shape
+           with the loop in the operator's seat.
+
+        TWO cases neither rebuild nor archive, because in each the candidate an
+        approval could have published is gone in a way that leaves nothing for a
+        binding to name: one already PUBLISHED
+        (`_drop_published_push_binding`), and one whose execution RECORD no
+        longer exists for a task that is no longer in flight
+        (`_drop_recordless_push_binding`). Those two, and only those two, still
+        queue an explanatory payload carrying no binding.
+        """
+        state = self.state
+        if self._execution_store is None:
+            # Without a store there is no way to learn which candidate the task
+            # holds, so a "rebuild" could only be the unbound explanatory payload
+            # this method exists to stop emitting.
+            return self._refuse_rebuild(
+                code, "this loop has no execution store to read the current candidate from"
+            )
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateError, OSError) as exc:
+            # UNREADABLE, not absent — the same fail-closed reading
+            # `_rebuild_execution_record_at_head` makes, and for the same reason:
+            # a record that cannot be parsed may name a published candidate.
+            return self._refuse_rebuild(
+                code, f"its execution record cannot be read ({type(exc).__name__})"
+            )
+        if execution is None:
+            # The park's other stated cause, in its own words: "the execution
+            # record is gone".
+            return self._drop_recordless_push_binding(task_id, code=code)
+        if execution.published_sha:
+            return self._drop_published_push_binding(task_id, execution, code=code)
+        if not execution.candidate_sha or not execution.worktree_path:
+            # No candidate committed, or no worker repository to read one from:
+            # either way there is no reviewable state, which is the archive
+            # path's case rather than this one's. `candidate_resolves` is left
+            # TRUE here — non-resolution has not been proven, only made
+            # unaskable, and an unasked question is not evidence.
+            return self._rebuild_execution_record_at_head(
+                task_id, code=code, cause=UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE
+            )
+        worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
+        try:
+            # The same two objects `_current_pending_postcommit` will read when
+            # it binds the rebuilt packet, probed here so an unresolvable
+            # candidate is ROUTED (to the archive path) rather than discovered
+            # later as a raise inside `_step_ready`.
+            worktree_git.read_commit(execution.candidate_sha)
+            worktree_git.tree_of(execution.candidate_sha)
+        except (GitError, OSError):
+            # PROVEN unresolvable, which is the one thing that lets the archive
+            # route past the outstanding-verdict refusal — see that method. An
+            # approval for the packet that presented this commit could not
+            # publish it either.
+            return self._rebuild_execution_record_at_head(
+                task_id,
+                code=code,
+                cause=UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE,
+                candidate_resolves=False,
+            )
+        if not self._registry.has(task_id):
+            # `build_review_packet_with_diff` renders the task's id and title,
+            # and inventing either would put a packet in front of the reviewer
+            # describing a task this loop does not hold.
+            return self._refuse_rebuild(code, f"task '{task_id}' is not in the registry")
+        try:
+            packet_text, packet_diff = build_review_packet_with_diff(
+                execution, worktree_git, self._registry.get(task_id)
+            )
+        except (GitError, TemplateError, OSError) as exc:
+            # NOT the archive path. A packet that will not render (an oversized
+            # range-diff, most likely) says nothing about whether the candidate
+            # is sound, and a park handler is the one place a second failure has
+            # nowhere to go.
+            return self._refuse_rebuild(
+                code, f"the review packet could not be rebuilt ({type(exc).__name__}: {exc})"
+            )
+        payload = (
+            f"STALE APPROVAL BINDING REBUILT — task {task_id}.\n\n"
+            "An approval named a candidate that is no longer this task's "
+            "current one, or that no longer resolved, so nothing was pushed and "
+            "that binding was dropped. No execution record was archived: the "
+            f"candidate below, {execution.candidate_sha[:12]}, is the one this "
+            "task actually holds, re-presented here so a verdict on it can "
+            "publish. Review it as you would any other post-commit packet.\n\n"
+        ) + TEMPLATES["postcommit_review"].render(
+            task_id=task_id,
+            task_title=self._registry.get(task_id).title,
+            packet=packet_text,
+        )
+        absent = [
+            name
+            for name, value in (
+                ("task_id", task_id),
+                ("task_branch", execution.task_branch),
+                ("base_sha", execution.task_base_sha),
+                ("candidate_sha", execution.candidate_sha),
+            )
+            if not value or value not in payload
+        ]
+        if absent:
+            # The same fail-closed verification `_rebuild_changeset_packet_at_
+            # head` makes, against the check `_step_ready` will actually apply
+            # (`_current_pending_postcommit` requires all four as literal text).
+            # Dispatching a payload already known not to bind is the unbound
+            # request this whole revision removes.
+            return self._refuse_rebuild(
+                code, f"the rebuilt packet does not carry {', '.join(absent)}"
+            )
+
+        # ---- decided; only now does anything move -------------------------
+        #
+        # EVERY entry for this task goes, not only the one naming the sha the
+        # approval named, and the choice is deliberate rather than lazy. The
+        # narrower drop would leave an older packet for the SAME candidate
+        # approvable alongside the one about to be sent, i.e. two live bindings
+        # for one commit while the loop is re-presenting it precisely because
+        # the binding situation was confused. Nothing is lost by the wider drop:
+        # `_step_ready` records a fresh entry for this candidate on the very next
+        # step, so it is unbound for no round at all, and the payload tells the
+        # reviewer to answer the new packet.
+        forgotten = [
+            str(record.get("request_id") or "")
+            for record in self._sent_postcommit_records(state)
+            if isinstance(record.get("postcommit"), dict)
+            and record["postcommit"].get("task_id") == task_id
+        ]
+        self._forget_sent_postcommits_for_task(state, task_id)
+        carried = state.carry_postcommit
+        if isinstance(carried, dict) and carried.get("task_id") == task_id:
+            state.carry_postcommit = None
+        self._log(
+            "autonomous_rebuild",
+            data={
+                "code": code,
+                "task_id": task_id,
+                "stale_record": STALE_PUSH_BINDING,
+                "forgotten_packets": forgotten,
+                "discarded_changeset": None,
+                # WHAT the next round will present, so the transcript answers
+                # "did the rebuild leave the loop able to publish?" without
+                # replaying the round.
+                "rebuilt_candidate": execution.candidate_sha,
+                "rebuilt_branch": execution.task_branch,
+                "packet_chars": len(payload),
+            },
+        )
+        # Refreshed from the record, exactly as `_finish_postcommit` does it:
+        # `_current_pending_postcommit` cross-checks the payload against THIS
+        # field and then against the store, so a stale one would refuse to bind
+        # the packet just rebuilt.
+        state.task_execution = asdict(execution)
+        state.last_response = None
+        self._replace_outbox(state, payload)
+        # Set AFTER `_replace_outbox` (which clears it) and on the same rule as
+        # `_finish_postcommit`: a patch too large for one message is planned for
+        # chunked/attached delivery instead. Both rewrites keep the four
+        # identifiers — they live in the packet's header, not in the diff — so
+        # the binding verified above survives them.
+        state.outbox_diff = (
+            packet_diff if len(packet_diff.strip()) > DIFF_INCLUDE_MAX_CHARS else None
+        )
+        state.phase = Phase.READY.value
+        return True
+
+    def _drop_published_push_binding(self, task_id: str, execution, *, code: str) -> bool:
+        """A task-arm case with nothing to rebuild: the candidate has already
+        been PUBLISHED, so the stale approval pointer really is the whole of the
+        stale state.
+
+        Re-presenting a published candidate would invite a second `push` of work
+        that already shipped — re-marking the task completed and re-triggering
+        the auto-merge — which is the exact double-publish
+        `_forget_sent_postcommits_for_task` was written to prevent. Archiving is
+        wrong for the same reason recut-01 refuses it (budget-01). So the pointer
+        goes, the loop re-dispatches, and the payload says plainly that there is
+        nothing left to approve here.
+        """
+        return self._drop_task_push_binding(
+            task_id,
+            code=code,
+            payload=(
+                f"STALE APPROVAL BINDING DISCARDED — task {task_id}.\n\n"
+                "An approval named a candidate that is no longer this task's "
+                "current one, and this task has already published "
+                f"{execution.published_sha[:12]} — so there is nothing left to "
+                "push and nothing to re-review. The loop dropped the binding "
+                "rather than waiting for an operator to. Nothing was pushed and "
+                "no execution record was archived.\n\n"
+                "Pick up the roadmap with any other decision."
+            ),
+            log_extra={"published_sha": execution.published_sha},
+        )
+
+    def _drop_recordless_push_binding(self, task_id: str, *, code: str) -> bool:
+        """The other task-arm case with nothing to rebuild: the execution record
+        is GONE, which is the second cause `_dispatch_task_push`'s own question
+        names.
+
+        **The registry decides between the two very different situations that
+        produces**, and reading the record's absence alone would get the common
+        one wrong:
+
+        * the task is NO LONGER IN PROGRESS — a `recut`, a `release` or an
+          earlier rebuild archived the record and returned the task to the queue.
+          Then there is no candidate to publish, nothing to archive, and the
+          stale pointer IS the whole of the stale state: dropping it and
+          re-dispatching is the complete remedy, exactly as for a published
+          candidate. Parking here would halt the loop over a fault whose cause
+          has already been cleared, which is the opposite of what this feature
+          is for.
+        * the task is still IN PROGRESS with no record — genuinely unfinishable.
+          Nothing else will pick it up either: `health.stranded_fault_rounds`
+          skips an ABSENT record deliberately (there is no evidence of a fault
+          round), so `_reconcile_stranded_tasks` will not requeue it. That is a
+          question for a human, so it parks with the question it already had.
+
+        A task the registry does not hold at all falls in the first arm: there is
+        no work in flight to finish, so there is nothing to keep the loop waiting
+        for.
+        """
+        in_flight = (
+            self._registry.has(task_id)
+            and self._registry.state_of(task_id) is TaskState.IN_PROGRESS
+        )
+        if in_flight:
+            return self._refuse_rebuild(
+                code,
+                f"task '{task_id}' is still in progress with no execution record, "
+                "so there is nothing to re-present, archive or requeue",
+            )
+        state_name = (
+            self._registry.state_of(task_id).value
+            if self._registry.has(task_id)
+            else "(not in the registry)"
+        )
+        return self._drop_task_push_binding(
+            task_id,
+            code=code,
+            payload=(
+                f"STALE APPROVAL BINDING DISCARDED — task {task_id}.\n\n"
+                "An approval named a candidate whose execution record no longer "
+                f"exists, and the task is {state_name} rather than in flight — "
+                "so the record was already archived by a recut, a release or an "
+                "earlier rebuild, and the approval was the last thing still "
+                "pointing at it. The loop dropped that pointer rather than "
+                "waiting for an operator to. Nothing was pushed and nothing was "
+                "archived here.\n\n"
+                "Pick up the roadmap with any other decision."
+            ),
+            log_extra={"record_absent": True, "task_state": state_name},
+        )
+
+    def _drop_task_push_binding(
+        self, task_id: str, *, code: str, payload: str, log_extra: dict
+    ) -> bool:
+        """Drop this task's stale approval pointers and re-dispatch with
+        `payload`. Shared by the two task-arm shapes that have nothing to
+        rebuild, so neither can forget one of the three pointers or the
+        transcript line.
+
+        This is the ONE place in the push arms that still queues a payload
+        carrying no binding, and it is correct exactly here: in both callers the
+        candidate an approval could have published is either already published or
+        no longer recorded, so there is nothing left for a binding to name. Every
+        other path either rebuilds a bindable packet or refuses.
         """
         state = self.state
         forgotten = [
@@ -10881,28 +11263,74 @@ class Orchestrator:
             for record in self._sent_postcommit_records(state)
             if isinstance(record.get("postcommit"), dict)
             and record["postcommit"].get("task_id") == task_id
-        ] if task_id else []
-        discarded_changeset = None
-        if task_id:
-            self._forget_sent_postcommits_for_task(state, task_id)
-            carried = state.carry_postcommit
-            if isinstance(carried, dict) and carried.get("task_id") == task_id:
-                state.carry_postcommit = None
-        else:
-            queued = state.changeset
-            if not queued:
-                return self._refuse_rebuild(
-                    code, "there is no task and no queued changeset to drop"
-                )
-            discarded_changeset = dict(queued) if isinstance(queued, dict) else str(queued)
-            state.changeset = None
+        ]
+        self._forget_sent_postcommits_for_task(state, task_id)
+        carried = state.carry_postcommit
+        if isinstance(carried, dict) and carried.get("task_id") == task_id:
+            state.carry_postcommit = None
         self._log(
             "autonomous_rebuild",
             data={
                 "code": code,
-                "task_id": task_id or NO_TASK,
+                "task_id": task_id,
                 "stale_record": STALE_PUSH_BINDING,
                 "forgotten_packets": forgotten,
+                "discarded_changeset": None,
+                "rebuilt_candidate": "",
+                **log_extra,
+            },
+        )
+        state.last_response = None
+        self._replace_outbox(state, payload)
+        state.phase = Phase.READY.value
+        return True
+
+    def _rebuild_changeset_review_at_head(self, *, code: str) -> bool:
+        """The changeset arm of `push_candidate_unresolvable`, which names no
+        task: an approval to an operator's queued changeset named a sha that
+        does not resolve.
+
+        **Which record is stale depends on the QUEUE ENTRY, not on the
+        approval.** The binding that failed and the entry an operator queued can
+        name different commits — the approval carries whatever was bound when
+        the packet went out, and `review-changeset` can have been run again
+        since. So this asks the repository about the ENTRY's own candidate:
+
+        * it still resolves → the entry is fine and only the packet standing in
+          front of it is stale, which is `_rebuild_changeset_packet_at_head`'s
+          case exactly. Reused rather than re-implemented, so the operator's
+          review survives and the four identifiers still come only from the
+          stored entry.
+        * it does not resolve (or there is no gateway to ask) → no packet can be
+          rendered from it and no approval could ever publish it, so dropping is
+          the only truthful action left. The WHOLE record goes to the transcript
+          first, because an operator queued it and the state file is about to be
+          rewritten.
+
+        Refuses when there is no queued changeset at all: re-dispatching without
+        having changed anything is theatre that costs a round and arrives at the
+        same park.
+        """
+        state = self.state
+        queued = state.changeset
+        if not queued:
+            return self._refuse_rebuild(
+                code, "there is no task and no queued changeset to drop"
+            )
+        candidate = (
+            str(queued.get("candidate_sha") or "") if isinstance(queued, dict) else ""
+        )
+        if candidate and self._git is not None and self._object_resolves(self._git, candidate):
+            return self._rebuild_changeset_packet_at_head(code=code)
+        discarded_changeset = dict(queued) if isinstance(queued, dict) else str(queued)
+        state.changeset = None
+        self._log(
+            "autonomous_rebuild",
+            data={
+                "code": code,
+                "task_id": NO_TASK,
+                "stale_record": STALE_PUSH_BINDING,
+                "forgotten_packets": [],
                 # The WHOLE queued record, not a summary: this transcript line is
                 # the only surviving copy of an operator's changeset once the
                 # state file is rewritten below.
@@ -10910,17 +11338,29 @@ class Orchestrator:
             },
         )
         state.last_response = None
-        subject = f"task {task_id}" if task_id else "the queued changeset review"
         self._replace_outbox(state, (
-            f"STALE APPROVAL BINDING DISCARDED — {subject}.\n\n"
-            "The reviewed candidate an approval named is no longer this task's "
-            "current candidate, or no longer resolves at all, so the loop "
-            "dropped the binding rather than waiting for an operator to. "
-            "Nothing was pushed and no execution record was archived: the "
-            "candidate on disk, if there is one, is untouched.\n\n"
-            "Re-review the current state before approving again."
+            "STALE APPROVAL BINDING DISCARDED — the queued changeset review.\n\n"
+            "The reviewed candidate an approval named no longer resolves in this "
+            "repository, so no packet could be rebuilt from it and no approval "
+            "could ever publish it. The loop dropped the queued review rather "
+            "than waiting for an operator to. Nothing was pushed; its full "
+            "record is in the transcript.\n\n"
+            "Re-queue with `review-changeset` if the candidate still exists "
+            "under another id."
         ))
         state.phase = Phase.READY.value
+        return True
+
+    @staticmethod
+    def _object_resolves(git: GitGateway, oid: str) -> bool:
+        """Does `oid` name a commit this gateway can read? False for every
+        failure, including a repository that is not there (`OSError`) — the
+        fail-closed direction, since the only thing this answer authorizes is
+        KEEPING a record rather than acting on one."""
+        try:
+            git.read_commit(oid)
+        except (GitError, OSError):
+            return False
         return True
 
     def _rebuild_changeset_packet_at_head(self, *, code: str) -> bool:

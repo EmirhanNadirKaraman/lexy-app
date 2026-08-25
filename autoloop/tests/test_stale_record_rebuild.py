@@ -10,14 +10,23 @@ The one claim under test, stated as the loop has to satisfy it:
     no operator step. With the flag off every one of them parks exactly as it
     did before, and the five hard halts are unreachable from any of it.
 
-"Archives the stale record" is exact for five of the six and precise about the
-sixth: `changeset_binding_missing`'s stale record is the PACKET in
-`state.outbox`, not the queued review it stands in front of, so that one keeps
-`state.changeset` and rebuilds the packet around it. Dropping the queue entry —
-what the first cut of this feature did — sent the unbindable payload unbound and
-left the operator's candidate unpublishable for the rest of the session, which
-is a review discarded rather than rebuilt. `ChangesetWiring` below exists to
-prove the redispatched request is bound and an approval to it still publishes.
+"Archives the stale record" is exact for the codes whose record is an execution
+record, and precise about the rest: what is stale can be a PACKET or an approval
+POINTER, and there the rebuild keeps the durable record and rebuilds around it.
+
+**The one mistake this suite is shaped to catch, because two cuts of the feature
+made it.** A handler drops the stale record, queues a sentence explaining what
+happened, and returns True. The loop moves, so every "did it park?" assertion
+passes — but a sentence carries none of the identifiers an approval binds by, so
+the NEXT request goes out unbound and the candidate underneath becomes
+unpublishable for the rest of the session. That is the park performed rather
+than avoided, and it is invisible to any test that stops at the rebuild. So the
+two arms that rebuild a review are each tested END TO END —
+`ChangesetWiring` and `PostcommitWiring` drive the real refusal site, then the
+round the rebuild bought, then a stamped approval, and assert the candidate
+landed on the remote. Where a rebuild is genuinely impossible (the record's own
+candidate does not resolve) the assertion is the opposite one: archived through
+recut-01's path, or parked, and never a request that could not bind.
 
 Four things about the shape of this file, because they are the ways a test suite
 for this could look convincing and prove nothing:
@@ -79,7 +88,8 @@ from autoloop.blockers import (
     autonomous_recovery,
 )
 from autoloop.config import AutoloopConfig, AutonomyConfig, BrowserConfig
-from autoloop.errors import StateCorruptError, TaskGraphError
+from autoloop.contract import Decision, Directive
+from autoloop.errors import GitCommandError, StateCorruptError, TaskGraphError
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import (
@@ -87,6 +97,7 @@ from autoloop.orchestrator import (
     CHANGESET_BINDING_FIELDS,
     DISPLACED_OUTBOX_LOG_CHARS,
     MAX_TASK_RECUTS,
+    UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE,
     Orchestrator,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
@@ -96,7 +107,14 @@ from autoloop.publisher import (
     provision_publisher_repo,
     read_publisher_url_snapshot,
 )
-from autoloop.state import LastResponse, LoopState, PendingRequest, Phase, StateStore
+from autoloop.state import (
+    LastResponse,
+    LoopState,
+    PendingRequest,
+    Phase,
+    PostcommitBinding,
+    StateStore,
+)
 from autoloop.tasks import (
     HOLD_ORIGIN_OPERATOR,
     Task,
@@ -494,6 +512,202 @@ class ChangesetWiring:
 
 
 # =============================================================================
+# helpers — a real produce-then-review candidate, for the push arm
+# =============================================================================
+
+
+class PostcommitWiring:
+    """A task holding a REAL committed candidate in a REAL worker repository,
+    with the execution record, registry entry and (optionally) Publisher the
+    push arm's rebuild and the round after it actually read.
+
+    Why this fixture exists rather than the collaborator-free `build()` the push
+    tests used to use: `build()` passes no execution store, so the handler could
+    never learn which candidate the task holds — and a test written on it could
+    only ever assert that some pointers were dropped, which is exactly the half
+    remedy that shipped and was refused. Everything below is real because the
+    claim is "the next round can be approved and published", and only the real
+    `_step_ready` → `_step_executing` path can show that.
+
+    `candidate` picks the shape the EXECUTION RECORD is in, which is what
+    decides between the three outcomes:
+
+    * `"commit"` — a real commit on `autoloop/t1`, descended from the recorded
+      base. The rebuild re-presents it.
+    * `"missing"` — a 40-hex sha nothing resolves. Nothing can be re-presented,
+      so the rebuild archives and requeues.
+    * `""` — no candidate was ever committed. Same archive path.
+    """
+
+    def __init__(self, tmp_path, *, enabled=True, with_publisher=False,
+                 candidate="commit", published_sha="", in_registry=True,
+                 with_record=True, recut_count=0, status="in_progress"):
+        self.repo_root = make_repo(tmp_path)
+        self.config = make_config(tmp_path, enabled=enabled)
+        self.policy = PolicyEngine(self.config.policy)
+        self.git = GitGateway(self.repo_root, self.policy)
+        self.base_sha = self.git.head_sha()
+
+        self.upstream = None
+        publisher = None
+        publisher_url_snapshot = None
+        if with_publisher:
+            self.upstream = tmp_path / "bare.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(self.upstream)], check=True)
+            run_git(self.repo_root, "remote", "add", "origin", str(self.upstream))
+            publisher_state_dir = tmp_path / "publisher-state"
+            publisher_repo = provision_publisher_repo(
+                publisher_state_dir, self.git, "origin"
+            )
+            publisher = Publisher(publisher_repo, "origin", PolicyEngine(self.config.policy))
+            publisher_url_snapshot = read_publisher_url_snapshot(publisher_state_dir)
+
+        self.worker_repos = WorkerRepoManager(
+            tmp_path / "workers", tmp_path / "worker-hooks"
+        )
+        worker = self.worker_repos.create("t1", self.repo_root, self.base_sha)
+        self.worker_path = Path(worker.path)
+        run_git(self.worker_path, "config", "user.email", "test@example.com")
+        run_git(self.worker_path, "config", "user.name", "Test")
+        run_git(self.worker_path, "config", "commit.gpgsign", "false")
+        (self.worker_path / "a.py").write_text("print('the work')\n", encoding="utf-8")
+        run_git(self.worker_path, "add", "-A")
+        run_git(self.worker_path, "commit", "-q", "-m", "task t1: the work")
+        #: The candidate the task ACTUALLY holds.
+        self.candidate_sha = run_git(self.worker_path, "rev-parse", "HEAD").strip()
+        #: The candidate an APPROVAL names — the one a later round advanced past.
+        #: A real commit, so nothing here passes for want of a resolvable object.
+        self.approved_sha = self.base_sha
+        self.recorded_sha = {
+            "commit": self.candidate_sha,
+            "missing": "0" * 40,
+            "": "",
+        }[candidate]
+
+        self.execution_store = TaskExecutionStore(tmp_path / "executions")
+        self.execution = TaskExecution(
+            task_id="t1",
+            task_branch="autoloop/t1",
+            worktree_path=str(self.worker_path),
+            task_base_sha=self.base_sha,
+            candidate_sha=self.recorded_sha,
+            review_round=1,
+            recut_count=recut_count,
+            published_sha=published_sha,
+        )
+        if with_record:
+            self.execution_store.save(self.execution)
+
+        self.registry = TaskRegistry([
+            Task(id=tid, title=f"Title {tid}", description="d",
+                 approved_paths=("a.py",), recut_count=recut_count)
+            for tid in (("t1", "t2") if in_registry else ("t2",))
+        ])
+        if in_registry and status == "in_progress":
+            self.registry.mark_in_progress("t1")
+        self.task_store = TaskStore(self.config.tasks_file)
+        self.task_store.save(self.registry)
+
+        self.state = LoopState.new(URL)
+        # STALE on purpose, and it is the pointer `_current_pending_postcommit`
+        # binds against — a rebuild that forgot to refresh it from the record
+        # would render a correct packet that still binds to nothing.
+        self.state.task_execution = {
+            "task_id": "t1", "candidate_sha": self.approved_sha
+        }
+        self.state.sent_postcommits = [
+            {"request_id": "alr-old", "head_sha": self.base_sha,
+             "report_sha256": "digest",
+             "postcommit": {"task_id": "t1", "candidate_sha": self.approved_sha}},
+            {"request_id": "alr-other", "head_sha": self.base_sha,
+             "report_sha256": "other",
+             "postcommit": {"task_id": "t2", "candidate_sha": "keep"}},
+        ]
+        # PRODUCTION-SHAPED, and it is load-bearing rather than decoration: the
+        # record's current candidate was PRESENTED in its own round, so the
+        # ledger holds an entry naming it. Without this line the archive route's
+        # `_recut_outstanding_verdict` refusal never fires in any test here, and
+        # the route would have been unreachable in production for exactly the
+        # shape it exists for while the suite stayed green.
+        if self.recorded_sha:
+            self.state.sent_postcommits.insert(1, {
+                "request_id": "alr-presented", "head_sha": self.base_sha,
+                "report_sha256": "presented",
+                "postcommit": {"task_id": "t1", "candidate_sha": self.recorded_sha},
+            })
+        self.state.carry_postcommit = {
+            "task_id": "t1", "candidate_sha": self.approved_sha
+        }
+        self.state.phase = Phase.EXECUTING.value
+        self.store = StateStore(self.config.state_file)
+        self.store.save(self.state)
+        self.blocker_store = BlockerStore(self.config.blockers_dir)
+        self.orch = Orchestrator(
+            config=self.config,
+            store=self.store,
+            state=self.state,
+            policy=self.policy,
+            git=self.git,
+            executor=None,
+            transcript=TranscriptLogger(self.config.transcript_file),
+            client_factory=None,
+            registry=self.registry,
+            task_store=self.task_store,
+            manifest_store=ManifestStore(self.config.manifests_dir),
+            worker_repos=self.worker_repos,
+            execution_store=self.execution_store,
+            blocker_store=self.blocker_store,
+            publisher=publisher,
+            publisher_url_snapshot=publisher_url_snapshot,
+        )
+
+    def binding(self, candidate_sha=None) -> PostcommitBinding:
+        """The binding an approval carries into `_dispatch_task_push`."""
+        return PostcommitBinding(
+            task_id="t1",
+            task_branch="autoloop/t1",
+            base_sha=self.base_sha,
+            candidate_sha=candidate_sha or self.approved_sha,
+            candidate_tree_sha="tree-as-reviewed",
+            packet_sha256="digest",
+        )
+
+    def refuse_at_the_real_site(self, candidate_sha=None) -> None:
+        """Drive `_dispatch_task_push` ITSELF — no replayed `_to_needs_user`
+        call — so the refusal, its code, its `task_id` and the recovery that
+        answers it are the production ones. A fixture that replayed the park
+        would still pass if the site stopped reaching it."""
+        binding = self.binding(candidate_sha)
+        resp = LastResponse(
+            request_id="alr-old",
+            raw=json.dumps({"version": 3, "decision": "push", "reason": "ok"}),
+            received_at="now",
+            head_sha=self.base_sha,
+            base_sha=self.base_sha,
+            report_sha256="digest",
+            postcommit=binding,
+        )
+        # Set on the state too, exactly as `_await_response` leaves it before a
+        # dispatch — `_recut_outstanding_verdict` reads it from there.
+        self.orch.state.last_response = resp
+        self.orch._dispatch_task_push(
+            Directive(decision=Decision.PUSH, reason="approved"), resp
+        )
+
+    def stamped_push_reply(self, req) -> str:
+        return json.dumps({
+            "version": 3,
+            "decision": "push",
+            "reason": "approved the re-presented candidate",
+            "reviewed": {
+                "request_id": req.request_id,
+                "head_sha": req.head_sha,
+                "report_sha256": req.report_sha256,
+            },
+        })
+
+
+# =============================================================================
 # 1. the table
 # =============================================================================
 
@@ -710,42 +924,288 @@ def test_the_quarantined_worker_and_the_archived_record_name_each_other(tmp_path
     assert not wiring.worker_repos.path_for("t1").exists()
 
 
-def test_push_candidate_stale_drops_the_binding_and_keeps_the_record(tmp_path):
+def test_push_candidate_stale_rebuilds_a_bindable_review_of_the_current_candidate(
+    tmp_path
+):
     """The stale thing here is the APPROVAL BINDING — the park says so in its
-    own words ("a later round advanced it"). Archiving the execution record
-    beneath it would discard a live candidate over a stale pointer."""
+    own words ("a later round advanced it") — so the execution record beneath it
+    is NOT archived: that would discard a live candidate over a stale pointer.
+
+    **But dropping the binding is only half a remedy, and the half that shipped
+    first was refused.** A payload that merely explains what happened carries
+    none of the four identifiers `_current_pending_postcommit` binds on, so the
+    next request goes out unbound and the candidate the task actually holds
+    becomes unpublishable for the rest of the session — the park performed
+    rather than avoided. This asserts the other half: the record's CURRENT
+    candidate is re-presented as a real review packet carrying all four.
+
+    Driven through `_dispatch_task_push` itself, so the refusal, its code and
+    its `task_id` are the production ones rather than a replay."""
+    wiring = PostcommitWiring(tmp_path)
+
+    wiring.refuse_at_the_real_site()
+
+    orch = wiring.orch
+    assert orch.state.phase == Phase.READY.value
+    assert orch.state.question is None
+    assert orch.state.park_blocker_id is None
+    # The record is untouched — this arm archives nothing.
+    assert wiring.execution_store.load("t1") is not None
+    assert TaskStore(wiring.config.tasks_file).load().state_of("t1") is (
+        TaskState.IN_PROGRESS
+    )
+    # The stale pointers are gone; another task's approval still binds.
+    assert [r["request_id"] for r in orch.state.sent_postcommits] == ["alr-other"]
+    assert orch.state.carry_postcommit is None
+    assert orch.state.last_response is None
+    # REBUILT: a real review packet for the candidate the record names, carrying
+    # every identifier the next `_step_ready` will bind on.
+    assert "STALE APPROVAL BINDING REBUILT" in orch.state.outbox
+    for value in ("t1", "autoloop/t1", wiring.base_sha, wiring.candidate_sha):
+        assert value in orch.state.outbox
+    # And the pointer that packet is bound against was refreshed from the record.
+    assert orch.state.task_execution["candidate_sha"] == wiring.candidate_sha
+    entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
+    assert entry["stale_record"] == STALE_PUSH_BINDING
+    # BOTH of this task's entries — the one the approval named and the one that
+    # presented the current candidate. `_step_ready` records a fresh entry for
+    # that candidate on the very next step, so it is unbound for no round at all.
+    assert entry["forgotten_packets"] == ["alr-old", "alr-presented"]
+    assert entry["rebuilt_candidate"] == wiring.candidate_sha
+
+
+def test_the_redispatched_task_request_binds_and_its_approval_publishes_that_candidate(
+    tmp_path
+):
+    """THE claim for the push arm, end to end and with nobody intervening: after
+    the rebuild the next request carries a POSTCOMMIT BINDING again, and a
+    stamped approval to it publishes exactly the candidate the task holds.
+
+    This is the test the previous round did not have, and the one that
+    distinguishes a rebuild from a drop. Every assertion below was false against
+    the unbound explanatory payload: `req.postcommit` was `None`, so the approval
+    resolved no binding and `_dispatch_task_push` refused it.
+
+    `_step_ready` is called by hand because this suite has no transport."""
+    wiring = PostcommitWiring(tmp_path, with_publisher=True)
+
+    wiring.refuse_at_the_real_site()  # the real refusal -> the rebuild
+
+    assert wiring.orch.state.phase == Phase.READY.value
+    assert wiring.orch.state.pending_request is None  # nothing was sent unbound
+
+    wiring.orch._step_ready()  # the round the rebuild bought
+
+    req = wiring.orch.state.pending_request
+    assert req is not None and req.postcommit is not None
+    assert req.postcommit.candidate_sha == wiring.candidate_sha
+    assert req.postcommit.task_branch == "autoloop/t1"
+
+    wiring.orch.state.last_response = LastResponse(
+        request_id=req.request_id,
+        raw=wiring.stamped_push_reply(req),
+        received_at="now",
+        head_sha=req.head_sha,
+        base_sha=req.base_sha,
+        report_sha256=req.report_sha256,
+        postcommit=req.postcommit,
+    )
+    wiring.orch._step_executing()
+
+    landed = run_git(wiring.upstream, "rev-parse", "refs/heads/autoloop/t1").strip()
+    assert landed == wiring.candidate_sha
+    assert wiring.execution_store.load("t1").published_sha == wiring.candidate_sha
+    # NO OPERATOR STEP: the record was written and never answered.
+    blockers = wiring.blocker_store.all_blockers()
+    assert [b.code for b in blockers] == ["push_candidate_stale"]
+    assert blockers[0].answer is None
+
+
+def test_push_candidate_unresolvable_on_the_task_arm_archives_and_requeues(
+    tmp_path, monkeypatch
+):
+    """The task arm of the OTHER code, at its own site. Here the approval names
+    the candidate the record itself names, and that commit no longer reads — so
+    there is nothing to re-present, and dropping the binding would change none of
+    the causal stale state. The safe archive/recut path is taken instead.
+
+    The object is made to vanish between the descendant check and the read,
+    because that seam is how this refusal is reachable at all (a prune, a
+    corrupt object): `is_descendant` RAISES rather than returning False for an
+    object git cannot resolve, so a sha that was never there would never get
+    this far."""
+    wiring = PostcommitWiring(tmp_path)
+    real_read_commit = GitGateway.read_commit
+    vanished = wiring.candidate_sha
+
+    def pruned(self, oid):
+        if oid == vanished:
+            raise GitCommandError(f"git cat-file commit {oid} failed: bad object")
+        return real_read_commit(self, oid)
+
+    monkeypatch.setattr(GitGateway, "read_commit", pruned)
+
+    wiring.refuse_at_the_real_site(candidate_sha=wiring.candidate_sha)
+
+    orch = wiring.orch
+    assert orch.state.phase == Phase.READY.value
+    assert orch.state.pending_request is None
+    # ARCHIVED through recut-01's path, not dropped and not re-presented.
+    assert wiring.execution_store.load("t1") is None
+    archived = list((wiring.execution_store.directory / "archive").glob("t1-*.json"))
+    assert len(archived) == 1
+    assert AUTONOMOUS_REBUILD_RETIREMENT_REASON in archived[0].name
+    reloaded = TaskStore(wiring.config.tasks_file).load()
+    assert reloaded.state_of("t1") is TaskState.READY
+    assert reloaded.get("t1").recut_count == 1
+    assert "REBUILT AT HEAD" in orch.state.outbox
+    assert UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE in orch.state.outbox
+    assert orch.state.task_execution is None
+    entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
+    assert entry["stale_record"] == STALE_EXECUTION_RECORD
+
+
+@pytest.mark.parametrize("candidate", ["missing", ""])
+def test_a_record_that_names_no_resolvable_candidate_is_archived_not_re_presented(
+    tmp_path, candidate
+):
+    """Reached by the OTHER road: the approval is refused as
+    `push_candidate_stale` because the record disagrees with it, and the record's
+    own candidate then turns out to be unresolvable (`missing`) or absent (`""`).
+    Re-presenting is impossible, so the rebuild archives and requeues rather than
+    emitting a payload nothing can bind.
+
+    The `missing` case is also what pins the ONE refusal the archive route lets a
+    caller switch off. The fixture's ledger holds an entry that PRESENTED that
+    candidate — as production always does — so `_recut_outstanding_verdict`
+    reports a verdict still in flight and the route would park. It is bypassed
+    only on proven non-resolution, because `_dispatch_task_push` would refuse
+    that very approval as `push_candidate_unresolvable`: there is no work left
+    for the refusal to protect, and keeping it would trade a park for a park."""
+    wiring = PostcommitWiring(tmp_path, candidate=candidate)
+
+    wiring.refuse_at_the_real_site()
+
+    assert wiring.orch.state.phase == Phase.READY.value
+    assert wiring.execution_store.load("t1") is None
+    assert TaskStore(wiring.config.tasks_file).load().state_of("t1") is TaskState.READY
+    assert "REBUILT AT HEAD" in wiring.orch.state.outbox
+    assert transcript_entries(wiring.config, "autonomous_rebuild")[0][
+        "stale_record"
+    ] == STALE_EXECUTION_RECORD
+
+
+def test_an_already_published_candidate_only_loses_its_binding(tmp_path):
+    """One of the two task-arm shapes with nothing to rebuild AND nothing to
+    archive (the other is the record-is-gone pair below).
+    Re-presenting a published candidate would invite a second push of work that
+    already shipped — the double-publish `_forget_sent_postcommits_for_task`
+    exists to prevent — and archiving it is what recut-01 refuses (budget-01).
+    So the pointer goes, the record stays, and the payload says so."""
+    wiring = PostcommitWiring(tmp_path)
+    wiring.execution.published_sha = wiring.candidate_sha
+    wiring.execution_store.save(wiring.execution)
+
+    wiring.refuse_at_the_real_site()
+
+    orch = wiring.orch
+    assert orch.state.phase == Phase.READY.value
+    assert wiring.execution_store.load("t1") is not None  # NOT archived
+    assert [r["request_id"] for r in orch.state.sent_postcommits] == ["alr-other"]
+    assert "STALE APPROVAL BINDING DISCARDED" in orch.state.outbox
+    assert wiring.candidate_sha[:12] in orch.state.outbox
+    entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
+    assert entry["stale_record"] == STALE_PUSH_BINDING
+    assert entry["published_sha"] == wiring.candidate_sha
+
+
+def test_a_recordless_binding_for_a_requeued_task_is_dropped_and_the_loop_goes_on(
+    tmp_path
+):
+    """The park's SECOND stated cause — "the execution record is gone" — in the
+    shape that actually produces it: a `recut`, a `release` or an earlier rebuild
+    archived the record and returned the task to the queue. There is then no
+    candidate to publish, nothing to archive, and the stale approval pointer is
+    the whole of the stale state, so dropping it IS the complete remedy.
+
+    Parking here (what the first cut of this revision did, reading the record's
+    absence alone) would halt the loop over a fault whose cause had already been
+    cleared — the opposite of what this feature is for."""
+    wiring = PostcommitWiring(tmp_path, with_record=False, status="ready")
+
+    wiring.refuse_at_the_real_site()
+
+    orch = wiring.orch
+    assert orch.state.phase == Phase.READY.value
+    assert orch.state.park_blocker_id is None
+    assert [r["request_id"] for r in orch.state.sent_postcommits] == ["alr-other"]
+    assert "STALE APPROVAL BINDING DISCARDED" in orch.state.outbox
+    entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
+    assert entry["record_absent"] is True
+    assert entry["task_state"] == TaskState.READY.value
+
+
+def test_a_recordless_binding_for_a_task_still_in_flight_parks(tmp_path):
+    """The other half of the same split, and the reason it is a split. A task
+    still `in_progress` with no execution record is genuinely unfinishable:
+    `health.stranded_fault_rounds` skips an ABSENT record on purpose, so
+    `_reconcile_stranded_tasks` will not requeue it either. Nothing the loop can
+    do makes that publishable, so it parks with the question it already had."""
+    wiring = PostcommitWiring(tmp_path, with_record=False, status="in_progress")
+
+    wiring.refuse_at_the_real_site()
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.pending_request is None
+    assert wiring.orch.state.outbox is None
+    assert "autonomous_rebuild" not in transcript_types(wiring.config)
+    reasons = [
+        e["reason"]
+        for e in transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    ]
+    assert any("still in progress with no execution record" in r for r in reasons)
+
+
+def test_without_an_execution_store_the_push_arm_refuses_rather_than_dispatching(
+    tmp_path
+):
+    """The fail-open this revision closes, in the exact configuration the
+    previous round's tests ran in. With no execution store there is no way to
+    learn which candidate the task holds, so a "rebuild" could only ever be the
+    unbound explanatory payload — and the loop parks instead."""
     orch, config, _, _, _ = build(tmp_path, enabled=True)
     orch.state.phase = Phase.EXECUTING.value
-    orch.state.sent_postcommits = [
-        {"request_id": "alr-1", "postcommit": {"task_id": "t1", "candidate_sha": "old"}},
-        {"request_id": "alr-2", "postcommit": {"task_id": "t2", "candidate_sha": "keep"}},
-    ]
-    orch.state.carry_postcommit = {"task_id": "t1", "candidate_sha": "old"}
+    orch.state.outbox = "the packet that was already queued"
 
     orch._to_needs_user("push refused — the reviewed candidate is stale",
                         kind="loop_fatal", code="push_candidate_stale", task_id="t1")
 
-    assert orch.state.phase == Phase.READY.value
-    # Only THIS task's ledger entries went; another task's approval still binds.
-    assert [r["request_id"] for r in orch.state.sent_postcommits] == ["alr-2"]
-    assert orch.state.carry_postcommit is None
-    assert orch.state.last_response is None
-    assert "STALE APPROVAL BINDING DISCARDED" in orch.state.outbox
-    entry = transcript_entries(config, "autonomous_rebuild")[0]
-    assert entry["stale_record"] == STALE_PUSH_BINDING
-    assert entry["forgotten_packets"] == ["alr-1"]
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.pending_request is None
+    assert orch.state.outbox == "the packet that was already queued"
+    assert "autonomous_rebuild" not in transcript_types(config)
+    reasons = [e["reason"] for e in transcript_entries(config, "autonomous_rebuild_refused")]
+    assert any("execution store" in reason for reason in reasons)
 
 
-def test_push_candidate_unresolvable_on_the_task_arm_drops_the_binding(tmp_path):
-    orch, config, _, _, _ = build(tmp_path, enabled=True)
-    orch.state.phase = Phase.EXECUTING.value
+def test_a_task_arm_rebuild_refused_for_want_of_its_task_parks_unbound_free(tmp_path):
+    """The other task-arm refusal: the packet renders the task's id and title, so
+    a task the registry does not hold cannot be re-presented without inventing
+    one. It parks — and, the property that matters, it parks having dispatched
+    nothing."""
+    wiring = PostcommitWiring(tmp_path, in_registry=False)
 
-    orch._to_needs_user("push refused — the candidate no longer resolves",
-                        kind="loop_fatal", code="push_candidate_unresolvable",
-                        task_id="t1")
+    wiring.refuse_at_the_real_site()
 
-    assert orch.state.phase == Phase.READY.value
-    assert transcript_entries(config, "autonomous_rebuild")[0]["task_id"] == "t1"
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.pending_request is None
+    assert wiring.orch.state.outbox is None
+    assert wiring.execution_store.load("t1") is not None
+    reasons = [
+        e["reason"]
+        for e in transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    ]
+    assert any("not in the registry" in reason for reason in reasons)
 
 
 def test_push_candidate_unresolvable_on_the_changeset_arm_drops_the_queued_review(
@@ -753,7 +1213,12 @@ def test_push_candidate_unresolvable_on_the_changeset_arm_drops_the_queued_revie
 ):
     """The second producer, which names NO task — `_dispatch_changeset_push`.
     A test that only covered the task arm would pass while the changeset arm
-    still halted the loop."""
+    still halted the loop.
+
+    Dropping is the arm taken when the QUEUE ENTRY's own candidate cannot be
+    resolved (here there is no gateway to resolve it with at all), which is the
+    case where no packet could be rendered and no approval could ever
+    publish."""
     orch, config, _, _, _ = build(tmp_path, enabled=True, in_flight=None)
     orch.state.phase = Phase.EXECUTING.value
     orch.state.changeset = {
@@ -771,6 +1236,33 @@ def test_push_candidate_unresolvable_on_the_changeset_arm_drops_the_queued_revie
     # changeset must never evaporate with nothing saying so.
     assert entry["discarded_changeset"]["candidate_sha"] == "cafe"
     assert entry["discarded_changeset"]["dest_ref"] == "refs/heads/main"
+
+
+def test_the_changeset_arm_rebuilds_a_queued_review_whose_candidate_still_resolves(
+    tmp_path
+):
+    """The approval's binding and the operator's queue entry can name different
+    commits — the binding is whatever was bound when the packet went out, and
+    `review-changeset` may have been run again since. So the ENTRY decides: one
+    whose candidate still resolves is a review that is fine standing behind a
+    packet that is stale, which is `_rebuild_changeset_packet_at_head`'s case
+    exactly. Dropping it on the binding's evidence would destroy a publishable
+    operator review."""
+    wiring = ChangesetWiring(tmp_path)
+    displaced = wiring.state.outbox
+
+    wiring.orch._to_needs_user(
+        "changeset push refused — the reviewed candidate no longer resolves",
+        kind="loop_fatal", code="push_candidate_unresolvable",
+    )
+
+    assert wiring.orch.state.phase == Phase.READY.value
+    assert wiring.orch.state.changeset == wiring.queued  # PRESERVED
+    assert wiring.orch.state.outbox != displaced
+    for name in CHANGESET_BINDING_FIELDS:
+        assert wiring.queued[name] in wiring.orch.state.outbox
+    entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
+    assert entry["stale_record"] == STALE_QUEUED_REVIEW
 
 
 def test_changeset_binding_missing_rebuilds_the_packet_and_keeps_the_queue_entry(
@@ -834,8 +1326,10 @@ def test_the_redispatched_request_binds_and_its_approval_publishes_that_candidat
     site and the rebuild answers it, the second is the round that rebuild made
     possible. `run()` would step the same two phases and then try to submit.
 
-    The one test in this file that provisions a Publisher, because it is the one
-    that publishes."""
+    One of the two tests in this file that provision a Publisher, because they
+    are the two that publish — this one for the changeset arm, and
+    `test_the_redispatched_task_request_binds_and_its_approval_publishes_that_
+    candidate` for the push arm."""
     wiring = ChangesetWiring(tmp_path, with_publisher=True)
 
     wiring.orch._step_ready()  # raises `changeset_binding_missing` -> rebuild
@@ -1578,16 +2072,47 @@ def test_the_state_inconsistent_site_still_passes_the_recoverable_veto(tmp_path)
     assert "recoverable" in found[0], "the corrupt-state veto is no longer passed"
 
 
-def test_nothing_here_can_publish(tmp_path):
-    """A rebuild is an archive-and-requeue and nothing else: no rebuild imports,
-    pushes or re-provisions anything, and the one that archives on disk asserts
-    the record moved rather than a ref.
+def test_the_push_sites_still_split_into_a_task_arm_and_a_task_free_arm():
+    """The split `_rebuild_stale_push_binding` dispatches on is `task_id`, and it
+    is only correct because the park sites really are shaped that way: the task
+    push passes `binding.task_id` and the changeset push passes none. A site that
+    started passing a task_id for the changeset arm would silently route an
+    operator's changeset into the task rebuild — the capture bug an earlier cut
+    shipped, reached from the other end."""
+    from autoloop import orchestrator as orchestrator_module
 
-    The one publish in this file is deliberately NOT a rebuild's doing —
-    `test_the_redispatched_request_binds_and_its_approval_publishes_that_
-    candidate` publishes only after a stamped reviewer approval reaches
-    `_dispatch_changeset_push`, which is the whole point of restoring the
-    binding. That is why `ChangesetWiring` carries a Publisher and this
+    tree = ast.parse(inspect.getsource(orchestrator_module))
+    arms: dict[str, list[bool]] = {
+        "push_candidate_stale": [], "push_candidate_unresolvable": []
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name != "_to_needs_user":
+            continue
+        kwargs = {kw.arg: kw.value for kw in node.keywords}
+        code = kwargs.get("code")
+        if isinstance(code, ast.Constant) and code.value in arms:
+            arms[code.value].append("task_id" in kwargs)
+    # One task-scoped site for the stale code; two sites for the unresolvable
+    # one, exactly one of which names a task.
+    assert arms["push_candidate_stale"] == [True]
+    assert sorted(arms["push_candidate_unresolvable"]) == [False, True]
+
+
+def test_nothing_here_can_publish(tmp_path):
+    """A rebuild archives, re-renders and re-dispatches, and does nothing else:
+    no rebuild imports, pushes or re-provisions anything, and the one that
+    archives on disk asserts the record moved rather than a ref.
+
+    The two publishes in this file are deliberately NOT a rebuild's doing. Each
+    happens only after a stamped reviewer approval reaches a dispatch
+    (`_dispatch_changeset_push` / `_dispatch_task_push`) in the round the rebuild
+    made possible — which is the whole point of restoring the binding, and the
+    property the previous round's drop-only handler could not satisfy. That is
+    why `ChangesetWiring` and `PostcommitWiring` can carry a Publisher and this
     orchestrator has none."""
     wiring = RealWiring(tmp_path)
     assert wiring.orch._publisher is None

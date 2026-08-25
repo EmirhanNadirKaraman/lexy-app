@@ -6847,15 +6847,16 @@ dispatches on.
 | code | stale record | what the rebuild does |
 |---|---|---|
 | `task_base_behind_head` | the `TaskExecution` on disk | Archives it and requeues the task through recut-01's `release_task_to_pending(move=registry.recut)`, so the next dispatch is cut fresh at the current head. |
-| `push_candidate_stale` | the approval binding | Drops `last_response`, this task's `sent_postcommits` entries and a `carry_postcommit` naming it. The execution record is NOT touched. |
-| `push_candidate_unresolvable` | the approval binding | Same. Its second producer — the changeset push — names no task, and there the queued changeset goes instead. |
+| `push_candidate_stale` | the approval binding | Drops `last_response`, this task's `sent_postcommits` entries and a `carry_postcommit` naming it — then RE-PRESENTS the candidate the execution record actually holds as a freshly rendered `postcommit_review` packet, verified to bind. The execution record is NOT archived. |
+| `push_candidate_unresolvable` | the approval binding | Same, when there is something to re-present. When the record's OWN candidate cannot be resolved there is not, and the rebuild routes to the archive-and-requeue path above. Its second producer — the changeset push — names no task, and there the queued changeset decides (below). |
 | `state_inconsistent` | the loop's own half-finished round | Drops `last_response` and `pending_request` and rebuilds the round at `ready`. |
 | `audit_revise_no_record` | `state.current_task` | Drops the pointer and asks the reviewer for a fresh `audit`, which mints a unit at the current head by construction. |
 | `changeset_binding_missing` | the PACKET in `state.outbox`, never the queue entry | Keeps `state.changeset` and re-renders the review packet for it from the immutable git objects, so the next round presents the same candidate under a binding an approval can resolve. |
 
 **Nothing new archives anything.** The one destructive step goes through the
-path recut-01 already built, so it inherits recut-01's five refusals rather than
-re-earning them: a published candidate is refused (budget-01's record was
+path recut-01 already built — reached now by two codes rather than one, still
+through the single `_rebuild_execution_record_at_head` — so it inherits
+recut-01's five refusals rather than re-earning them: a published candidate is refused (budget-01's record was
 archived 54 seconds before the reviewer returned PUSH for that exact candidate);
 so is a candidate whose verdict is still outstanding, an unreadable record, an
 operator hold, a task the registry will not move, and a loop with no execution
@@ -6973,11 +6974,77 @@ or `stop`, and the loop's own iteration budget is the ceiling. Both costs are
 the trade this direction buys: the loop halting for ever on a packet nobody can
 bind was the alternative.
 
-`push_candidate_unresolvable`'s changeset arm still DROPS the queue entry, and
-that is a different case rather than the same decision made twice: there the
-reviewed candidate does not resolve in the repository at all, so no packet can be
-rendered from it and no approval could ever publish it. Dropping is the only
-truthful action left.
+**The same mistake, made twice, and the rule that now covers both.** The
+changeset fix above was the first half. The push arms were the second, and they
+failed review for exactly the shape the changeset arm had just been fixed out of:
+they dropped the stale approval pointer, queued a sentence explaining it, and
+returned as if the loop had recovered. A sentence carries none of the four
+identifiers `_current_pending_postcommit` binds on, so the next request went out
+UNBOUND — and with the `sent_postcommits` entries forgotten as well, no approval
+to it, or to anything after it, could publish the candidate the task still held.
+The park was performed, not avoided, and the operator's job afterwards was
+harder than the park would have left it.
+
+So the rule is stated once, for every handler:
+
+* **a rebuild that returns True must leave the outbox carrying what the next
+  round binds on, and must verify that before it returns.**
+  `_rebuild_task_review_at_head` re-renders the record's current candidate
+  through `packet.build_review_packet_with_diff` and re-applies
+  `_current_pending_postcommit`'s own four-literal test to the result;
+  `_rebuild_changeset_packet_at_head` does the same against
+  `CHANGESET_BINDING_FIELDS`. A payload already known not to bind is refused, not
+  dispatched.
+* **the exceptions are positive, not gaps.** `_rebuild_execution_record_at_head`
+  has just archived the candidate, so there is deliberately nothing left to bind;
+  `_drop_published_push_binding`'s candidate has already been published, where
+  re-presenting it would invite a second push of work that already shipped; and
+  `_drop_recordless_push_binding`'s execution record is gone for a task that is
+  no longer in flight. In all three, nothing a binding could name still exists.
+
+`push_candidate_unresolvable` therefore has two task-arm outcomes rather than
+one. When the record still names a candidate that resolves — the ordinary
+`push_candidate_stale` shape, "a later round advanced it" — that candidate is
+re-presented and the very next round is approvable. When the record's own
+candidate is the unresolvable one, which is the usual way this code is reached on
+the task arm, there is nothing to re-present and dropping the pointer would
+change none of the causal stale state; the rebuild routes to
+`_rebuild_execution_record_at_head` with its own cause string, inheriting
+recut-01's refusals and `MAX_TASK_RECUTS` rather than adding a third archival
+mechanism.
+
+`push_candidate_stale`'s other stated cause — "the execution record is gone" —
+splits on the REGISTRY rather than on the record's absence, because absence alone
+describes two opposite situations. A task no longer `in_progress` had its record
+archived by a recut, a release or an earlier rebuild, and is already back in the
+queue: nothing is left to publish or archive, the stale pointer is the whole of
+the stale state, and dropping it is the complete remedy. A task still
+`in_progress` with no record is genuinely unfinishable — `health.
+stranded_fault_rounds` skips an ABSENT record deliberately, so
+`_reconcile_stranded_tasks` will not requeue it either — and that is a question
+for a human, so it parks. Reading absence alone halts the loop over a fault whose
+cause was already cleared.
+
+One refusal inside the archive route is switchable, and only on proven evidence:
+`candidate_resolves=False`, set by the push arm after it has read the commit out
+of the worker repository and failed. Without it the route is unreachable for the
+shape it exists for — the record's current candidate WAS presented in its own
+round, so `sent_postcommits` names it and `_recut_outstanding_verdict` reports a
+verdict still in flight. That refusal protects work an approval could still
+publish; an approval to an unresolvable commit publishes nothing
+(`_dispatch_task_push` refuses it as `push_candidate_unresolvable`), so keeping
+it there would trade a park for a park. Everything else the route refuses — the
+cap, the operator hold, a published candidate, an unreadable record — is
+unconditional.
+
+Its CHANGESET arm asks the queue entry, not the approval, which record is stale —
+the two can name different commits, since the binding is whatever was bound when
+the packet went out and `review-changeset` may have been run again since. An
+entry whose candidate still resolves is a fine review standing behind a stale
+packet, so it goes through `_rebuild_changeset_packet_at_head` and survives. An
+entry whose candidate does not resolve can render no packet and could never be
+published by any approval, so it is dropped — with its whole record written to
+the transcript first, because an operator queued it.
 
 **Nothing that swaps the outbox leaves the old packet's delivery state behind.**
 Every rebuild goes through `_replace_outbox`, which clears `outbox_diff` and
@@ -6999,10 +7066,12 @@ what was discarded, including the archive and quarantine paths).
 **The five hard halts are unchanged and still unreachable.** They are refused by
 `blockers.autonomous_recovery` before the table is consulted at all, so growing
 the table cannot reach them; `test_stale_record_rebuild.py` re-asserts the
-disjointness against the MERGED table. Pinned there, and by the three AST checks
-that read the `task_base_behind_head`, `state_inconsistent` and
-`changeset_binding_missing` park sites to confirm they still pass the arguments
-the tests replay.
+disjointness against the MERGED table. Pinned there, and by the four AST checks
+that read the park sites: `task_base_behind_head`, `state_inconsistent` and
+`changeset_binding_missing` must still pass the arguments the tests replay, and
+the two `push_candidate_*` sites must still split into one that names a task and
+one that does not — a changeset site that started naming a task would route an
+operator's changeset into the task rebuild.
 
 ### 9d. Retired: superseded work is not blocked work
 

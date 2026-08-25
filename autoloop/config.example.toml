@@ -412,6 +412,16 @@ test_selection = "reachable"
 # re-derived from the checkout's current branch, which could rebind a candidate
 # to a destination nobody named — and a packet that cannot be rendered, or that
 # comes back without them, parks instead of being sent.
+#
+# AND NOTHING IS LEFT UNPUBLISHABLE. The two push_candidate_* codes hold a stale
+# APPROVAL BINDING rather than a record, and dropping one is only half a remedy:
+# the candidate the task still holds would have no packet a later approval could
+# name, so the loop would have moved while making the operator's job harder.
+# Both instead RE-PRESENT that candidate — a freshly rendered review packet,
+# checked before it is sent to carry everything the next round binds on — so the
+# very next verdict can publish it. Where nothing can be re-presented because the
+# recorded candidate itself no longer resolves, the record is archived and the
+# task requeued through the same path as above, never re-dispatched blind.
 enabled = false
 
 # A CEILING on the per-code retry budgets in blockers.AUTONOMOUS_RECOVERIES,
