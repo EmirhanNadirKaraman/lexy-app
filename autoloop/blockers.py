@@ -212,11 +212,15 @@ STALE_EXECUTION_RECORD = "execution_record"
 #: avoided.
 #:
 #: The execution record underneath is still not archived in the ordinary case,
-#: for the reason the `push_candidate_stale` entry gives. The exception is the
-#: shape where nothing can be rebuilt at all — the record's OWN candidate does
-#: not resolve — and there the rebuild routes to `STALE_EXECUTION_RECORD`'s
-#: path, recut-01's refusals and cap included, rather than emitting an unbound
-#: request.
+#: for the reason the `push_candidate_stale` entry gives. The ONE exception is
+#: the shape where nothing can be rebuilt at all AND git said so — the worker
+#: repository the record names answers that its object database does not hold
+#: the record's OWN candidate — and there the rebuild routes to
+#: `STALE_EXECUTION_RECORD`'s path, recut-01's refusals and cap included, rather
+#: than emitting an unbound request. Every weaker reading of "does not resolve"
+#: parks: a probe that could not answer, a record naming no candidate, and a
+#: record naming no worker repository to ask in are each an unanswered question,
+#: not an absent object.
 STALE_PUSH_BINDING = "push_binding"
 
 #: The PACKET standing between an operator-queued changeset review

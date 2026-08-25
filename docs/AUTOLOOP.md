@@ -6848,7 +6848,7 @@ dispatches on.
 |---|---|---|
 | `task_base_behind_head` | the `TaskExecution` on disk | Archives it and requeues the task through recut-01's `release_task_to_pending(move=registry.recut)`, so the next dispatch is cut fresh at the current head. |
 | `push_candidate_stale` | the approval binding | Drops `last_response`, this task's `sent_postcommits` entries and a `carry_postcommit` naming it — then RE-PRESENTS the candidate the execution record actually holds as a freshly rendered `postcommit_review` packet, verified to bind. The execution record is NOT archived. |
-| `push_candidate_unresolvable` | the approval binding | Same, when there is something to re-present. When the record's OWN candidate cannot be resolved there is not, and the rebuild routes to the archive-and-requeue path above. Its second producer — the changeset push — names no task, and there the queued changeset decides (below). |
+| `push_candidate_unresolvable` | the approval binding | Same, when there is something to re-present. When the worker repository ANSWERS that it does not hold the record's OWN candidate there is not, and the rebuild routes to the archive-and-requeue path above — that answer, and nothing weaker, is the whole authority for it. Its second producer — the changeset push — names no task, and there the queued changeset decides (below). |
 | `state_inconsistent` | the loop's own half-finished round | Drops `last_response` and `pending_request` and rebuilds the round at `ready`. |
 | `audit_revise_no_record` | `state.current_task` | Drops the pointer and asks the reviewer for a fresh `audit`, which mints a unit at the current head by construction. |
 | `changeset_binding_missing` | the PACKET in `state.outbox`, never the queue entry | Keeps `state.changeset` and re-renders the review packet for it from the immutable git objects, so the next round presents the same candidate under a binding an approval can resolve. |
@@ -7066,6 +7066,31 @@ raises), which is why `cli._candidate_is_retired` is built the same way.
   a live execution record, quarantines the worker, and is the one thing licensed
   to bypass `_recut_outstanding_verdict`. `None` there parks with the record, the
   worker, the approval pointers and that refusal all intact.
+
+**A question that was never PUT is not an answer either**, and the task arm had
+two of those left after the tri-state probe went in. A record naming no
+`candidate_sha`, and a record naming no `worktree_path`, both routed straight to
+the archive path on the reading that there was nothing to re-present. Neither is
+git reporting an object absent, so both now refuse and park with the record, the
+worker and the bindings intact:
+
+* **no candidate.** An empty `candidate_sha` says the loop never persisted one.
+  It is also the shape in which the protection is structurally silent:
+  `_recut_outstanding_verdict` matches ledger entries by candidate sha, and a
+  candidate that was never committed was never presented, so nothing can be
+  outstanding for it and the refusal cannot object however live the record is.
+* **no worker repository.** Falling through would not have skipped the question,
+  it would have asked the WRONG REPOSITORY: `GitGateway(Path(""), …)` is the loop
+  process's own working directory — the primary checkout — which can answer
+  `False` perfectly truthfully about a commit that only ever existed inside a
+  worker. That `False` archives the record and bypasses the verdict refusal on an
+  answer to a question nobody asked.
+
+So the task arm's authority to destroy a record is exactly one answer, `git
+cat-file -e` exiting 1, against exactly one repository, the worker the record
+names. `task_base_behind_head` is unaffected and still archives a record with no
+candidate on it: there the established fact is the BASE, and the candidate is not
+what the code is about.
 
 The same fail-open was shipped twice — the changeset arm in the first cut, the
 task arm surviving the fix to it, where `read_commit`/`tree_of` in one `try`

@@ -74,12 +74,25 @@ one thing licensed to bypass `_recut_outstanding_verdict`. So a transient git
 failure, a policy refusal, a corrupt object, an I/O error or a worker directory
 that had been removed would each have thrown away a candidate an approval still
 in flight could publish. It now goes through the same `_commit_presence`, and the
-four tests under "the worker-repository presence probe" below are the matrix:
+six tests under "the worker-repository presence probe" below are the matrix:
 explicit absence archives; exit 128 parks; an OSError parks; an object that IS
-there but whose tree will not resolve parks. Each park is asserted on the four
+there but whose tree will not resolve parks; a record naming NO candidate parks;
+and a record naming no WORKER REPOSITORY parks. Each park is asserted on the four
 things that must survive it — the record, the worker, the approval pointers and
 the outbox — because "it parked" alone would also pass against code that parked
 after archiving.
+
+**The fourth mistake, and it is the same one a third time: the two shapes where
+the probe was never REACHED.** A record with no `candidate_sha` and a record with
+no `worktree_path` both routed straight to the archive path, on the reading that
+"there is nothing to re-present, so this is the archive case". Neither is git
+answering anything. The first is worse than it looks, because
+`_recut_outstanding_verdict` matches by candidate sha and an empty one matches no
+ledger entry — the refusal meant to protect a verdict in flight is silent for
+exactly that shape. The second is worse still: `Path("")` is `.`, so falling
+through would have asked the PRIMARY CHECKOUT whether a worker's commit exists
+and read its truthful `False` as this task's. Both park now, with everything
+intact, and only `git cat-file -e` exiting 1 archives anything on this arm.
 
 Self-contained per this codebase's convention (see `test_blockers.py`) — the
 config/orchestrator helpers are duplicated here rather than imported from
@@ -629,9 +642,14 @@ class PostcommitWiring:
 
     * `"commit"` — a real commit on `autoloop/t1`, descended from the recorded
       base. The rebuild re-presents it.
-    * `"missing"` — a 40-hex sha nothing resolves. Nothing can be re-presented,
-      so the rebuild archives and requeues.
-    * `""` — no candidate was ever committed. Same archive path.
+    * `"missing"` — a 40-hex sha `git cat-file -e` answers exit 1 about. Nothing
+      can be re-presented and git SAID SO, so the rebuild archives and requeues.
+      The only shape here that destroys anything.
+    * `""` — no candidate was ever committed, so no question was ever put to git.
+      The rebuild PARKS with the record intact; it used to archive, which is the
+      revision the "fourth mistake" paragraph in this module's docstring
+      describes. Note the `alr-presented` guard below: with no candidate there is
+      nothing the ledger could name, which is why that case must not archive.
     """
 
     def __init__(self, tmp_path, *, enabled=True, with_publisher=False,
@@ -1178,13 +1196,20 @@ def test_push_candidate_unresolvable_on_the_task_arm_archives_and_requeues(
 # it archives a live execution record, quarantines the worker AND is the one
 # thing licensed to bypass `_recut_outstanding_verdict`, so a candidate an
 # approval still in flight could publish is destroyed by it. Exactly one answer
-# authorizes that — `git cat-file -e` returning 1 — and the three tests after it
-# put the probe in states where the question went UNANSWERED and assert that
-# everything the archive would have consumed is still there.
+# authorizes that — `git cat-file -e` returning 1 — and the five tests after it
+# put the probe in states where the question went UNANSWERED, or was never
+# ASKABLE at all, and assert that everything the archive would have consumed is
+# still there.
 # =============================================================================
 
 
-def assert_parked_with_everything_intact(wiring, tmp_path, *, reason_fragment):
+def assert_parked_with_everything_intact(
+    wiring,
+    tmp_path,
+    *,
+    reason_fragment,
+    expected_ledger=("alr-old", "alr-presented", "alr-other"),
+):
     """The four things a park must leave standing, asserted together so no test
     here can prove "it parked" while the record was already gone.
 
@@ -1192,6 +1217,14 @@ def assert_parked_with_everything_intact(wiring, tmp_path, *, reason_fragment):
     quarantined the worker and THEN parked — which is the failure mode being
     excluded, not a hypothetical: the archival is durable before the payload is
     built, so a park after it is a park with the work destroyed.
+
+    `expected_ledger` is overridden by exactly one caller, the record that names
+    NO candidate: `PostcommitWiring` seeds `alr-presented` only when the record
+    has a candidate to have presented, and that guard is right rather than an
+    inconvenience — nothing was ever committed, so nothing was ever put in front
+    of a reviewer. Weakening the fixture to seed it anyway would have hidden the
+    very thing that case is about, which is that an empty ledger is the state in
+    which the outstanding-verdict refusal has nothing to object with.
     """
     orch = wiring.orch
     assert orch.state.phase == Phase.NEEDS_USER.value
@@ -1204,11 +1237,11 @@ def assert_parked_with_everything_intact(wiring, tmp_path, *, reason_fragment):
     # 2. the worker repository, where it was and not in quarantine.
     assert wiring.worker_path.exists()
     assert not (tmp_path / "quarantine").exists()
-    # 3. the approval bindings — including `alr-presented`, which is what the
-    #    outstanding-verdict refusal reads. Its survival IS the protection.
-    assert [r["request_id"] for r in orch.state.sent_postcommits] == [
-        "alr-old", "alr-presented", "alr-other"
-    ]
+    # 3. the approval bindings — including, wherever the record HAS a candidate,
+    #    `alr-presented`, which is what the outstanding-verdict refusal reads.
+    #    Its survival IS the protection; see `expected_ledger` above for the one
+    #    caller where no such entry can exist.
+    assert [r["request_id"] for r in orch.state.sent_postcommits] == list(expected_ledger)
     assert orch.state.carry_postcommit == {
         "task_id": "t1", "candidate_sha": wiring.approved_sha
     }
@@ -1355,24 +1388,28 @@ def test_only_gits_own_absent_answer_archives_the_record(tmp_path, monkeypatch):
     assert outcomes["unanswered"] == (Phase.NEEDS_USER.value, False)
 
 
-@pytest.mark.parametrize("candidate", ["missing", ""])
-def test_a_record_that_names_no_resolvable_candidate_is_archived_not_re_presented(
-    tmp_path, candidate
+def test_a_record_whose_own_candidate_git_reports_absent_is_archived_not_re_presented(
+    tmp_path
 ):
     """Reached by the OTHER road: the approval is refused as
     `push_candidate_stale` because the record disagrees with it, and the record's
-    own candidate then turns out to be unresolvable (`missing`) or absent (`""`).
+    own candidate then turns out to be one git answers exit 1 about.
     Re-presenting is impossible, so the rebuild archives and requeues rather than
     emitting a payload nothing can bind.
 
-    The `missing` case is also what pins the ONE refusal the archive route lets a
-    caller switch off. The fixture's ledger holds an entry that PRESENTED that
-    candidate — as production always does — so `_recut_outstanding_verdict`
-    reports a verdict still in flight and the route would park. It is bypassed
-    only on proven non-resolution, because `_dispatch_task_push` would refuse
-    that very approval as `push_candidate_unresolvable`: there is no work left
-    for the refusal to protect, and keeping it would trade a park for a park."""
-    wiring = PostcommitWiring(tmp_path, candidate=candidate)
+    This is also what pins the ONE refusal the archive route lets a caller switch
+    off. The fixture's ledger holds an entry that PRESENTED that candidate — as
+    production always does — so `_recut_outstanding_verdict` reports a verdict
+    still in flight and the route would park. It is bypassed only on proven
+    non-resolution, because `_dispatch_task_push` would refuse that very approval
+    as `push_candidate_unresolvable`: there is no work left for the refusal to
+    protect, and keeping it would trade a park for a park.
+
+    It was parametrized over both record shapes until this module's "fourth
+    mistake" revision split them apart. They looked alike and are opposite:
+    `ABSENT_SHA` is a name git RESOLVES A QUESTION ABOUT, and an empty
+    `candidate_sha` is a question nobody put."""
+    wiring = PostcommitWiring(tmp_path, candidate="missing")
 
     wiring.refuse_at_the_real_site()
 
@@ -1383,6 +1420,71 @@ def test_a_record_that_names_no_resolvable_candidate_is_archived_not_re_presente
     assert transcript_entries(wiring.config, "autonomous_rebuild")[0][
         "stale_record"
     ] == STALE_EXECUTION_RECORD
+
+
+def test_a_record_that_names_no_candidate_at_all_parks_rather_than_archiving(tmp_path):
+    """An empty `candidate_sha` is NOT git reporting an object absent, and the
+    earlier cut of this arm archived on it anyway — routing to the archive path
+    with `candidate_resolves` left TRUE, which is where it looks safe and is not.
+
+    The bypass is not the hole here; the EVIDENCE is. `_recut_outstanding_verdict`
+    matches ledger entries by candidate sha, and a candidate that was never
+    committed was never presented, so the ledger cannot hold one naming `""` —
+    the refusal that is supposed to protect a verdict in flight is structurally
+    silent for exactly this shape, and the archival goes through on a question
+    nobody asked. `expected_ledger` below is two entries rather than three for
+    that very reason: `alr-presented` is absent because there was nothing to
+    present, which is the fixture agreeing with the argument rather than
+    accommodating it.
+
+    Reached by the stale road, which is the only one available: with no candidate
+    on the record, `_dispatch_task_push`'s `execution.candidate_sha !=
+    binding.candidate_sha` test at `orchestrator.py:9263` fires for ANY binding,
+    before a single worker-repository git command runs."""
+    wiring = PostcommitWiring(tmp_path, candidate="")
+    wiring.orch.state.outbox = "the packet that was already queued"
+
+    wiring.refuse_at_the_real_site()
+
+    assert wiring.orch.state.outbox == "the packet that was already queued"
+    assert_parked_with_everything_intact(
+        wiring,
+        tmp_path,
+        reason_fragment="names no candidate",
+        expected_ledger=("alr-old", "alr-other"),
+    )
+
+
+def test_a_record_that_names_no_worker_repository_parks_rather_than_archiving(
+    tmp_path
+):
+    """The other shape the earlier cut archived on, and the more dangerous of the
+    two because falling through does not merely skip the question — it asks it of
+    the WRONG REPOSITORY.
+
+    `_rebuild_task_review_at_head` builds `GitGateway(Path(execution.worktree_
+    path), ...)`, and `Path("")` is `.`: the loop process's own working
+    directory, i.e. the primary checkout. That repository can answer `False`
+    perfectly truthfully about a commit that only ever existed inside a worker,
+    and `False` is the one answer licensed to archive the record, quarantine the
+    worker and bypass `_recut_outstanding_verdict`. So the fail-open here is not
+    "an unanswered question read as absence" but "another repository's answer
+    read as this one's".
+
+    Here the record DOES name a candidate, so `alr-presented` is in the ledger
+    and the default `expected_ledger` applies — this test's park is therefore
+    also the assertion that the outstanding-verdict protection survived."""
+    wiring = PostcommitWiring(tmp_path)
+    wiring.execution.worktree_path = ""
+    wiring.execution_store.save(wiring.execution)
+    wiring.orch.state.outbox = "the packet that was already queued"
+
+    wiring.refuse_at_the_real_site()
+
+    assert wiring.orch.state.outbox == "the packet that was already queued"
+    assert_parked_with_everything_intact(
+        wiring, tmp_path, reason_fragment="names no worker repository"
+    )
 
 
 def test_an_already_published_candidate_only_loses_its_binding(tmp_path):

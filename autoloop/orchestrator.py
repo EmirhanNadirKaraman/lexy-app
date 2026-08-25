@@ -10995,8 +10995,10 @@ class Orchestrator:
            There is nothing to re-present, so the remedy is the one recut-01
            already implements and `_rebuild_execution_record_at_head` is called
            with its own cause string. It carries recut-01's refusals and
-           `MAX_TASK_RECUTS`, so this is not a second archival mechanism.
-        3. *Refused* — and the loop parks with the question it always had. THREE
+           `MAX_TASK_RECUTS`, so this is not a second archival mechanism. That
+           one answer — `git cat-file -e` exiting 1 — is the WHOLE of this arm's
+           authority to destroy a record; everything else is (3).
+        3. *Refused* — and the loop parks with the question it always had. FIVE
            shapes are deliberately in this arm rather than in (2), and each was a
            fail-open in the destructive direction before it was:
            * the presence question going UNANSWERED — a transient git failure, a
@@ -11005,6 +11007,14 @@ class Orchestrator:
              record and bypassed the outstanding-verdict refusal on evidence
              nobody gathered, which is the changeset arm's own bug wearing the
              task arm's clothes;
+           * a record naming NO candidate. It says the loop never persisted one,
+             not that git was asked and answered — and it is the state in which
+             the outstanding-verdict refusal has nothing to object with, since a
+             candidate that was never committed was never presented either;
+           * a record naming no WORKER REPOSITORY, where the question cannot be
+             put at all: `Path("")` is the loop process's own directory, so the
+             probe would have interrogated the PRIMARY CHECKOUT about a worker's
+             commit and read its truthful `False` as this task's;
            * a candidate whose TREE will not resolve though the object is there
              — undiagnosed, not absent;
            * a packet that cannot be RENDERED — an oversized range-diff is not
@@ -11042,14 +11052,43 @@ class Orchestrator:
             return self._drop_recordless_push_binding(task_id, code=code)
         if execution.published_sha:
             return self._drop_published_push_binding(task_id, execution, code=code)
-        if not execution.candidate_sha or not execution.worktree_path:
-            # No candidate committed, or no worker repository to read one from:
-            # either way there is no reviewable state, which is the archive
-            # path's case rather than this one's. `candidate_resolves` is left
-            # TRUE here — non-resolution has not been proven, only made
-            # unaskable, and an unasked question is not evidence.
-            return self._rebuild_execution_record_at_head(
-                task_id, code=code, cause=UNRESOLVABLE_CANDIDATE_REBUILD_CAUSE
+        if not execution.candidate_sha:
+            # NOT git's answer, and the archive route is reached ONLY by git's
+            # answer. A record naming no candidate says this loop never
+            # persisted one; it does not say the object database was asked
+            # about anything. The earlier cut routed here to
+            # `_rebuild_execution_record_at_head` with `candidate_resolves` left
+            # TRUE — so the outstanding-verdict refusal did still run, but a
+            # live record was archived and its worker quarantined on a question
+            # nobody put to git, and an empty ledger (no candidate was ever
+            # presented, so nothing is outstanding) is precisely the state in
+            # which that refusal cannot object. It parks instead.
+            return self._refuse_rebuild(
+                code,
+                "its execution record names no candidate, which is not git "
+                "reporting one absent, so nothing about it is established",
+            )
+        if not execution.worktree_path:
+            # The probe below could not even be ADDRESSED. `Path("")` is `.` —
+            # the loop process's own working directory, i.e. the primary
+            # checkout — so falling through would ask the WRONG REPOSITORY
+            # whether a worker's candidate exists, and a truthful `False` about
+            # a repository that was never this task's would archive the record,
+            # quarantine a worker and bypass `_recut_outstanding_verdict` on an
+            # answer to a question nobody asked. An unaskable question is not an
+            # unfavourable answer.
+            #
+            # NOT a new rule: `_carry_reviewed_candidate_past` states the same
+            # two preconditions in the same order and for the same reason (see
+            # its preconditions 1 and 2 — "`Path('')` resolves to the CWD, so an
+            # empty `worktree_path` would otherwise send the probe below at the
+            # primary checkout"). This handler probes a worker repository too,
+            # and its probe authorizes more, so it cannot be laxer.
+            return self._refuse_rebuild(
+                code,
+                "its execution record names no worker repository, so whether "
+                f"candidate {execution.candidate_sha[:12]} exists could not be "
+                "asked",
             )
         # Constructing a gateway cannot fail: `GitGateway.__init__` stores
         # `Path(repo_root)`, the policy and the runner and touches no
