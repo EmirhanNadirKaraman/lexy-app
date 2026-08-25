@@ -86,10 +86,31 @@ from .git_gateway import GitGateway
 from .implement_executor import ImplementExecutor, implement_agent_runner
 from .inbox import (
     KIND_URGENT,
+    MAX_WORK_SUGGESTIONS,
     InboxError,
+    IntakeError,
     TaskInbox,
     apply_requests,
+    audit_finding_suggestions,
+    create_draft,
+    draft_blockers,
+    create_draft_from_file,
+    draft_from_suggestion,
+    draft_path,
+    draft_specs,
+    gather_suggestions,
     inbox_dir_for,
+    intake_dir_for,
+    interview_step,
+    list_drafts,
+    open_blocker_suggestions,
+    plan_step,
+    provider_asker,
+    read_draft,
+    ready_task_suggestions,
+    record_decline,
+    refuse_if_round_running,
+    submit_draft,
 )
 from .auto_merge import (
     UPGRADE_EXEC_FAILED,
@@ -2061,6 +2082,235 @@ def _cmd_add_task(args: argparse.Namespace) -> int:
         "on merge, so a duplicate id or unknown dependency is reported there."
     )
     return 0
+
+
+def _intake_dir(config: AutoloopConfig) -> Path:
+    return intake_dir_for(config.workers_root, config.state_dir)
+
+
+def _all_suggestions(config: AutoloopConfig) -> list:
+    """Every citable suggestion, unfiltered and unlimited.
+
+    Used only to resolve a KEY an operator typed back at us (`accept`,
+    `decline`). The OFFER is `gather_suggestions`, which bounds and de-declines
+    it; this is the lookup behind it, so a key that scrolled off the offer is
+    still resolvable.
+    """
+    tasks_file = config.tasks_file
+    try:
+        registry_text = tasks_file.read_text(encoding="utf-8")
+    except OSError:
+        registry_text = ""
+    tasks_data = None
+    if registry_text:
+        try:
+            tasks_data = json.loads(registry_text)
+        except ValueError:
+            tasks_data = None
+    return (
+        audit_finding_suggestions(Path.cwd(), config.repo.audit_report_glob, registry_text)
+        + ready_task_suggestions(tasks_data)
+        + open_blocker_suggestions(config.blockers_dir)
+    )
+
+
+def _print_pass(result) -> None:
+    print(f"draft: {result.path}")
+    for question in result.added_questions:
+        print(f"  + ? {question}")
+    for line in result.added_evidence:
+        print(f"  + evidence: {line}")
+    if result.evidence_note:
+        print(f"  evidence: {result.evidence_note}")
+    if result.provider_note:
+        print(f"  note: {result.provider_note}")
+    for line in result.assumptions:
+        print(f"  assumed: {line}")
+    if result.blockers:
+        print("  NOT a draft yet:")
+        for line in result.blockers:
+            print(f"    - {line}")
+        print(
+            "  Answer the `?!` questions in the file, then run `intake ask` "
+            "again. Nothing has been queued."
+        )
+    else:
+        print(
+            "  READY — a `## Draft` section is in the file. Check the "
+            "approved_paths (they are SUGGESTED, and authorize nothing until "
+            "you submit), then `python -m autoloop intake submit --id "
+            f"{result.path.stem}`."
+        )
+
+
+def _cmd_intake(args: argparse.Namespace) -> int:
+    """Operator intake: a rough idea, interviewed into a DRAFT task.
+
+    Every subcommand here is AUTHORING-TIME. Nothing dispatches, nothing
+    writes the registry, and the only one that queues anything at all is
+    `submit`, which goes through the same `TaskInbox` `add-task` uses.
+
+    The three question-asking subcommands (`ask`, `suggest`, `plan`) refuse
+    while a round is live — `ask_user` was retired for parking the loop on a
+    question nobody was there to answer, and asking mid-round would rebuild it.
+    `new`, `show`, `list` and `submit` are safe at any moment, exactly like
+    `add-task`, because they touch nothing inside the checkout.
+    """
+    config = load_config(args.config)
+    intake_dir = _intake_dir(config)
+    repo = Path.cwd()
+    action = args.intake_cmd
+    try:
+        return _run_intake(action, args, config, intake_dir, repo)
+    except OSError as exc:
+        # A drafts directory that is a file, a read-only volume, a full disk.
+        # Reported as a refusal rather than a traceback: `main` catches
+        # `IntakeError`, and every one of these is something the operator can
+        # act on. Nothing here has queued anything by this point except a
+        # `submit`, which reports its own partial state (`submit_draft`).
+        raise IntakeError(f"the intake directory could not be used: {exc}") from exc
+
+
+def _run_intake(action, args, config: AutoloopConfig, intake_dir: Path, repo: Path) -> int:
+    """The subcommand bodies. Split out so `_cmd_intake` owns the one
+    OSError-to-refusal boundary rather than repeating it per branch."""
+    if action == "list":
+        drafts = list_drafts(intake_dir)
+        if not drafts:
+            print(f"no drafts in {intake_dir}")
+            return 0
+        for path in drafts:
+            draft = read_draft(path)
+            blockers = draft_blockers(draft)
+            state = "ready" if not blockers else f"{len(blockers)} open"
+            print(f"{path.stem:24} {state:12} {draft.title[:60]}")
+        return 0
+
+    if action == "new":
+        if args.file:
+            path = create_draft_from_file(intake_dir, Path(args.file), args.id or "")
+        else:
+            if not args.id:
+                raise IntakeError("--id is required when the idea is given as --text")
+            path = create_draft(intake_dir, args.id, args.text or "")
+        print(
+            f"draft: {path}\n"
+            "Nothing has been queued and no task exists. Run "
+            f"`python -m autoloop intake ask --id {path.stem}` to be asked "
+            "about it; delete the file to abandon it, which leaves nothing "
+            "behind."
+        )
+        return 0
+
+    if action == "show":
+        path = draft_path(intake_dir, args.id)
+        try:
+            print(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise IntakeError(f"could not read {path}: {exc}") from exc
+        return 0
+
+    if action == "ask":
+        refuse_if_round_running(config.state_dir, "the intake interview")
+        result = interview_step(
+            draft_path(intake_dir, args.id),
+            ask=None if args.no_model else provider_asker(config),
+            repo=repo,
+        )
+        _print_pass(result)
+        return 0
+
+    if action == "plan":
+        refuse_if_round_running(config.state_dir, "intake planning")
+        result = plan_step(
+            draft_path(intake_dir, args.id), ask=provider_asker(config), repo=repo
+        )
+        print(f"draft: {result.path}")
+        print(f"  one level, {len(result.tasks)} task(s): {', '.join(result.tasks)}")
+        if result.note:
+            print(f"  reason given: {result.note}")
+        print(
+            "  Nothing was queued. Deeper splits are not produced here: a task "
+            "that turns out to be too large is split later by a reviewer that "
+            "sees it refuse, on that task's own evidence."
+        )
+        return 0
+
+    if action == "submit":
+        path = draft_path(intake_dir, args.id)
+        if args.dry_run:
+            for spec in draft_specs(read_draft(path)):
+                print(f"{spec['id']} (priority {spec['priority']})")
+                print(f"  approved_paths: {', '.join(spec['approved_paths'])}")
+                print(f"  description: {len(spec['description'])} chars")
+            print("Nothing was queued — this was a dry run.")
+            return 0
+        inbox = TaskInbox(inbox_dir_for(config.workers_root, config.state_dir))
+        filed = submit_draft(path, inbox)
+        for task_id, queued in filed:
+            print(f"queued task '{task_id}' -> {queued}")
+        print(
+            "The running loop picks these up between steps; the task graph is "
+            "validated on merge, so a duplicate id or unknown dependency is "
+            f"reported there. The draft is still at {path}."
+        )
+        return 0
+
+    if action == "suggest":
+        refuse_if_round_running(config.state_dir, "offering work to do")
+        offer = gather_suggestions(
+            repo,
+            report_glob=config.repo.audit_report_glob,
+            tasks_file=config.tasks_file,
+            blockers_dir=config.blockers_dir,
+            intake_dir=intake_dir,
+            limit=args.limit,
+        )
+        for line in offer.sources:
+            print(f"read: {line}")
+        if offer.declined:
+            print(f"({offer.declined} previously declined, evidence unchanged)")
+        if not offer.suggestions:
+            print(
+                "nothing to offer. That is a statement about the sources listed "
+                "above and nothing else — an empty offer is not a claim that "
+                "there is no work."
+            )
+            return 0
+        print("")
+        for item in offer.suggestions:
+            print(f"{item.key}\n  {item.headline}\n  cite: {item.cite}")
+        print(
+            "\nPick one: `intake accept <key> --id <slug>`. Declining is free: "
+            "`intake decline <key>` — it is not offered again unless its "
+            "evidence changes."
+        )
+        return 0
+
+    if action in ("accept", "decline"):
+        found = [item for item in _all_suggestions(config) if item.key == args.key]
+        if not found:
+            raise IntakeError(
+                f"no suggestion with key {args.key!r} — run `intake suggest` for "
+                "the current offer"
+            )
+        item = found[0]
+        if action == "decline":
+            record_decline(intake_dir, item.key, item.fingerprint)
+            print(
+                f"declined {item.key}. It will not be offered again unless its "
+                "evidence changes."
+            )
+            return 0
+        path = draft_from_suggestion(intake_dir, item, args.id or "")
+        print(
+            f"draft: {path}\n"
+            f"Seeded from {item.cite}. Nothing has been queued. Rewrite the "
+            f"idea in your own words, then `intake ask --id {path.stem}`."
+        )
+        return 0
+
+    raise IntakeError(f"unknown intake action {action!r}")
 
 
 def _cmd_urgent(args: argparse.Namespace) -> int:
@@ -5481,6 +5731,79 @@ def build_parser() -> argparse.ArgumentParser:
                           help='repeatable, e.g. --validation "ruff check ."')
     add_task.add_argument("--validation-cwd", default="")
 
+    # ---- intake: an idea, interviewed into a draft ---------------------------
+    # AUTHORING TIME ONLY. `ask`, `suggest` and `plan` refuse while a round is
+    # live (`inbox.refuse_if_round_running`); `new`, `show`, `list` and
+    # `submit` are safe at any moment, exactly like `add-task`, because they
+    # touch nothing inside the checkout. `submit` is the only one that queues.
+    intake = sub.add_parser(
+        "intake",
+        help=(
+            "turn a rough idea into a DRAFT task by question and answer "
+            "(authoring-time; nothing is filed until you submit)"
+        ),
+    )
+    intake_sub = intake.add_subparsers(dest="intake_cmd", required=True)
+
+    intake_new = intake_sub.add_parser(
+        "new", help="start a draft from typed text or a .md/.txt file"
+    )
+    add_config(intake_new)
+    intake_new.add_argument("--id", default="", help="draft name (defaults to the file stem)")
+    intake_new.add_argument("--text", default="", help="the idea, in a sentence or two")
+    intake_new.add_argument(
+        "--file", default="", help="a .md/.txt file holding the idea"
+    )
+
+    for name, help_text in (
+        ("ask", "one interview pass: add questions and evidence, re-read answers"),
+        ("show", "print the draft file"),
+        ("submit", "file the draft through the inbox (the ONLY step that queues)"),
+        ("plan", "split a ready draft into ONE level of tasks"),
+    ):
+        p = intake_sub.add_parser(name, help=help_text)
+        add_config(p)
+        p.add_argument("--id", required=True, help="the draft name")
+        if name == "ask":
+            p.add_argument(
+                "--no-model",
+                action="store_true",
+                help=(
+                    "add only the questions this module holds as constants; "
+                    "ask no model at all"
+                ),
+            )
+        if name == "submit":
+            p.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="print what would be queued and queue nothing",
+            )
+
+    intake_list = intake_sub.add_parser("list", help="every draft and whether it is ready")
+    add_config(intake_list)
+
+    intake_suggest = intake_sub.add_parser(
+        "suggest", help="two or three cited things worth doing, so you face no blank page"
+    )
+    add_config(intake_suggest)
+    intake_suggest.add_argument(
+        "--limit", type=int, default=MAX_WORK_SUGGESTIONS,
+        help="how many to offer; small on purpose — this is a choice, not a list",
+    )
+
+    for name, help_text in (
+        ("accept", "start a draft from an offered suggestion"),
+        ("decline", "never offer this again unless its evidence changes"),
+    ):
+        p = intake_sub.add_parser(name, help=help_text)
+        add_config(p)
+        p.add_argument("key", help="the suggestion key printed by `intake suggest`")
+        if name == "accept":
+            p.add_argument("--id", default="", help="draft name (defaults to the key)")
+
+    intake.set_defaults(func=_cmd_intake)
+
     blockers = sub.add_parser(
         "blockers", help="list open operator-facing blockers (read-only, no lock)"
     )
@@ -5578,7 +5901,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except AutoloopError as exc:
+    except (AutoloopError, InboxError, IntakeError) as exc:
+        # `InboxError` and `IntakeError` are deliberately NOT `AutoloopError`
+        # subclasses — they are refusals of an operator REQUEST, not loop
+        # faults — but they are still messages written for the person at the
+        # prompt, and a traceback is not one.
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
