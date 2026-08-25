@@ -1398,11 +1398,12 @@ so a file created in round 1 and deleted in round 2 is absent from the reviewed
 range entirely. `out_of_scope_paths` is NEVER pruned when a path is cleaned up:
 the record that authorization was exceeded is regression history.
 
-**Not addressed, and worth naming.** This closes out-of-scope cleanup only. A
-task still cannot delete a file INSIDE its `approved_paths` — the missing
-capability is the agent's, not the authorization's — so a review asking for the
-removal of an in-scope file remains unperformable. roadmap-01's second file,
-`autoloop/tests/test_obsolete.py`, was exactly that case.
+**Not addressed by THIS amendment, and worth naming.** It closes out-of-scope
+cleanup only. A task could not delete a file INSIDE its `approved_paths` — the
+missing capability is the agent's, not the authorization's — so a review asking
+for the removal of an in-scope file was unperformable. roadmap-01's second file,
+`autoloop/tests/test_obsolete.py`, was exactly that case. Closed separately by
+the 2026-08-25 amendment below, under a DIFFERENT authority.
 
 **Amended 2026-08-24 (scope-05) — the same authority now also RESTORES a
 recorded path to its base content, and still grants nothing else.** The
@@ -1465,11 +1466,93 @@ Exception`, answered as "", pinned by
 `test_a_corrupt_execution_record_offers_no_revert_and_never_raises`), and a
 task's very first dispatch has no record at all (also "").
 
-**file:line** — `autoloop/tasks.py` (`authorized_cleanup_paths`);
-`autoloop/implement_executor.py` (`_CLEANUP_RE`, `_cleanup_instruction`,
-`_apply_recorded_cleanup`, `_remove_recorded_file`, and since scope-05
-`_REVERT_RE`, `_apply_recorded_reverts`, `_revert_recorded_file`,
-`_revert_base_sha`); `autoloop/orchestrator.py` (`_dispatch_task_postcommit`,
+**Amended 2026-08-25 (del-01) — a round may DELETE a file INSIDE its own
+`approved_paths`, under a DIFFERENT authority, and the trackers are excluded.**
+The two amendments above are about paths a task was never allowed to touch. This
+is the case they leave: a path it IS allowed to touch, and the one where the
+prohibition bought nothing. The agent already has `Edit`/`Write` over every
+authorized path, so it could always reduce such a file to nothing; what it could
+not do was remove the ENTRY. The rule therefore did not stop a file being
+destroyed, it stopped it being destroyed CLEANLY — roadmap-01 committed a
+zero-byte file where a correct review asked for an absent one — and it bent three
+specs in one night on 2026-08-24/25 (brw-14, port-05, shrink-01).
+
+**The rule.** A round may delete a repository-relative path that
+`tasks.unauthorized_paths` says is inside
+`effective_approved_paths(task.approved_paths)`, EXCEPT a `TRACKER_PATHS` entry.
+Nothing is added to `approved_paths` or `allowed_paths`; those are read and never
+written, and every other authorization is untouched.
+
+**Why this does not widen scope, and why the bound is not new code.**
+
+* **The gate is the loop's own matcher, not a copy of it.**
+  `tasks.deletable_paths` CALLS `tasks.unauthorized_paths` over
+  `effective_approved_paths(...)` — the same function, on the same list, that the
+  pre-commit and post-commit scope comparisons use. So an out-of-scope deletion
+  is refused by exactly the code that records an out-of-scope write, and a second
+  matcher that could drift away from the first does not exist. An unscoped task
+  gets `()` and can delete nothing, the fail-closed default it already has for
+  writing.
+* **The bound was already there.** `GitGateway.changed_paths` is
+  `git diff-tree -r --name-only -z`, which reports a DELETED path exactly as it
+  reports a modified one (verified empirically 2026-08-25), and
+  `dirty_paths_all()` reports a tracked deletion as ` D <path>`. So an in-scope
+  deletion is staged, committed, in `commit_range_paths`, and in the reviewer's
+  diff, like any other change — no new visibility mechanism was required and none
+  was added.
+* **Tracker paths are REFUSED although writing them is allowed.**
+  `effective_approved_paths` grants every task write access to `TRACKER_PATHS` so
+  it can APPEND its change note. Those are append-only ledgers shared by every
+  task in the repository, and a grant that exists for appending is not a licence
+  to remove one. The refusal is unconditional — including when the task's own
+  `approved_paths` covers the tracker by an exact entry or a `docs/` prefix — and
+  it is reported as its OWN category, never as "outside your approved paths",
+  which for a tracker would be a false statement that sends a reviewer looking in
+  the wrong place.
+* **Deletion only, and only of a regular file.** The capability is the SAME
+  `_remove_recorded_file` unlink the other two gates use — now shared by all
+  three, so its guards cannot drift into three versions — refusing an absolute
+  path, any `..` segment, a parent that does not resolve inside the worker repo,
+  and anything that is not a regular file or symlink. No directory, no recursive
+  delete, and a symlink removed as the link and never followed. A directory
+  prefix in `approved_paths` authorizes by `startswith`, so a `..` segment can
+  pass the SCOPE gate; this guard is what stops it, which is why it is defence in
+  depth rather than decoration.
+* **No new agent capability.** `WRITE_ALLOWED_TOOLS` and
+  `IMPLEMENT_DISALLOWED_TOOLS` are byte-identical; `Bash` stays disallowed and
+  the executor performs the unlink. The third anchor (`DELETE-FILE:`) refuses
+  `-`/`*`/`>` prefixes like the first two. Echo-safety is doubly structural: the
+  prompt's placeholder `<repository-relative path>` cannot be authorized (no
+  `approved_paths` entry can hold a `<` or a space —
+  `tasks._validate_approved_path` allowlists `[A-Za-z0-9._-]` segments) and no
+  file on disk carries that name.
+* **The two authorities never act on one path in one round.**
+  `_apply_scoped_deletes` leaves any requested path that is in this execution's
+  `out_of_scope_paths` to `REMOVE-`/`REVERT-OUT-OF-SCOPE:` and reports it. The
+  sets are disjoint by construction; the branch is what keeps them disjoint after
+  an operator widens a task's scope between rounds.
+
+**Residual exposure, stated plainly.** A round can now delete an in-scope file
+the reviewer wanted kept — which is the same exposure an `Edit` that empties it
+already carried, minus the misleading zero-byte artifact. Bounded by disclosure
+rather than by a heuristic, deliberately: whether a deletion was WISE is a review
+question and the reviewer sees the diff, so nothing here guesses at intent.
+`implement_executor._scoped_delete_note` NAMES every removed path in the round
+summary — on the success path and on every uncommitted branch — computed from
+what was actually unlinked and never from `result.raw_text`, so an agent claiming
+deletions it did not make moves no entry and an agent silent about ones it did
+make hides nothing. Refusals are reported too: tracker refusals and deferrals are
+NAMED (both bounded by loop-written sets), out-of-scope and absent requests are
+COUNTED and never quoted, because the summary becomes the commit message and an
+agent-chosen string has no length bound.
+
+**file:line** — `autoloop/tasks.py` (`authorized_cleanup_paths`, and since
+del-01 `deletable_paths`); `autoloop/implement_executor.py` (`_CLEANUP_RE`,
+`_cleanup_instruction`, `_apply_recorded_cleanup`, `_remove_recorded_file`, and
+since scope-05 `_REVERT_RE`, `_apply_recorded_reverts`, `_revert_recorded_file`,
+`_revert_base_sha`, and since del-01 `_DELETE_RE`, `_delete_instruction`,
+`_apply_scoped_deletes`, `_ScopedDeletes`, `_scoped_delete_note`);
+`autoloop/orchestrator.py` (`_dispatch_task_postcommit`,
 the `removed_out_of_scope_paths` union); `autoloop/worktask.py`
 (`TaskExecution.removed_out_of_scope_paths`,
 `TaskExecution.reverted_out_of_scope_paths`, `RecordedRevertAuthority`);
@@ -1490,14 +1573,23 @@ rg -n 'revert_authority' autoloop/cli.py
 # Repair must never widen either authorization field — expect NO hit:
 rg -n 'allowed_paths.*cleanup|approved_paths.*cleanup' autoloop/
 rg -n 'allowed_paths|approved_paths' autoloop/implement_executor.py  # read-only rendering only
-pytest autoloop/tests/test_scope_cleanup.py autoloop/tests/test_scope_revert.py -q
+# del-01: the in-scope delete gate must CALL the loop's own matcher, never
+# restate it, and must exclude the trackers — expect both names in the body:
+rg -n -A12 'def deletable_paths' autoloop/tasks.py   # unauthorized_paths + trackers
+rg -n 'DELETE-FILE' autoloop/implement_executor.py
+pytest autoloop/tests/test_scope_cleanup.py autoloop/tests/test_scope_revert.py \
+       autoloop/tests/test_scoped_delete.py -q
 ```
 
 **Suggested fix:** none outstanding. If a future change ever populates the
 repair set from an agent's report, admits a prefix match, lets a repair path
 reach `allowed_paths`/`approved_paths`, restores content from anywhere but
 `task_base_sha`, or makes an unreadable base fall through to a deletion, that is
-a regression of this finding, not a refactor.
+a regression of this finding, not a refactor. Since del-01 the same is true of
+the in-scope delete gate: giving it a scope matcher of its own instead of
+calling `unauthorized_paths`, letting it delete a `TRACKER_PATHS` entry, letting
+it reach a directory, or dropping `_scoped_delete_note` from any branch of the
+round summary are all regressions of this finding.
 
 ### S26 — Two `answer`-precondition keys were dead or mismapped, letting environmental blockers clear on text alone — MEDIUM — RESOLVED 2026-07-31
 
@@ -2785,3 +2877,7 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-25 | brw-16 | One loosening to state plainly rather than bury: `cli._load_state` no longer refuses when `state.conversation_url` differs from the config's, IF the config declares no URL at all. That guard existed so a run could not silently continue against a conversation nobody chose; with no browser adapter registered, nothing aims a transport at that value, and the alternative was forcing a `reset` on any operator who deletes the now-unused `[browser]` section. A config that DOES declare a URL is still held to it. |
 | 2026-08-25 | brw-16 | Revision round, and it is a further narrowing: `smoke-browser` is retired outright rather than repointed at `conversation.provider`. The command now reads no config, constructs no conversation client, takes no `LoopLock` and writes nothing under `state_dir` — a preflight that used to submit a real prompt to a real reviewer submits nothing at all. `cli._SmokeNeverExecutor`, the guard making "a smoke test never executes a task" true, is removed with the only path it guarded. |
 | 2026-08-25 | brw-16 | Verification-check drift worth knowing, in the 2026-08-16 entry above: it ends with an `rg` for `stop_kind == "contract"` in `autoloop/cli.py`, offered as proof the PASS gate reads the POSITIVE value rather than `!= "fault"`. That gate lived in `_cmd_smoke_browser` and is gone, so the grep now returns nothing — retired, not regressed. The rule it demonstrated is unchanged: `cli._is_fault_stop` still gates on `"fault"` positively, and `test_blockers.py` still pins the contract/fault pair. |
+| 2026-08-25 | del-01 | No new finding; S25 gained a 2026-08-25 amendment instead, since this extends the same mechanism under a new authority. A round may now delete a file INSIDE `approved_paths`. The gate CALLS `tasks.unauthorized_paths` rather than restating it, so the deletion rule and the out-of-scope-write rule are one computation. The three "not addressed — a task still cannot delete inside its scope" paragraphs (S25 here, `docs/AUTOLOOP.md` §4e, `CLAUDE.md` §12) were claims this falsified and are corrected in the same commit. |
+| 2026-08-25 | del-01 | Nothing was weakened, and the one place the delete rule departs from the write rule NARROWS: a `TRACKER_PATHS` entry is refused although writing it is allowed, because that grant exists so every task can APPEND a change note to a shared append-only ledger. Refused unconditionally, including when the task's own `approved_paths` covers the tracker by an exact entry or a `docs/` prefix, and reported as its own category — "outside your approved paths" would be false for a path the task may write. |
+| 2026-08-25 | del-01 | No new agent capability: `WRITE_ALLOWED_TOOLS` and `IMPLEMENT_DISALLOWED_TOOLS` are byte-identical, `Bash` stays disallowed, and the executor performs the unlink through the SAME `_remove_recorded_file` the other two gates use — one implementation of the absolute-path, `..`, parent-outside-root and not-a-regular-file refusals rather than three. A directory prefix authorizes by `startswith`, so that guard is what stops `pkg/../../secret.txt` after the scope gate admits it. |
+| 2026-08-25 | del-01 | Residual exposure named rather than guessed at: a round can delete an in-scope file the reviewer wanted kept — the same exposure an `Edit` that empties it already carried, minus the misleading zero-byte artifact. Bounded by DISCLOSURE, not by a heuristic: `_scoped_delete_note` names every removed path in the summary, computed from what was unlinked and never from the agent's text, and the deletion stays in `commit_range_paths` so the reviewer reads it in the diff. Whether it was wise is a review question. |

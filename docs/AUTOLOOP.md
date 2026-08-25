@@ -2553,10 +2553,10 @@ every post-commit check stay exactly as they are; `allowed_paths` and
 `approved_paths` gain nothing, ever. An EDIT to a recorded path is as
 unauthorized as it was — it lands, it is recorded, the reviewer judges it.
 
-Not addressed, and worth knowing before you read a park as this bug: a task
-still cannot delete a file INSIDE its `approved_paths`, because the missing
-capability there is the agent's tool set, not the authorization. roadmap-01's
-second file, `autoloop/tests/test_obsolete.py`, was that case. See
+Not addressed by THIS amendment, and the thing the 2026-08-25 one below adds: a
+task could not delete a file INSIDE its `approved_paths` either, because the
+missing capability there is the agent's tool set, not the authorization.
+roadmap-01's second file, `autoloop/tests/test_obsolete.py`, was that case. See
 `docs/SECURITY.md` S25's 2026-08-19 amendment for the security accounting and
 `autoloop/tests/test_scope_cleanup.py` for the regressions.
 
@@ -2657,6 +2657,103 @@ restored path (the worker tree really did change), so the pre-commit advisory
 comparison re-records it in `out_of_scope_paths` — which is a no-op, since that
 field is never pruned anyway. The POST-commit comparison is the one that
 notices: the path has left the reviewed range.
+
+**Amendment, 2026-08-25 — a round may DELETE a file INSIDE its own
+`approved_paths` (task `del-01`).** The two amendments above are both about
+paths a task was NEVER allowed to touch. This is the other case, and the one the
+missing tool cost most: a path the task IS allowed to touch, which it could
+write freely and could not remove.
+
+**The prohibition never prevented destruction.** The agent already has `Edit`
+and `Write` over everything in `approved_paths`, so it could always reduce an
+authorized file to nothing. What it could not do was remove the ENTRY — so the
+rule did not stop a file being destroyed, it stopped it being destroyed CLEANLY,
+and forced the failure it looked like it was preventing: roadmap-01's
+"remove the residue you added" (2026-08-18) was a correct review, was literally
+unperformable, and produced a committed zero-byte file instead of an absent one.
+Measured cost on 2026-08-24/25: three specs bent around the gap in one night —
+`brw-14` ("remove the browser transport" rewritten to "disconnect it and leave
+the files on disk", plus an operator `git rm`), `port-05` (the same rewrite,
+after the original wording would have produced 120 empty files), and
+`shrink-01` ("break up long files" written as EXTRACTION only, because a move is
+a create plus a delete).
+
+**The bound already existed; the capability did not.** `GitGateway.changed_paths`
+is `git diff-tree -r --name-only -z`, which lists a DELETED path exactly as it
+lists a modified one — verified empirically 2026-08-25 against this repository.
+So `commit_range_paths`, `dirty_paths_all`, and therefore both of the loop's own
+scope comparisons already see a deletion, and nothing new had to be built to
+bound one. `WRITE_ALLOWED_TOOLS` stays Read/Grep/Glob/Edit/Write with `Bash`
+disallowed; the executor performs the unlink, exactly as it performs the other
+two.
+
+What is different from the two amendments above, in the order a round meets it:
+
+* **The authority is `Task.approved_paths`, and it is a DIFFERENT authority.**
+  `REMOVE-OUT-OF-SCOPE:`/`REVERT-OUT-OF-SCOPE:` select from
+  `TaskExecution.out_of_scope_paths`, a record the loop writes from its own path
+  comparisons and an agent can never add to. Those stay exactly as they are. This
+  selects from what the task declared. Two authorities for two questions, kept
+  apart on purpose: merging them would let one request form choose between them.
+* **The request.** `DELETE-FILE: <path>`, a third anchor with the same discipline
+  as the first two — start of line, indent allowed, `-`/`*`/`>` prefixes refused
+  so prose about the convention cannot read as a use of it. Rendered on every
+  ordinary round (`implement_executor._delete_instruction`), and on none at all
+  for a task with no approved paths.
+* **The gate.** `tasks.deletable_paths` runs `tasks.unauthorized_paths` over
+  `effective_approved_paths(task.approved_paths)` — THE function both scope
+  comparisons already use, not a copy of its rule. So an out-of-scope deletion is
+  refused by exactly the code that records an out-of-scope write, a trailing `/`
+  means a subtree at both ends, and the two cannot drift into disagreeing about
+  one path. An unscoped task gets `()` and can delete nothing.
+* **TRACKER PATHS ARE REFUSED although writing them is allowed**, and this is the
+  one place the delete rule deliberately departs from the write rule.
+  `effective_approved_paths` grants every task write access to `TRACKER_PATHS` so
+  it can APPEND its change note; those are append-only ledgers shared by every
+  task, and a grant that exists for appending is not a licence to remove one. The
+  refusal is unconditional — including when the task's own scope covers the
+  tracker independently — and it is reported as its OWN category, never as
+  "outside your approved paths", which for a tracker would be false.
+* **The unlink.** `_remove_recorded_file`, now shared by all three gates so its
+  guards cannot drift into three versions of themselves, in the same window as
+  the other two (before the `git status` read, so a delete-only round has
+  something to commit; before validation, so the suite grades the tree that is
+  committed). It refuses an absolute path, a `..` segment, a parent outside the
+  worker repo, and anything that is not a regular file or symlink — a directory
+  is never removed. That last refusal is also what makes an ECHOED request inert:
+  a path no file sits at is deleted by nobody.
+* **The disclosure.** `_scoped_delete_note` NAMES every file the round actually
+  removed, in the round summary, on the success path and on every uncommitted
+  branch. It is computed from what was unlinked and never from `result.raw_text`
+  — an agent claiming forty deletions moves no entry — and the prompt separately
+  asks the agent to name its deletions in prose, so the two accounts are
+  comparable. Refusals are visible too: a tracker refusal and a deferral are
+  named (both bounded by loop-written sets), an out-of-scope or absent request is
+  COUNTED and never quoted, because the summary becomes the commit message and an
+  agent-chosen string has no bound.
+* **No record field, deliberately.** Unlike the two above, an in-scope deletion is
+  NOT invisible to the packet: it is inside `approved_paths`, so it stays in
+  `commit_range_paths(task_base_sha, candidate_sha)` and the reviewer reads it as
+  a removal in the diff. `TaskExecution` gains nothing.
+
+**What this unlocks, and where it stops.** A MOVE becomes ordinary work — write
+the new path, delete the old, and git records it as a rename
+(`autoloop/{ => loop}/stall.py | 0`), including when the content changes in the
+same commit, so the diff is the delta rather than the whole file twice. A MASS
+REORGANISATION is still not a task, and deletion was never what blocked it:
+`approved_paths` are exact repo-relative paths, so moving `autoloop/dashboard.py`
+means rewriting the `approved_paths` of every live task scoped to it — measured
+2026-08-25, 85 references across 51 live tasks naming 29 distinct top-level
+modules, 355 rewrites across 133 tasks in total. That is `tasks.json`, which no
+agent can edit. Both halves of a move must also be in scope. So: single, scoped
+moves and removals are ordinary; a 41-file reorganisation stays an operator
+commit because of the registry, not because of the tool list.
+
+**Whether a deletion was WISE is a review question**, not a mechanism one — the
+reviewer sees the diff. There is deliberately no heuristic guessing at intent;
+the scope is bounded and the judgement is left where it belongs. Security
+accounting is `docs/SECURITY.md` S25's 2026-08-25 amendment; the regressions are
+`autoloop/tests/test_scoped_delete.py`.
 
 ---
 
