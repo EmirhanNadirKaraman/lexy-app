@@ -1,19 +1,30 @@
-"""Transport recovery: submission classification, the one same-chat resend, and
-bounded conversation rotation.
+"""Transport recovery: submission classification and the one same-chat resend.
 
 The invariant every test here defends is the same one: **what the loop is
 allowed to do automatically depends on what it can prove, not on what it is
 guessing.** A send whose acceptance is merely unobserved licenses nothing (the
 backend may have taken it, so resending risks a double post). A send the browser
 itself reports as failed licenses exactly one resend, after reconciliation
-confirms the request is absent. A second such failure licenses one rotation.
-Nothing licenses two.
+confirms the request is absent. A second such failure licenses NOTHING: the loop
+parks (`send_rejected_twice`).
+
+brw-15 (2026-08-25) is why that last sentence is short. A second confirmed
+rejection, a structurally unusable conversation and a three-strike silent
+conversation each used to authorize one bounded conversation ROTATION — open a
+fresh chat in `browser.project_url`, post the request into it, prove it landed,
+rebind. That machinery is gone from `orchestrator.py`, so every test that
+asserted a rotation happened went with it; what remains here is the
+classification, the resend bound, the per-request conversation binding, and the
+parks. The tests that pin "this fault must NOT rotate" are kept and still pass
+for the stronger reason that nothing can.
 
 `RotatingFakeClient` models the shape of the real transport rather than its
 mechanics: a per-conversation server truth, a page URL that only becomes a real
-`/c/<id>` after the first turn lands (which is why rotation has to submit before
-it can capture), and a `retarget` that decides which conversation every
-subsequent call reads.
+`/c/<id>` after the first turn lands, and a `retarget` that decides which
+conversation every subsequent call reads. It keeps its rotation-shaped
+affordances (`retarget`, `current_url`, `placeholder_until`) because
+`test_conversation_retirement.py` imports it and because they model a real
+browser, not because anything under test still rotates.
 """
 
 import json
@@ -46,7 +57,7 @@ from autoloop.errors import (
     SessionLostError,
 )
 from autoloop.manifest import ManifestStore
-from autoloop.orchestrator import CONTINUATION_NOTE, Orchestrator
+from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import LoopState, PendingRequest, Phase, StateStore
 from autoloop.tasks import TaskRegistry, TaskStore
@@ -326,84 +337,18 @@ def transcript_entries(config, entry_type=None):
     return [r for r in rows if entry_type is None or r.get("type") == entry_type]
 
 
-# ---- 1. a persisted send is never resent and never rotates ------------------
+# ---- 1. a persisted send is never resent ------------------------------------
+#
+# `Orchestrator._url_in_project` and the nine tests that pinned its
+# segment-boundary rules were removed with the rotation machinery (brw-15): the
+# question "is this replacement chat inside the configured project" only ever
+# arose while binding a chat rotation had just created. The equivalent rule that
+# is still live — "are these two URLs the same chat" — is `_same_conversation`,
+# exercised by `test_the_resolution_survives_a_project_relative_search_result`
+# below.
 
 
-SLUG_PROJECT_URL = "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77/project"
-
-
-def in_project(candidate, project=SLUG_PROJECT_URL):
-    from autoloop.orchestrator import Orchestrator
-
-    return Orchestrator._url_in_project(candidate, project)
-
-
-def test_a_chat_url_carrying_the_project_slug_is_inside_the_project():
-    """The bug that stranded the loop on 2026-08-03. ChatGPT writes the project
-    LANDING page as `/g/g-p-<id>/project` but its conversations as
-    `/g/g-p-<id>-<slugified-name>/c/<id>`, so a plain prefix compare rejects a
-    chat that really is in the project. A rotation created a chat, posted the
-    request into it, then refused its own successful result on this check."""
-    assert in_project(
-        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77"
-        "-learn-german-by-speaking/c/6a7069f5-a370-83ed-85c8-0693cd484b86"
-    )
-
-
-def test_the_check_accepted_the_conversation_already_in_use():
-    """What proves the old check was not discriminating good from bad: it
-    rejected the conversation the loop had been working in all day."""
-    assert in_project(
-        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77"
-        "-learn-german-by-speaking/c/6a6d0342-5ddc-83ed-bbf1-6f8a78371671"
-    )
-
-
-def test_a_chat_with_no_slug_suffix_is_still_inside():
-    assert in_project(
-        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77/c/abc123"
-    )
-
-
-def test_a_longer_id_is_not_the_same_project():
-    """The segment-boundary trap: `g-p-abc` may match `g-p-abc-x` but never
-    `g-p-abcdef`. Same class of bug as bare string prefixes in approved_paths."""
-    assert not in_project(
-        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77EXTRA/c/abc"
-    )
-
-
-def test_a_different_project_is_refused():
-    assert not in_project("https://chatgpt.com/g/g-p-someotherproject/c/abc")
-
-
-def test_a_chat_outside_any_project_is_refused():
-    """A redirect to the plain composer must not be silently adopted."""
-    assert not in_project("https://chatgpt.com/c/abc123")
-
-
-def test_the_project_landing_page_is_not_a_conversation():
-    assert not in_project(SLUG_PROJECT_URL)
-    assert not in_project(SLUG_PROJECT_URL.rstrip("/") + "/")
-
-
-def test_a_foreign_host_is_refused():
-    assert not in_project(
-        "https://evil.example/g/g-p-6918cd65611881918e54c50bef4aee77-x/c/abc"
-    )
-
-
-def test_an_empty_or_missing_c_segment_is_refused():
-    assert not in_project("")
-    assert not in_project(
-        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77-x/c/"
-    )
-    assert not in_project(
-        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77-x/settings/abc"
-    )
-
-
-def test_persisted_send_never_resends_or_rotates(tmp_path):
+def test_persisted_send_never_resends(tmp_path):
     """Reconciliation finds the request already there: nothing may be sent."""
     client = RotatingFakeClient(responses=[stop_block()])
     client.seed(CONV_URL, "alr-test-0001")
@@ -468,10 +413,13 @@ def test_successful_resend_avoids_rotation(tmp_path):
     assert transcript_entries(config, "conversation_rotated") == []
 
 
-# ---- 4. a second confirmed rejection rotates, exactly once ------------------
+# ---- 4. a second confirmed rejection parks ----------------------------------
 
 
-def test_second_confirmed_rejection_rotates_exactly_once(tmp_path):
+def test_second_confirmed_rejection_parks_and_sends_nothing_more(tmp_path):
+    """The bound on the resend. Two disproven sends of one request, in one
+    chat, is where the loop stops: it does not send a third time, and (since
+    brw-15) it does not move the request to a fresh chat either."""
     client = RotatingFakeClient(
         submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
         responses=[stop_block()],
@@ -481,81 +429,33 @@ def test_second_confirmed_rejection_rotates_exactly_once(tmp_path):
     state.pending_request = pending()
     orch, store, config = build(tmp_path, client, state=state)
 
-    # reject -> reconcile+resend -> reject -> reconcile+rotate. Deliberately
-    # stopped at the rotation: a fifth step would consume the reply and clear
-    # the pending request this test is asserting about.
-    orch.run(max_steps=4)
-
-    assert orch.state.rotations == 1
-    assert orch.state.conversation_url == NEW_CONV_URL
-    assert orch.state.conversation_epoch == 1
-    assert orch.state.pending_request.conversation_url == NEW_CONV_URL
-    assert orch.state.phase == Phase.AWAITING.value
-    # Rotation opened the project page, sent there, then bound the minted URL.
-    assert PROJECT_URL in client.retargets
-    assert client.retargets[-1] == NEW_CONV_URL
-    rotated = transcript_entries(config, "conversation_rotated")
-    assert len(rotated) == 1
-    assert rotated[0]["data"]["old_url"] == CONV_URL
-    assert rotated[0]["data"]["new_url"] == NEW_CONV_URL
-    assert rotated[0]["data"]["reason"] == "send_rejected_twice"
-
-
-def test_rotation_binds_only_after_reconciling_against_the_new_url(tmp_path):
-    """The address bar is not evidence: a new chat that does not hold the
-    request after reconciliation is refused, and nothing is rebound."""
-
-    class NoPersistOnRotate(RotatingFakeClient):
-        def submit(self, request_id, prompt):
-            result = super().submit(request_id, prompt)
-            if self.conversation_url == PROJECT_URL:
-                # URL minted, request NOT actually stored: the exact shape a
-                # trusted-URL implementation would accept and this one must not.
-                self.persisted.get(self._new_url, set()).discard(request_id)
-            return result
-
-    client = NoPersistOnRotate(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-    )
-    state = LoopState.new(CONV_URL)
-    state.phase = Phase.SUBMITTING.value
-    state.pending_request = pending()
-    orch, store, config = build(tmp_path, client, state=state)
-
+    # reject -> reconcile+resend -> reject -> reconcile+park.
     orch.run(max_steps=5)
 
     assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert park_code(config) == "send_rejected_twice"
+    # Exactly the two sends the resend rule allows, both into the ORIGINAL chat.
+    assert [url for url, _, _ in client.submitted] == [CONV_URL, CONV_URL]
+    # Nothing was rebound and no budget was spent on a recovery that no longer
+    # exists.
     assert orch.state.conversation_url == CONV_URL
-    declined = transcript_entries(config, "rotation_declined")
-    assert declined and declined[-1]["data"]["reason_code"] == "rotation_failed"
-    # The request is still the OLD conversation's, unchanged. In particular its
-    # prompt must not have been rewritten: a `--resubmit` into the original chat
-    # would otherwise send it a note saying that conversation is abandoned.
-    req = orch.state.pending_request
-    assert req.conversation_url == CONV_URL
-    assert req.conversation_epoch == 0
-    assert CONTINUATION_NOTE not in req.prompt
-    import hashlib
-
-    assert req.prompt_sha256 == hashlib.sha256(req.prompt.encode("utf-8")).hexdigest()
+    assert orch.state.conversation_epoch == 0
+    assert orch.state.pending_request.conversation_url == CONV_URL
+    assert orch.state.rotations == 0
+    assert client.retargets == [] or PROJECT_URL not in client.retargets
+    assert transcript_entries(config, "conversation_rotated") == []
 
 
-def test_a_failed_rotation_still_spends_the_budget(tmp_path):
-    """A rotation SENDS. If it fails after that send, autoloop must not be able
-    to open a second chat and post again — so the attempt is charged even when
-    it does not complete."""
-
-    class RotateSendExplodes(RotatingFakeClient):
-        def submit(self, request_id, prompt):
-            if self.conversation_url == PROJECT_URL:
-                from autoloop.errors import BrowserError
-
-                raise BrowserError("died right after posting")
-            return super().submit(request_id, prompt)
-
-    client = RotateSendExplodes(
+def test_the_park_after_two_rejections_leaves_the_request_byte_identical(tmp_path):
+    """A `--resubmit` after this park must send the SAME bytes into the SAME
+    chat. Rotation used to rewrite `prompt` (appending a note saying the
+    conversation was abandoned) and re-stamp `prompt_sha256`; with it gone,
+    nothing on the request may move on the way to the park."""
+    client = RotatingFakeClient(
         submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED],
     )
+    original = pending()
     state = LoopState.new(CONV_URL)
     state.phase = Phase.SUBMITTING.value
     state.pending_request = pending()
@@ -563,13 +463,14 @@ def test_a_failed_rotation_still_spends_the_budget(tmp_path):
 
     orch.run(max_steps=5)
 
+    req = orch.state.pending_request
     assert orch.state.phase == Phase.NEEDS_USER.value
-    assert orch.state.rotations == 1  # spent, not refunded
-    assert orch.state.conversation_url == CONV_URL  # nothing was bound
-    assert CONTINUATION_NOTE not in orch.state.pending_request.prompt
-    # Reloading and retrying cannot open a second chat: the budget is gone.
+    assert req.prompt == original.prompt
+    assert req.prompt_sha256 == original.prompt_sha256
+    # And the durable copy says the same thing, so a restart resumes on it.
     reloaded = StateStore(config.state_file).load()
-    assert reloaded.rotations == 1
+    assert reloaded.pending_request.prompt == original.prompt
+    assert reloaded.rotations == 0
 
 
 # ---- 5. unknown acceptance parks and never resends --------------------------
@@ -595,7 +496,13 @@ def test_unknown_acceptance_parks_and_never_resends(tmp_path):
     assert transcript_entries(config, "conversation_rotated") == []
 
 
-# ---- 6/7. failures that must never rotate ----------------------------------
+# ---- 6/7. failures that take the ordinary failure budget --------------------
+#
+# Each of these was written when a wedged conversation could rotate, to pin that
+# THIS fault is not that one. They are kept: the assertions (the failure budget
+# moves, the loop stays retryable, nothing is rebound) are the live behaviour,
+# and `rotations == 0` is now a statement about the whole module rather than
+# about the branch each test takes.
 
 
 def test_response_timeout_after_generation_started_never_rotates(tmp_path):
@@ -616,8 +523,8 @@ def test_response_timeout_after_generation_started_never_rotates(tmp_path):
 
 
 def test_login_expiry_never_rotates(tmp_path):
-    """A logged-out profile is an account problem; a new chat cannot fix it,
-    and rotating would spend the run's single rotation on it."""
+    """A logged-out profile is an account problem, and it must park as
+    `login_expired` rather than as anything about the conversation."""
     client = RotatingFakeClient(attach_errors=[LoginExpiredError("logged out")])
     state = LoopState.new(CONV_URL)
     state.phase = Phase.SUBMITTING.value
@@ -633,7 +540,8 @@ def test_login_expiry_never_rotates(tmp_path):
 
 def test_generic_browser_failure_never_rotates(tmp_path):
     """Rate limits, capacity refusals and transport faults surface as ordinary
-    BrowserErrors; only ConversationUnusableError authorizes a rotation."""
+    BrowserErrors, and take the ordinary failure budget; only
+    ConversationUnusableError is routed away from it."""
     from autoloop.errors import BrowserError
 
     client = RotatingFakeClient(attach_errors=[BrowserError("too many requests")])
@@ -649,10 +557,13 @@ def test_generic_browser_failure_never_rotates(tmp_path):
     assert transcript_entries(config, "conversation_rotated") == []
 
 
-# ---- 8. an unusable conversation rotates ------------------------------------
+# ---- 8. an unusable conversation parks --------------------------------------
 
 
-def test_unusable_conversation_rotates(tmp_path):
+def test_unusable_conversation_parks_without_sending_anything(tmp_path):
+    """The fault that used to rotate. The chat loaded and is broken; the loop
+    stops, names it, and sends nothing — a replacement chat is an operator
+    action now."""
     client = RotatingFakeClient(
         attach_errors=[ConversationUnusableError("wedged")],
         responses=[stop_block()],
@@ -664,16 +575,48 @@ def test_unusable_conversation_rotates(tmp_path):
 
     orch.run(max_steps=2)
 
-    assert orch.state.rotations == 1
-    assert orch.state.conversation_url == NEW_CONV_URL
-    rotated = transcript_entries(config, "conversation_rotated")
-    assert rotated and rotated[0]["data"]["reason"] == "conversation_unusable"
-    # The fault is charged to the rotation budget, not also to the failure
-    # budget — one fault, one accounting.
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert park_code(config) == "conversation_unusable"
+    assert client.submitted == [], "a wedged chat must not be answered with a send"
+    assert orch.state.conversation_url == CONV_URL
+    assert orch.state.rotations == 0
+    # The fault is NOT also charged to the browser failure budget — one fault,
+    # one accounting. That rule outlives the rotation it was written for.
     assert orch.state.consecutive_failures == 0
+    unusable = transcript_entries(config, "conversation_unusable")
+    assert unusable and unusable[0]["data"]["reason_code"] == "conversation_unusable"
 
 
-def test_rotation_without_project_url_parks(tmp_path):
+def test_the_wedged_chat_park_carries_the_errors_own_code(tmp_path):
+    """`ConversationUnusableError.code` distinguishes a chat that would not
+    load from a submission that provably never appeared. The blocker CODE stays
+    the fixed `conversation_unusable` (a varying code set is one nothing can
+    map preconditions onto); the error's own code rides in the transcript and
+    the question."""
+    client = RotatingFakeClient(
+        attach_errors=[
+            ConversationUnusableError("never appeared", code="submission_never_appeared")
+        ],
+    )
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.SUBMITTING.value
+    state.pending_request = pending()
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=2)
+
+    assert park_code(config) == "conversation_unusable"
+    unusable = transcript_entries(config, "conversation_unusable")
+    assert unusable and unusable[0]["data"]["reason_code"] == "submission_never_appeared"
+    assert "submission_never_appeared" in (orch.state.question or "")
+    assert CONV_URL in (orch.state.question or ""), "the park must name the wedged chat"
+
+
+def test_a_wedged_conversation_parks_the_same_way_with_no_project_url(tmp_path):
+    """`browser.project_url` used to decide whether this fault could rotate or
+    had to park, and the park it produced advised setting that key. It is not
+    consulted any more: the same fault, the same park, either way."""
     client = RotatingFakeClient(attach_errors=[ConversationUnusableError("wedged")])
     state = LoopState.new(CONV_URL)
     state.phase = Phase.SUBMITTING.value
@@ -683,36 +626,12 @@ def test_rotation_without_project_url_parks(tmp_path):
     orch.run(max_steps=2)
 
     assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "conversation_unusable"
     assert orch.state.rotations == 0
-    declined = transcript_entries(config, "rotation_declined")
-    assert declined and declined[0]["data"]["reason_code"] == "rotation_unavailable"
+    assert "browser.project_url" not in (orch.state.question or "")
 
 
 # ---- 9/10. per-request conversation binding --------------------------------
-
-
-def test_delayed_response_in_the_abandoned_chat_cannot_authorize(tmp_path):
-    """After a rotation the request is bound to the new chat, so the reply that
-    gets read is the new chat's — a late answer in the abandoned one is never
-    even looked at."""
-    client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block("from the replacement chat")],
-    )
-    state = LoopState.new(CONV_URL)
-    state.phase = Phase.SUBMITTING.value
-    state.pending_request = pending()
-    orch, store, config = build(tmp_path, client, state=state)
-
-    orch.run(max_steps=6)
-
-    assert orch.state.rotations == 1
-    assert client.awaited, "the loop never awaited a response"
-    # Every await happened against the replacement conversation.
-    assert {url for url, _ in client.awaited} == {NEW_CONV_URL}
-    assert orch.state.last_response is None or (
-        orch.state.last_response.conversation_url == NEW_CONV_URL
-    )
 
 
 def test_reconciliation_uses_the_requests_own_url_not_the_loops(tmp_path):
@@ -768,13 +687,17 @@ def test_legacy_request_binds_to_the_loop_url_before_any_rotation(tmp_path):
     assert orch.state.pending_request.conversation_url == CONV_URL
 
 
-# ---- 11. the rotation cap parks --------------------------------------------
+# ---- 11. the rotation budget is inert --------------------------------------
 
 
-def test_rotation_cap_parks(tmp_path):
+def test_a_spent_rotation_budget_no_longer_changes_anything(tmp_path):
+    """A state file left by an older process can carry `rotations > 0`. That
+    used to be the difference between rotating and parking `rotation_cap_
+    reached`; with no rotation to cap, the same fault takes the same park and
+    the counter is neither read nor written."""
     client = RotatingFakeClient(attach_errors=[ConversationUnusableError("wedged again")])
     state = LoopState.new(CONV_URL)
-    state.rotations = 1  # this run has already used its rotation
+    state.rotations = 1  # an older run's spent budget
     state.phase = Phase.SUBMITTING.value
     state.pending_request = pending()
     orch, store, config = build(tmp_path, client, state=state)
@@ -782,21 +705,60 @@ def test_rotation_cap_parks(tmp_path):
     orch.run(max_steps=2)
 
     assert orch.state.phase == Phase.NEEDS_USER.value
-    assert orch.state.rotations == 1  # not incremented
-    declined = transcript_entries(config, "rotation_declined")
-    assert declined and declined[-1]["data"]["reason_code"] == "rotation_cap_reached"
-    assert "max_conversation_rotations" in orch.state.question
+    assert park_code(config) == "conversation_unusable"
+    assert orch.state.rotations == 1, "left exactly as found"
+    assert "max_conversation_rotations" not in (orch.state.question or "")
 
 
-def test_rotation_budget_is_checkable_without_an_orchestrator():
+def test_the_policy_budget_survives_for_the_state_readers_that_still_use_it():
+    """`policy.max_conversation_rotations` and `PolicyEngine.check_rotation_
+    budget` are deliberately NOT removed: `cli._reset_run_scoped_budgets` and
+    `doctor`'s conversation checks still read the counter they bound, and
+    `policy.py` is outside brw-15's scope. Nothing in `orchestrator.py` calls
+    this any more — `test_no_rotation_machinery_is_reachable_from_the_
+    orchestrator` is what pins that half."""
     engine = PolicyEngine(PolicyConfig(max_conversation_rotations=1))
     assert engine.check_rotation_budget(0).allowed
     assert not engine.check_rotation_budget(1).allowed
-    # A cap of 0 disables rotation entirely — the second way to turn it off,
-    # equivalent in effect to leaving browser.project_url unset. The check is
-    # `>=` rather than `>` precisely so 0 means "never", not "once".
     zero = PolicyEngine(PolicyConfig(max_conversation_rotations=0))
     assert zero.check_rotation_budget(0).allowed is False
+
+
+def test_no_rotation_machinery_is_reachable_from_the_orchestrator():
+    """The claim brw-15 makes, asserted rather than described.
+
+    Named methods first, because those are what the removal was about; then the
+    module source, because a re-added helper under a new name would still have
+    to build a URL, spend the budget or emit one of the retired codes to do
+    anything, and every one of those is a string this catches."""
+    import inspect
+
+    from autoloop import orchestrator as orchestrator_module
+
+    for gone in (
+        "_attempt_rotation",
+        "_attempt_silence_rotation",
+        "_rotate_conversation",
+        "_park_rotation",
+        "_url_in_project",
+        "_continuation_prompt",
+        "_heal_config_url",
+        "_reconcile_no_response",
+    ):
+        assert not hasattr(Orchestrator, gone), f"{gone} is back"
+    for gone in ("CONTINUATION_NOTE", "ROTATION_URL_TIMEOUT_SECONDS",
+                 "ROTATION_URL_POLL_SECONDS", "PLACEHOLDER_CONVERSATION_PREFIX"):
+        assert not hasattr(orchestrator_module, gone), f"{gone} is back"
+
+    source = inspect.getsource(orchestrator_module)
+    # The retired blocker codes. Quoted with their `code=`/`"..."` punctuation
+    # so the module docstring, which names them as history, does not match.
+    for retired in ("rotation_unavailable", "rotation_cap_reached",
+                    "rotation_failed", "rotation_unsupported_by_transport"):
+        assert f'"{retired}"' not in source, f"{retired} is emitted again"
+    # And the two calls any replacement would have to make.
+    assert "check_rotation_budget" not in source
+    assert "rotations +=" not in source
 
 
 # ---- 12. the config heal is atomic and refuses tracked files ----------------
@@ -871,14 +833,17 @@ def test_config_update_refuses_a_git_tracked_file(tmp_path):
     assert tracked.read_text(encoding="utf-8") == CONFIG_TEXT
 
 
-def test_rotation_heals_the_config(tmp_path):
+def test_a_wedged_conversation_never_rewrites_the_config(tmp_path):
+    """`config_writer` is still exercised above, but nothing in the loop calls
+    it any more: the rotation's config heal was its one caller. A fault that
+    used to end with the config pointing at a new chat must now leave the file
+    byte-identical — the operator owns that edit."""
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     config_path = tmp_path / "al-config.toml"
-    config_path.write_text(
-        CONFIG_TEXT.replace("https://chatgpt.com/c/old", CONV_URL), encoding="utf-8"
-    )
+    before = CONFIG_TEXT.replace("https://chatgpt.com/c/old", CONV_URL)
+    config_path.write_text(before, encoding="utf-8")
     client = RotatingFakeClient(
         attach_errors=[ConversationUnusableError("wedged")], responses=[stop_block()]
     )
@@ -887,20 +852,18 @@ def test_rotation_heals_the_config(tmp_path):
     state.pending_request = pending()
     orch, store, config = build(tmp_path, client, state=state, config_path=config_path)
 
-    import os
+    orch.run(max_steps=2)
 
-    cwd = os.getcwd()
-    os.chdir(repo)
-    try:
-        orch.run(max_steps=2)
-    finally:
-        os.chdir(cwd)
-
-    assert orch.state.rotations == 1
-    assert f'conversation_url = "{NEW_CONV_URL}"' in config_path.read_text(encoding="utf-8")
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert config_path.read_text(encoding="utf-8") == before
+    assert transcript_entries(config, "config_heal_failed") == []
 
 
 def test_drift_guard_accepts_a_recorded_rotation_and_nothing_else(tmp_path):
+    """`cli._drift_is_recorded_rotation` is deliberately left alone by brw-15.
+    Nothing writes `last_rotation` any more, but a state file written before
+    the removal still carries one, and refusing to start on it would strand a
+    session on a recovery a previous process completed."""
     from autoloop.cli import _drift_is_recorded_rotation
 
     config = AutoloopConfig(
@@ -961,29 +924,31 @@ def test_rejected_submission_logs_only_path_status_and_failure(tmp_path):
         assert forbidden not in raw
 
 
-# ---- 14. a restart preserves the binding and the rotation count -------------
+# ---- 14. a restart preserves the binding ------------------------------------
 
 
-def test_restart_preserves_request_url_and_rotation_count(tmp_path):
+def test_restart_preserves_the_requests_own_binding(tmp_path):
+    """The binding is durable, and a park does not disturb it: the request the
+    next process reads is still the ORIGINAL chat's, which is where a
+    `--resubmit` has to go."""
     client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED],
     )
     state = LoopState.new(CONV_URL)
     state.phase = Phase.SUBMITTING.value
     state.pending_request = pending()
     orch, store, config = build(tmp_path, client, state=state)
-    orch.run(max_steps=4)  # stops at the rotation, before the reply is consumed
-    assert orch.state.rotations == 1
+    orch.run(max_steps=5)
 
     reloaded = StateStore(config.state_file).load()
 
-    assert reloaded.rotations == 1
-    assert reloaded.conversation_url == NEW_CONV_URL
-    assert reloaded.conversation_epoch == 1
-    assert reloaded.pending_request.conversation_url == NEW_CONV_URL
-    assert reloaded.pending_request.conversation_epoch == 1
-    assert reloaded.last_rotation["old_url"] == CONV_URL
+    assert reloaded.phase == Phase.NEEDS_USER.value
+    assert reloaded.rotations == 0
+    assert reloaded.conversation_url == CONV_URL
+    assert reloaded.conversation_epoch == 0
+    assert reloaded.pending_request.conversation_url == CONV_URL
+    assert reloaded.pending_request.conversation_epoch == 0
+    assert reloaded.last_rotation in (None, {})
 
 
 def test_rejected_outcome_survives_a_restart(tmp_path):
@@ -1010,13 +975,16 @@ def test_rejected_outcome_survives_a_restart(tmp_path):
     assert orch2.state.phase == Phase.SUBMISSION_REJECTED.value
 
 
-# ---- 15. the replacement chat gets a contract-complete prompt ---------------
+# ---- 15. every send this loop makes goes to the request's own chat ----------
 
 
-def test_new_chat_prompt_is_the_original_plus_one_continuation_line(tmp_path):
+def test_the_only_sends_are_the_two_the_resend_rule_allows(tmp_path):
+    """The replacement for `test_new_chat_prompt_is_the_original_plus_one_
+    continuation_line`. There is no replacement chat and no continuation note:
+    the prompt that goes out the second time is the SAME prompt, into the SAME
+    conversation, and there is never a third."""
     client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED],
     )
     state = LoopState.new(CONV_URL)
     state.phase = Phase.SUBMITTING.value
@@ -1024,30 +992,25 @@ def test_new_chat_prompt_is_the_original_plus_one_continuation_line(tmp_path):
     state.pending_request = pending()
     orch, store, config = build(tmp_path, client, state=state)
 
-    orch.run(max_steps=4)  # stops at the rotation, before the reply is consumed
+    orch.run(max_steps=5)
 
-    rotated_url, rotated_rid, rotated_prompt = client.submitted[-1]
-    assert rotated_url == PROJECT_URL  # sent into the project's new chat
-    assert rotated_rid == "alr-test-0001"  # same request id, deliberately
-    assert original_prompt in rotated_prompt  # contract + CONTEXT block intact
-    assert rotated_prompt.endswith(CONTINUATION_NOTE)
-    assert rotated_prompt.count(CONTINUATION_NOTE) == 1
-    # The re-stamp keeps the integrity check honest for the bytes actually sent.
-    import hashlib
-
-    assert orch.state.pending_request.prompt_sha256 == (
-        hashlib.sha256(rotated_prompt.encode("utf-8")).hexdigest()
-    )
+    assert len(client.submitted) == 2
+    for url, rid, prompt in client.submitted:
+        assert url == CONV_URL
+        assert rid == "alr-test-0001"
+        assert prompt == original_prompt
+    assert PROJECT_URL not in [url for url, _, _ in client.submitted]
 
 
-# ---- 16. the silent-conversation rotation entry condition -------------------
+# ---- 16. the silent conversation ------------------------------------------
 #
-# A CONFIRMED, persisted send whose assistant turn never starts is a THIRD,
-# distinct rotation trigger (`docs/AUTOLOOP.md` §5c): the send is known good,
-# the model simply never begins. Unlike the other two triggers, its own
-# disproof (three `ResponseTimeoutError(stage="start")`s, an accumulated wait
-# past the configured floor, and one final reconciliation) has to be earned
-# here rather than handed over by the transport.
+# A CONFIRMED, persisted send whose assistant turn never starts: the send is
+# known good, the model simply never begins. It used to be a third rotation
+# trigger, earned by three `ResponseTimeoutError(stage="start")`s, an
+# accumulated wait past a configured floor and one final reconciliation. Since
+# brw-15 it is an ordinary transport fault that also advances two per-request
+# counters, and these tests pin exactly that: the counters move, they survive a
+# restart, and nothing else happens.
 
 
 def _start_timeout(elapsed=125.0):
@@ -1066,9 +1029,9 @@ def _start_timeout(elapsed=125.0):
     return _raise
 
 
-def test_two_start_timeouts_do_not_rotate(tmp_path):
-    """The entry condition requires a THIRD consecutive timeout; two is an
-    ordinary retry on the failure budget, exactly as before this change."""
+def test_two_start_timeouts_are_an_ordinary_retry(tmp_path):
+    """Two response-START timeouts advance the counters and leave the loop
+    retryable on the ordinary failure budget."""
     client = RotatingFakeClient(responses=[_start_timeout(), _start_timeout()])
     state = LoopState.new(CONV_URL)
     state.phase = Phase.AWAITING.value
@@ -1080,49 +1043,19 @@ def test_two_start_timeouts_do_not_rotate(tmp_path):
     assert orch.state.pending_request.start_timeouts == 2
     assert orch.state.phase == Phase.AWAITING.value  # retried, not parked
     assert orch.state.rotations == 0
-    assert client.no_response_calls == []  # never reached the final check
+    assert client.no_response_calls == []
     assert transcript_entries(config, "conversation_rotated") == []
 
 
-def test_third_start_timeout_with_confirmed_silence_rotates(tmp_path):
-    """Three consecutive response-START timeouts, an accumulated wait past
-    the floor, and a final reconciliation that still finds no assistant turn
-    — together are what authorizes the one rotation."""
+def test_a_third_start_timeout_is_still_only_the_failure_budget(tmp_path):
+    """THE removed trigger. Three consecutive response-START timeouts, an
+    accumulated wait far past the old floor, and a transport that would answer
+    the final silence check with "still silent" — the exact state that used to
+    rotate. Now: no silence check is even asked for, nothing is sent, nothing
+    is rebound, and the loop is still on the ordinary failure budget."""
     client = RotatingFakeClient(
         responses=[_start_timeout(), _start_timeout(), _start_timeout()],
         no_response_results=[True],
-    )
-    state = LoopState.new(CONV_URL)
-    state.phase = Phase.AWAITING.value
-    state.pending_request = pending(submitted=True)
-    orch, store, config = build(tmp_path, client, state=state)
-
-    orch.run(max_steps=3)  # stops at the rotation, before the reply is consumed
-
-    assert orch.state.rotations == 1
-    assert orch.state.conversation_url == NEW_CONV_URL
-    assert orch.state.conversation_epoch == 1
-    assert orch.state.pending_request.conversation_url == NEW_CONV_URL
-    assert orch.state.pending_request.start_timeouts == 0  # reset by the rotation
-    assert orch.state.phase == Phase.AWAITING.value
-    # The final check reconciled the OLD (still-current-at-the-time) chat.
-    assert client.no_response_calls == [(CONV_URL, "alr-test-0001")]
-    rotated = transcript_entries(config, "conversation_rotated")
-    assert len(rotated) == 1
-    assert rotated[0]["data"]["old_url"] == CONV_URL
-    assert rotated[0]["data"]["new_url"] == NEW_CONV_URL
-    assert rotated[0]["data"]["reason"] == "response_start_silence"
-    confirmed = transcript_entries(config, "response_silence_confirmed")
-    assert confirmed and confirmed[0]["data"]["start_timeouts"] == 3
-
-
-def test_response_appearing_during_final_reconciliation_cancels_rotation(tmp_path):
-    """A reply that shows up between the third timeout and the final
-    reconciliation means the conversation was never silent: no rotation, and
-    the stale streak must not survive to threaten a future timeout."""
-    client = RotatingFakeClient(
-        responses=[_start_timeout(), _start_timeout(), _start_timeout()],
-        no_response_results=[False],
     )
     state = LoopState.new(CONV_URL)
     state.phase = Phase.AWAITING.value
@@ -1132,50 +1065,29 @@ def test_response_appearing_during_final_reconciliation_cancels_rotation(tmp_pat
     orch.run(max_steps=3)
 
     assert orch.state.rotations == 0
-    assert orch.state.conversation_url == CONV_URL  # never rotated
-    assert orch.state.phase == Phase.AWAITING.value  # still retryable
-    assert orch.state.pending_request.start_timeouts == 0  # streak reset
-    assert orch.state.pending_request.start_timeout_wait_seconds == 0.0
-    cancelled = transcript_entries(config, "response_silence_check_cancelled")
-    assert cancelled and cancelled[0]["data"]["start_timeouts"] == 3
+    assert orch.state.conversation_url == CONV_URL
+    assert orch.state.conversation_epoch == 0
+    assert orch.state.pending_request.conversation_url == CONV_URL
+    assert orch.state.pending_request.start_timeouts == 3, "counted, not acted on"
+    assert client.no_response_calls == [], "the silence check is gone, not merely unused"
+    assert client.submitted == [], "the trigger's whole point was a send; there is none"
     assert transcript_entries(config, "conversation_rotated") == []
+    assert transcript_entries(config, "response_silence_confirmed") == []
+    # The failure budget is what governs it, and three faults is what it saw.
+    assert orch.state.consecutive_failures == 3
 
 
-def test_no_duplicate_send_during_timeout_retries(tmp_path):
-    """`awaiting` never resends on its own account; the only send across the
-    whole sequence is the ONE the eventual rotation makes into the
-    replacement chat."""
-    client = RotatingFakeClient(
-        responses=[_start_timeout(), _start_timeout(), _start_timeout()],
-        no_response_results=[True],
-    )
-    state = LoopState.new(CONV_URL)
-    state.phase = Phase.AWAITING.value
-    state.pending_request = pending(submitted=True)
-    orch, store, config = build(tmp_path, client, state=state)
-
-    orch.run(max_steps=2)
-    assert client.submitted == []  # nothing sent across the first two timeouts
-
-    orch.run(max_steps=1)  # the third timeout, confirmed silence, rotation
-    assert len(client.submitted) == 1
-    assert client.submitted[0][0] == PROJECT_URL  # the one send: into the replacement
-    assert client.submitted[0][1] == "alr-test-0001"
-
-
-def test_delayed_reply_in_the_retired_conversation_is_ignored(tmp_path):
-    """After the silence rotation the request is bound to the replacement
-    chat; every read from that point on follows the request's OWN
-    conversation, so a reply that later shows up in the retired one is never
-    even looked at."""
+def test_a_reply_that_arrives_after_the_timeouts_is_still_read(tmp_path):
+    """The counters must not become a trap of their own: a conversation that
+    was merely slow answers on the next step, from its OWN chat, and the loop
+    proceeds."""
     client = RotatingFakeClient(
         responses=[
             _start_timeout(),
             _start_timeout(),
             _start_timeout(),
-            stop_block("from the replacement chat"),
+            stop_block("late, but here"),
         ],
-        no_response_results=[True],
     )
     state = LoopState.new(CONV_URL)
     state.phase = Phase.AWAITING.value
@@ -1184,89 +1096,35 @@ def test_delayed_reply_in_the_retired_conversation_is_ignored(tmp_path):
 
     orch.run(max_steps=4)
 
-    assert orch.state.rotations == 1
-    assert client.awaited, "the loop never awaited a response"
-    # The three pre-rotation timeouts were read from the original chat; the
-    # reply that actually got consumed came from the replacement.
-    assert client.awaited[:3] == [(CONV_URL, "alr-test-0001")] * 3
-    assert client.awaited[-1] == (NEW_CONV_URL, "alr-test-0001")
+    assert client.awaited == [(CONV_URL, "alr-test-0001")] * 4
     assert orch.state.last_response is not None
-    assert orch.state.last_response.conversation_url == NEW_CONV_URL
+    assert orch.state.last_response.conversation_url == CONV_URL
+    assert client.submitted == []
 
 
-def test_replacement_chat_reuses_the_same_request_id(tmp_path):
+def test_no_send_at_all_during_timeout_retries(tmp_path):
+    """`awaiting` never resends on its own account. The one send this sequence
+    used to make — the rotation's, into a replacement chat — is gone, so the
+    answer is now simply zero."""
     client = RotatingFakeClient(
         responses=[_start_timeout(), _start_timeout(), _start_timeout()],
         no_response_results=[True],
     )
     state = LoopState.new(CONV_URL)
     state.phase = Phase.AWAITING.value
-    original = pending(submitted=True)
-    state.pending_request = original
+    state.pending_request = pending(submitted=True)
     orch, store, config = build(tmp_path, client, state=state)
 
     orch.run(max_steps=3)
 
-    assert len(client.submitted) == 1
-    rotated_url, rotated_rid, rotated_prompt = client.submitted[0]
-    assert rotated_url == PROJECT_URL  # sent into the project's new chat
-    assert rotated_rid == original.request_id == "alr-test-0001"
-    assert orch.state.pending_request.request_id == original.request_id
-    assert CONTINUATION_NOTE in rotated_prompt
+    assert client.submitted == []
+    assert client.retargets == [] or PROJECT_URL not in client.retargets
 
 
-def test_second_silence_rotation_is_refused_and_parks(tmp_path):
-    """The FULL sequence, not a pre-seeded budget: three timeouts rotate once
-    (this is what resets `consecutive_failures` alongside `start_timeouts` —
-    without that reset, a first timeout in the replacement chat would exceed
-    the ordinary failure budget and reach `failed` before the rotation cap
-    is ever consulted, making this scenario unreachable). Three MORE timeouts
-    in the replacement chat, confirmed silent again, attempt a second
-    rotation — refused by `policy.max_conversation_rotations` (default 1),
-    parking `loop_fatal` exactly like the other two triggers' cap refusals.
-    """
-    client = RotatingFakeClient(
-        responses=[
-            _start_timeout(),
-            _start_timeout(),
-            _start_timeout(),
-            _start_timeout(),
-            _start_timeout(),
-            _start_timeout(),
-        ],
-        no_response_results=[True, True],
-    )
-    state = LoopState.new(CONV_URL)
-    state.phase = Phase.AWAITING.value
-    state.pending_request = pending(submitted=True)
-    orch, store, config = build(tmp_path, client, state=state)
-
-    orch.run(max_steps=6)
-
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert orch.state.park_kind == "loop_fatal"
-    assert orch.state.rotations == 1  # the first rotation, not a second
-    declined = transcript_entries(config, "rotation_declined")
-    assert declined and declined[-1]["data"]["reason_code"] == "rotation_cap_reached"
-    # Exactly one rotation happened — the first sequence's, into the chat
-    # that then ALSO went silent.
-    rotated = transcript_entries(config, "conversation_rotated")
-    assert len(rotated) == 1
-    assert rotated[0]["data"]["new_url"] == NEW_CONV_URL
-    # The final silence check ran BOTH times (evidence gathering happens
-    # unconditionally): once against the original chat, once against the
-    # replacement — it is only the second ROTATION that the budget refuses.
-    assert client.no_response_calls == [
-        (CONV_URL, "alr-test-0001"),
-        (NEW_CONV_URL, "alr-test-0001"),
-    ]
-
-
-def test_restart_preserves_timeout_count_and_completes_the_rotation(tmp_path):
-    """A crash after two response-start timeouts loses nothing: a fresh
-    process resumes the count (and the still-retired epoch/binding) from
-    disk, and the third timeout — now against a fresh client — still
-    completes the same rotation a live run would have."""
+def test_restart_preserves_the_timeout_count(tmp_path):
+    """A crash after two response-start timeouts loses neither counter: a
+    fresh process resumes both from disk, and the third timeout — now against
+    a fresh client — keeps counting rather than starting over."""
     client = RotatingFakeClient(responses=[_start_timeout(), _start_timeout()])
     state = LoopState.new(CONV_URL)
     state.phase = Phase.AWAITING.value
@@ -1280,43 +1138,24 @@ def test_restart_preserves_timeout_count_and_completes_the_rotation(tmp_path):
     assert reloaded.pending_request.start_timeout_wait_seconds == pytest.approx(250.0)
     assert reloaded.phase == Phase.AWAITING.value
     assert reloaded.rotations == 0
-    assert reloaded.conversation_epoch == 0  # nothing retired yet
+    assert reloaded.conversation_epoch == 0
     assert reloaded.pending_request.conversation_url == CONV_URL
-    # Captured now, not read again after `orch2.run()` below: `build()` binds
-    # the orchestrator directly to the `reloaded` object (by reference, not a
-    # copy), so a second run mutates it in place — the SAME trap
-    # `test_rejected_outcome_survives_a_restart` avoids by never re-reading
-    # `reloaded` after constructing `orch2`.
-    epoch_before_restart = reloaded.conversation_epoch
 
-    # Fresh process, fresh client: the count picks up where it left off.
-    resumed_client = RotatingFakeClient(
-        responses=[_start_timeout()], no_response_results=[True]
-    )
+    resumed_client = RotatingFakeClient(responses=[_start_timeout()])
     second = tmp_path / "second"
     second.mkdir()
     orch2, _, config2 = build(second, resumed_client, state=reloaded)
     orch2.run(max_steps=1)
 
-    assert orch2.state.rotations == 1
-    assert orch2.state.conversation_url == NEW_CONV_URL
-    assert orch2.state.conversation_epoch == 1
-    assert orch2.state.pending_request.conversation_url == NEW_CONV_URL
-    assert orch2.state.pending_request.start_timeouts == 0  # reset by the rotation
+    assert orch2.state.pending_request.start_timeouts == 3
+    assert orch2.state.rotations == 0
+    assert orch2.state.conversation_url == CONV_URL
+    assert orch2.state.conversation_epoch == 0
 
     reloaded2 = StateStore(config2.state_file).load()
-    assert reloaded2.rotations == 1
-    assert reloaded2.conversation_epoch == 1
-    assert reloaded2.pending_request.conversation_url == NEW_CONV_URL
-    assert reloaded2.last_rotation["old_url"] == CONV_URL
-    assert reloaded2.last_rotation["reason"] == "response_start_silence"
-    # `RotationRecord` carries no separate `old_epoch` field — the retired
-    # epoch is recorded only implicitly, as `epoch - 1`. That is exactly
-    # `epoch_before_restart` captured above, from BEFORE the restart: epoch 0
-    # is what got retired, epoch 1 (asserted here) is what replaced it, and
-    # the restart lost neither number.
-    assert reloaded2.last_rotation["epoch"] == 1
-    assert reloaded2.last_rotation["epoch"] - 1 == epoch_before_restart
+    assert reloaded2.pending_request.start_timeouts == 3
+    assert reloaded2.pending_request.conversation_url == CONV_URL
+    assert reloaded2.last_rotation in (None, {})
 
 
 # ---- classification unit tests ---------------------------------------------
@@ -1355,268 +1194,65 @@ def _raiser(exc):
     return _raise
 
 
-def test_rotation_waits_for_the_chat_id_instead_of_reading_the_project_page(tmp_path):
-    """ChatGPT assigns a `/c/<id>` only once the first turn is processed.
+# ---- three incidents that no longer have code to happen in ------------------
+#
+# Removed with the rotation machinery (brw-15), and listed rather than silently
+# dropped, because each was a real production failure and the next person to
+# consider re-adding a "just open a fresh chat" recovery should know what it
+# costs to get right:
+#
+#   * 2026-08-03, twice — a replacement chat that existed and held the request
+#     was refused because its address had not been minted yet, or because the
+#     project-membership compare mishandled ChatGPT's slug suffix. Three
+#     rotations failed leaving orphaned chats nobody read
+#     (`test_rotation_waits_for_the_chat_id_instead_of_reading_the_project_page`,
+#     `test_a_rotation_is_found_by_request_id_when_the_address_bar_lags`,
+#     `test_a_rotation_still_refuses_when_no_chat_carries_the_request`).
+#   * 2026-08-16 — a chat opened from a project page carries a placeholder
+#     `/c/WEB:<uuid>` address, under no project, until its first message lands.
+#     Judging membership on it parked the loop LOOP-FATAL on a rotation that had
+#     worked (`test_a_placeholder_address_is_primed_and_then_accepted` and the
+#     three tests beside it).
+#
+# `RotatingFakeClient.placeholder_until` / `strand_the_address_bar` /
+# `find_finds_nothing` are what those tests drove; they are left on the fake
+# because it models a browser, not because anything still uses them.
 
-    Reading `current_url()` once, right after the submit, returned the PROJECT
-    PAGE, and the containment check refused it while printing a mismatch
-    between two identical-looking strings:
 
-        the replacement chat is not inside the configured project
-        ('.../g-p-.../project' vs '.../g-p-.../project')
-
-    That spent the single rotation budget and parked the loop on a conversation
-    it had correctly identified as wedged. This fake withholds the id on the
-    first read after submitting, exactly as the browser did.
-    """
+def test_the_loop_never_navigates_away_from_the_requests_own_chat(tmp_path):
+    """The property all three 2026-08-03 incidents were downstream of: the loop
+    used to drive the browser to a PROJECT PAGE and reason about where it ended
+    up. Nothing does that now — every `retarget` this loop issues aims at the
+    conversation the request is already bound to, so an address bar that lags,
+    strands or shows a placeholder cannot mislead anything."""
     client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
-    )
-    real_current_url = client.current_url
-    seen = {"n": 0}
-
-    def delayed_current_url():
-        seen["n"] += 1
-        if seen["n"] == 1:
-            return PROJECT_URL          # id not minted yet
-        return real_current_url()
-
-    client.current_url = delayed_current_url
-
-    state = LoopState.new(CONV_URL)
-    state.phase = Phase.SUBMITTING.value
-    state.pending_request = pending()
-    orch, store, config = build(tmp_path, client, state=state)
-
-    orch.run(max_steps=4)
-
-    assert orch.state.rotations == 1, "a delayed id must not burn the rotation"
-    assert orch.state.conversation_url == NEW_CONV_URL, "must bind the CHAT, not the project page"
-    assert transcript_entries(config, "conversation_rotated"), "rotation must be recorded"
-    assert seen["n"] > 1, "the first read returned the project page — it must poll again"
-
-
-# ---- a rotation is identified by CONTENT when the URL lags (2026-08-03) ------
-
-
-def test_a_rotation_is_found_by_request_id_when_the_address_bar_lags(tmp_path):
-    """The failure that stopped the loop three times. ChatGPT mints `/c/<id>`
-    some time after accepting the first message; on a slow account that is
-    longer than any polling window worth having. The rotation gave up and
-    reported "the chat id was never assigned" — about a chat that existed, held
-    the request, and sat in the project list. The request id is IN the message,
-    so it identifies the chat without the URL."""
-    client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED],
     )
     client.strand_the_address_bar(PROJECT_URL)
-    client.seed(NEW_CONV_URL, "alr-x-0001")  # the chat exists and holds it
-
     state = LoopState.new(CONV_URL)
     state.phase = Phase.SUBMITTING.value
     state.pending_request = pending("alr-x-0001")
     orch, store, config = build(tmp_path, client, state=state)
 
-    orch.run(max_steps=4)
-
-    assert client.find_calls, "must ask the CONTENT once the URL will not move"
-    assert orch.state.conversation_url == NEW_CONV_URL, "must bind the chat it created"
-    assert orch.state.phase != Phase.NEEDS_USER.value, "a lagging URL must not park it"
-
-
-def test_a_rotation_still_refuses_when_no_chat_carries_the_request(tmp_path):
-    """The guard must survive. If the content search finds nothing either, the
-    send did not land anywhere and adopting some other chat is the wrong
-    repair — the same reasoning that makes an unbound request refuse to guess."""
-    client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
-    )
-    client.strand_the_address_bar(PROJECT_URL)
-    # The search itself comes up empty — the send landed nowhere. Forced
-    # explicitly, because this fake persists a CONFIRMED submit into the chat
-    # it rotated to, so "seed nothing" does NOT model an empty project (the
-    # first draft of this test assumed it did, and passed for the wrong
-    # reason: the rotation legitimately SUCCEEDED).
-    client.find_finds_nothing = True
-
-    state = LoopState.new(CONV_URL)
-    state.phase = Phase.SUBMITTING.value
-    state.pending_request = pending("alr-x-0002")
-    orch, store, config = build(tmp_path, client, state=state)
-
-    orch.run(max_steps=4)
-
-    assert client.find_calls, "it must have looked"
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert "no chat in the project carries this request" in (orch.state.question or "")
-
-
-# ---- rotation PRIMES the replacement before judging it (2026-08-16) ---------
-#
-# The failure this block exists for: a chat opened from a project page has no
-# durable URL until its first message lands, and the address until then is
-# `https://chatgpt.com/c/WEB:<uuid>` — under no project at all. The old wait
-# stopped as soon as the address DIFFERED from the project page, so it handed
-# the placeholder to the membership check, which refused it every time and
-# parked the loop LOOP-FATAL on a rotation that had actually worked. The rule
-# was right; the moment it was applied was wrong.
-#
-# What must stay true after the fix: a replacement genuinely outside the project
-# is still refused, the wait is bounded, exactly one message is ever sent, and
-# the rotated URL is what a restart resumes on.
-
-
-def fast_rotation_wait(monkeypatch, timeout=2.0, poll=0.01):
-    """Shrink the bounded wait. Both constants are read as module globals at
-    call time, so patching them here is what stops the placeholder tests from
-    sitting out a real 30-second window.
-
-    The default timeout is generous relative to the handful of poll intervals a
-    resolving test needs: a deadline that can expire under load would silently
-    turn "the address resolved" into "the content search rescued it", which is
-    the distinction those tests exist to make. Tests that WANT the expiry pass a
-    short one explicitly."""
-    from autoloop import orchestrator as orchestrator_module
-
-    monkeypatch.setattr(orchestrator_module, "ROTATION_URL_TIMEOUT_SECONDS", timeout)
-    monkeypatch.setattr(orchestrator_module, "ROTATION_URL_POLL_SECONDS", poll)
-
-
-def rotating_state(request_id="alr-test-0001"):
-    state = LoopState.new(CONV_URL)
-    state.phase = Phase.SUBMITTING.value
-    state.pending_request = pending(request_id)
-    return state
-
-
-def test_a_placeholder_address_is_primed_and_then_accepted(tmp_path, monkeypatch):
-    """The incident, in one test. The replacement's address is the placeholder
-    for the first reads and a real project conversation afterwards — exactly
-    what an operator reproduced by hand. The rotation must wait through the
-    placeholder and accept the address it becomes, not refuse the address it
-    starts as."""
-    fast_rotation_wait(monkeypatch)
-    client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
-    )
-    client.placeholder_until(3)
-    orch, store, config = build(tmp_path, client, state=rotating_state())
-
-    orch.run(max_steps=4)
-
-    assert orch.state.phase != Phase.NEEDS_USER.value, "a placeholder must not park the loop"
-    assert orch.state.rotations == 1
-    assert orch.state.conversation_url == NEW_CONV_URL
-    assert transcript_entries(config, "conversation_rotated"), "rotation must be recorded"
-    # The proof that it PRIMED rather than being rescued: the by-content search
-    # never had to run. Without this the test also passes on the old code, which
-    # refused the placeholder and then recovered via `find_conversation_with`.
-    assert client.find_calls == [], "the address resolved; nothing should need finding"
-
-
-def test_a_replacement_outside_the_project_is_still_refused(tmp_path, monkeypatch):
-    """The membership rule is not relaxed by the priming fix. A chat that opens
-    outside the configured project — and stays there, so the wait cannot be what
-    is missing — is refused, and the park names the address actually observed so
-    the operator can see where it went.
-
-    `find_finds_nothing` because the search reads the PROJECT'S list: a chat
-    outside the project is genuinely not in it, and the fake's search would
-    otherwise return it (it returns any persisted chat). Refusing here is the
-    address-bar check doing its job on `new_url`, which is where the incident
-    happened and where the rule belongs."""
-    fast_rotation_wait(monkeypatch, timeout=0.2)  # this one WANTS the expiry
-    client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
-        new_url=OUTSIDE_PROJECT_URL,
-    )
-    client.find_finds_nothing = True
-    orch, store, config = build(tmp_path, client, state=rotating_state("alr-x-0003"))
-
-    orch.run(max_steps=4)
+    orch.run(max_steps=5)
 
     assert orch.state.phase == Phase.NEEDS_USER.value
-    question = orch.state.question or ""
-    assert "not inside the configured project" in question
-    assert OUTSIDE_PROJECT_URL in question, "the park must name the address observed"
-    # Nothing was bound to it: the request still belongs to the old chat.
+    assert park_code(config) == "send_rejected_twice"
+    assert all(url == CONV_URL for url in client.retargets)
     assert orch.state.conversation_url == CONV_URL
-    assert orch.state.pending_request.conversation_url == CONV_URL
-    declined = transcript_entries(config, "rotation_declined")
-    assert declined and declined[-1]["data"]["reason_code"] == "rotation_failed"
 
 
-def test_an_address_that_never_leaves_the_placeholder_parks_bounded(tmp_path, monkeypatch):
-    """The wait is bounded, so a chat that never gets a durable address parks
-    instead of hanging — and the park says PLACEHOLDER, with the address it saw,
-    rather than a generic timeout that sends the next operator hunting a browser
-    fault. This test completing at all is the "does not hang" assertion."""
-    fast_rotation_wait(monkeypatch, timeout=0.2)
-    client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
-    )
-    client.placeholder_until(None)  # never resolves
-    client.find_finds_nothing = True  # and no chat in the project carries it
-    orch, store, config = build(tmp_path, client, state=rotating_state("alr-x-0004"))
-
-    orch.run(max_steps=4)
-
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    question = orch.state.question or ""
-    assert PLACEHOLDER_URL in question, "the observed address, not a generic timeout"
-    assert "placeholder" in question
-    # Exactly one message ever left for the project page. A retried send there
-    # does not retry anything — it opens a SECOND chat and orphans the first,
-    # with the same request live in both. (`client.submitted` also holds the two
-    # pre-rotation sends into the original conversation.)
-    assert len([s for s in client.submitted if s[0] == PROJECT_URL]) == 1
-    # And the park tells the operator the loop is still pinned to the retired
-    # conversation, which is the trap this incident left behind by hand.
-    assert CONV_URL in question
-
-
-def test_the_primed_rotation_url_survives_a_restart(tmp_path, monkeypatch):
-    """A restart must resume in the replacement, not the retired thread. The
-    state file is what the next process reads, so the rotation is only finished
-    once the new URL is in it — and the resumed run must await THERE."""
-    fast_rotation_wait(monkeypatch)
-    client = RotatingFakeClient(
-        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
-        responses=[stop_block()],
-    )
-    client.placeholder_until(2)
-    orch, store, config = build(tmp_path, client, state=rotating_state())
-
-    orch.run(max_steps=4)  # stops at the rotation, before the reply is consumed
-
-    reloaded = StateStore(config.state_file).load()
-    assert reloaded.conversation_url == NEW_CONV_URL
-    assert reloaded.rotations == 1
-    assert reloaded.pending_request.conversation_url == NEW_CONV_URL
-    assert reloaded.pending_request.conversation_epoch == 1
-    assert reloaded.last_rotation["old_url"] == CONV_URL
-    assert reloaded.last_rotation["new_url"] == NEW_CONV_URL
-
-    # A fresh process over that state reads the replacement chat. The config it
-    # is built from still names the retired conversation (the heal is
-    # best-effort), so this is the case that would otherwise resume on the dead
-    # thread with a submitted request against it.
-    resumed = RotatingFakeClient(conversation_url=CONV_URL, responses=[stop_block()])
-    resumed.seed(NEW_CONV_URL, "alr-test-0001")
-    second = tmp_path / "second"
-    second.mkdir()
-    orch2, _, _ = build(second, resumed, state=reloaded)
-
-    orch2.run(max_steps=1)
-
-    assert resumed.awaited, "the resumed run never awaited a response"
-    assert {url for url, _ in resumed.awaited} == {NEW_CONV_URL}
+# ---- what the removed priming block was about (2026-08-16) ------------------
+#
+# A chat opened from a project page has no durable URL until its first message
+# lands; the address until then is `https://chatgpt.com/c/WEB:<uuid>`, under no
+# project at all. The wait that used to stop at the first change handed that
+# placeholder to the project-membership check, which refused it every time and
+# parked the loop LOOP-FATAL on a rotation that had actually worked. Four tests
+# pinned the repair (prime, then judge; still refuse a chat genuinely outside
+# the project; bound the wait; make the new URL durable before anything else).
+# All four went with the machinery. `PLACEHOLDER_URL` and `OUTSIDE_PROJECT_URL`
+# are kept above as the documented shapes, since nothing else records them.
 
 
 # ---- a FALSE ambiguity is resolved by PROVING the request is there ----------
@@ -1848,21 +1484,20 @@ def test_a_dead_browser_during_the_search_is_not_demoted_to_ambiguity(tmp_path, 
     assert orch.state.phase == Phase.SUBMISSION_UNCONFIRMED.value
 
 
-def test_a_wedged_page_during_the_search_never_licenses_a_rotation(tmp_path):
+def test_a_wedged_page_during_the_search_never_condemns_this_conversation(tmp_path):
     """The one browser fault that is caught here, and why it is the exception
     that proves the rule.
 
     `ConversationUnusableError` is not collapsed because its route says too
-    little — it is collapsed because its route ACTS. `run()` sends it to
-    `_handle_conversation_unusable` -> `_attempt_rotation` -> a rotation that
-    POSTS the request id into a replacement chat. That is a send, from the one
-    phase whose entire contract is that only `--resubmit` repeats one.
-
-    And the page that raised it is usually not even this request's conversation:
-    the search walks the project page and up to `limit` OTHER chats, so
-    propagating it would let a stranger's wedged chat license a repost of a
-    request the backend may already hold — exactly the duplicate
-    `submission_ambiguous` exists to prevent. It parks safely instead.
+    little — it is collapsed because its route CONDEMNS THE WRONG CHAT. The
+    search walks the project page and up to `limit` OTHER chats, so the page
+    that raised it is usually not this request's conversation at all; letting it
+    through would park `conversation_unusable` naming the chat this request IS
+    bound to, on evidence gathered from a different one. (Until brw-15 it was
+    worse: that route rotated, which POSTS the request id into a replacement
+    chat — a send, from the one phase whose entire contract is that only
+    `--resubmit` repeats one. That is why this test is older than the park it
+    now asserts.)
     """
     client = RotatingFakeClient(responses=[])
     client.find_error = ConversationUnusableError("this chat appears wedged")
@@ -1870,11 +1505,12 @@ def test_a_wedged_page_during_the_search_never_licenses_a_rotation(tmp_path):
 
     orch.run(max_steps=3)
 
-    assert client.submitted == [], "a wedged page must not rotate, because rotating SENDS"
+    assert client.submitted == [], "a wedged page elsewhere must not cause a send"
     assert client.retargets == [], "and must not rebind the loop to another chat"
     assert orch.state.rotations == 0
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert park_code(config) == "submission_ambiguous"
+    assert park_code(config) != "conversation_unusable"
     refused = transcript_entries(config, "presence_search_inconclusive")
     assert refused and refused[-1]["data"]["kind"] == "ConversationUnusableError"
     # A wedged page says nothing about presence, so neither may the park.
@@ -1883,12 +1519,12 @@ def test_a_wedged_page_during_the_search_never_licenses_a_rotation(tmp_path):
 
 
 def test_a_hit_in_a_different_chat_parks_and_names_it(tmp_path):
-    """Presence somewhere is not presence HERE. A rotation deliberately reuses
-    the request id in the replacement chat, so a hit outside this request's own
-    conversation can be a retired copy — rebinding to it on that evidence is a
-    rotation performed on a duplicate id. It parks, and the operator is told
-    which chat to read instead of being sent to look for a message that may not
-    exist."""
+    """Presence somewhere is not presence HERE. A loop moved to another chat —
+    by an operator, or by a rotation an older process performed — keeps the
+    request id, so a hit outside this request's own conversation can be a
+    retired copy, and rebinding to it on that evidence would be a rebinding
+    performed on a duplicate id. It parks, and the operator is told which chat
+    to read instead of being sent to look for a message that may not exist."""
     client = RotatingFakeClient(responses=[])
     client.seed(NEW_CONV_URL, RESCUED)  # some OTHER chat carries the id
     orch, store, config = build(tmp_path, client, state=ambiguous_state())

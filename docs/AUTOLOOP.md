@@ -3930,8 +3930,8 @@ answer unless it demonstrably reached the end — §5c) gets the last word:
   resumes into `awaiting` and reads the answer. Nothing is ambiguous, and
   resuming **sends nothing**, so the risk is zero.
 * **found in a different chat** → still parks, but the operator is told which
-  chat. Rotation reuses the request id in the replacement chat, so a hit
-  elsewhere can be a retired copy, and rebinding to it would be a rotation
+  chat. A loop moved to another conversation keeps the request id, so a hit
+  elsewhere can be a retired copy, and rebinding to it would be a rebinding
   performed on a duplicate id.
 * **not found, the search refused to conclude, a page it opened was wedged, or
   no project is configured** → parks exactly as before, and the park says which
@@ -3963,9 +3963,11 @@ point. Every one of those SENDS NOTHING, so nothing is risked by letting them
 through, while catching them would swap a recoverable transport fault for a park
 naming the wrong cause: a dropped CDP connection is not evidence about what is
 in the conversation. The single exception is `ConversationUnusableError`, caught
-here because its route ACTS — it authorizes the rotation that reposts the request
-id, and the search reads the project page and other chats, so a chat that is not
-even this request's must never license a repost of it.
+here because its route CONDEMNS: it parks `conversation_unusable` naming the chat
+this request is bound to, and the search reads the project page and other chats,
+so a page that is not even this request's must never be the evidence for that.
+(Before brw-15 the objection was stronger still — that route rotated, reposting
+the request id into a replacement chat.)
 
 **Navigation is explicit.** `attach()` navigates only when there is no page on
 the conversation (URL compared without query/fragment/trailing slash);
@@ -4019,7 +4021,7 @@ opening `Understood.`) can never satisfy a later request.
 
 ---
 
-## 5c. Transport recovery: disproving a send, resending once, rotating once
+## 5c. Transport recovery: disproving a send, resending once, then parking
 
 Added 2026-07-31. §5b made ambiguity safe; this section makes it **rarer**,
 without weakening the rule that ambiguity never retries.
@@ -4060,39 +4062,83 @@ the same request id so a message that did land is still detected. Sessions
 without the observation capability (every non-Playwright adapter) never produce
 `REJECTED` and behave exactly as they did before.
 
-**Rotation is the last resort, not the reflex.** A second confirmed rejection, a
-`ConversationUnusableError`, or a confirmed **silent conversation** (below) may
-abandon the chat for a fresh one in the configured project:
+**A second confirmed rejection parks (`send_rejected_twice`).** Nothing else is
+tried. The park quotes the remedy for the transport actually in use — browser
+advice for a browser run (open the chat by hand; if it is dead, repoint
+`browser.conversation_url` and `reset`), `conversation.transport_remedy` for
+everything else — and it leaves the request byte-identical, still bound to its
+own conversation, so an operator's `run --resubmit` sends the same bytes to the
+same chat.
 
-* `browser.project_url` must be set **explicitly**. It is never derived from
-  `conversation_url` — a guessed project opens chats somewhere you did not
-  choose. Unset means the loop parks instead of rotating.
-* `policy.max_conversation_rotations` (default **1**) caps it per run. A second
-  rotation in one run usually means the fault is not the chat.
-* **"Per run" means per process**, and it took a real incident to make that
-  true. `state.rotations` lives in the state file, which outlives the process,
-  so the budget was really per *session*: a dropped network on 2026-08-02 spent
-  the one rotation, and every later `run --retry` re-read the same count and
-  parked with the same reason. Neither escape the park message offered was
-  right — raise a policy cap for a rotation that was never needed, or `reset`,
-  which back then also took the task registry. `cli._reset_run_scoped_budgets`
-  now zeroes it once per process, logging `rotation_budget_reset` with the
-  forgiven count so genuine churn stays visible.
-  The reset lives in `_cmd_run`, **not** `_build_orchestrator`: `_run_continuous`
-  rebuilds the orchestrator every iteration, so resetting there would refill the
-  budget between rotations and delete the cap. Within one run the cap is exactly
-  as strict as before — a rotation still costs its budget the moment it is
-  attempted, and a failed attempt is still not refunded.
-* `ConversationUnusableError` is deliberately narrow: the page demonstrably
-  reached the conversation URL, is not an auth page, and still has no composer
-  (or shows an explicit unavailable marker). A page that never loaded, a dropped
-  CDP connection and a logged-out profile stay ordinary failures on the normal
-  budget — rotating for a network blip would spend the one rotation and leave
-  none for the real thing. The two budgets are also kept separate: a rotation
-  attempt does not also increment `consecutive_failures`.
-* Never rotates for: generation already started, a slow answer, a single or
-  merely occasional response-start timeout, login expiry, rate limits,
-  capacity, a malformed reply, or a policy denial.
+**A `ConversationUnusableError` parks (`conversation_unusable`).** The error is
+deliberately narrow: the page demonstrably reached the conversation URL, is not
+an auth page, and still has no composer (or shows an explicit unavailable
+marker), or a submission this loop made provably never appeared. A page that
+never loaded, a dropped CDP connection and a logged-out profile stay ordinary
+failures on the normal budget. **This park does not also charge
+`consecutive_failures`** — one fault, one accounting — and it never restarts
+Chrome: both shapes of the error were established THROUGH a working,
+un-throttled page, so a restart cannot help. The error's own `code` rides into
+the transcript and the blocker question; the blocker CODE is the fixed
+`conversation_unusable`.
+
+**Conversation rotation was removed on 2026-08-25 (brw-15).** Until then those
+two faults, plus a confirmed **silent conversation** (below), could abandon the
+chat for a fresh one in `browser.project_url`: open it, post the in-flight
+request with a continuation note, prove the new chat holds it, rebind
+`state.conversation_url` / `conversation_epoch`, and heal the config file.
+Bounded by `policy.max_conversation_rotations` (default 1 per run).
+
+It is gone because it could only ever work for ONE transport while being
+reachable from all of them. Rotation is a ChatGPT-project concept end to end,
+and the default `codex_cli` provider has no conversation to rotate away from;
+`_step_submission_rejected` reached it without passing any fault handler, so
+two consecutive codex failures on one request walked into browser recovery.
+11 of the loop's first 103 blocker records were `rotation_failed` — the fault
+this section's own operator runbook carried a five-step manual recovery for.
+
+What that leaves:
+
+* `_attempt_rotation`, `_attempt_silence_rotation`, `_rotate_conversation`,
+  `_park_rotation`, `_url_in_project`, `_continuation_prompt`,
+  `_heal_config_url` and `_reconcile_no_response` are gone from
+  `orchestrator.py`, with the constants `CONTINUATION_NOTE`,
+  `ROTATION_URL_TIMEOUT_SECONDS`, `ROTATION_URL_POLL_SECONDS` and
+  `PLACEHOLDER_CONVERSATION_PREFIX`.
+* Four blocker codes are retired and can no longer be emitted:
+  `rotation_unavailable`, `rotation_cap_reached`, `rotation_failed`,
+  `rotation_unsupported_by_transport`. None of them was a key in
+  `cli._RESOLUTION_PRECONDITIONS`, so `answer` is unaffected. Two new codes take
+  their place: `send_rejected_twice` and `conversation_unusable`. Open blocker
+  records carrying a retired code are still listable and answerable — nothing
+  reads the code back except that mapping.
+* `rate_limited` is NOT retired. It is emitted by `_handle_rate_limited` for an
+  account throttle, which has a meaning entirely outside the browser; only the
+  rotation-context park that reused the code is gone.
+* `browser.project_url` is still read, by `_search_for_request` (§5b's
+  by-content presence search) and by `doctor`. It no longer decides anything
+  about a wedged conversation: the same fault takes the same park with the key
+  set or unset.
+* `state.rotations`, `state.last_rotation` and
+  `policy.max_conversation_rotations` remain in `state.py` / `policy.py`, and
+  `cli._reset_run_scoped_budgets` still zeroes the counter once per process.
+  Nothing in the orchestrator increments it any more, so on a state file this
+  code writes it reads 0 — which is why `_bind_request_conversation`'s
+  `rotations` guard is kept rather than deleted: a state file from an OLDER
+  process can still carry a nonzero count, and that is exactly the file whose
+  unbound request must not be attributed by guessing.
+* `cli._drift_is_recorded_rotation` is likewise kept: a config that still names
+  the chat a previous process rotated away from must not refuse to start.
+* `doctor`'s `conversation_rotations` check now always reports `0/N`. Reading it
+  as "budget available" is wrong; there is nothing to spend it on.
+* `autoloop/browser/` is untouched and still offers `retarget` / `current_url` /
+  `find_conversation_with`. The last of those is live (the presence search); the
+  first two are used only by the adapter itself now.
+
+**Moving the loop to a fresh chat is an operator action.** Point
+`browser.conversation_url` at the new chat and `reset` — the drift guard
+requires state and config to agree. Do not resend into a chat that may already
+hold the request.
 
 **One Playwright driver per process.** `sync_playwright().start()` raises
 "Playwright Sync API inside the asyncio loop" when another driver is already
@@ -4159,126 +4205,61 @@ Same principle as the throttling back-off and the "a failure nobody could
 recover from must not spend the budget" rule: a transport fault degrades into a
 recorded decision, never into silence.
 
-**A silent conversation — send confirmed, model never starts — is the third
-trigger.** Added 2026-07-31, after this exact shape recurred three times: the
+**A silent conversation — send confirmed, model never starts — is counted, not
+acted on.** Added 2026-07-31 after this exact shape recurred three times: the
 send is CONFIRMED and persisted (§5b/§5c above already rule out ambiguity and a
 disproven send), and the model simply never begins generating, producing
-repeated `ResponseTimeoutError`s that used to just spend the ordinary failure
-budget down to `failed`. `BrowserChatGPT.await_response` now tags each timeout
-with a `stage` — `"start"` (nothing began within `response_start_timeout_seconds`)
-or `"complete"` (a response began and merely did not settle) — and rotation may
-consider only `"start"`. All three of the following must hold, checked in this
-order, before autoloop will call the chat unusable:
+repeated `ResponseTimeoutError`s. `BrowserChatGPT.await_response` tags each
+timeout with a `stage` — `"start"` (nothing began within
+`response_start_timeout_seconds`) or `"complete"` (a response began and merely
+did not settle).
 
-1. **Three consecutive `stage="start"` timeouts for the SAME request**, with no
-   resubmission in between. This holds by construction, not by an extra guard:
-   `awaiting` has no transition back to `submitting` except through a completed
-   rotation, which resets the count — so three in a row can only mean three
-   timeouts in one conversation, for one submission, nothing resent between
-   them.
-2. **A total measured wait of at least 3× `response_start_timeout_seconds`**
-   (the default 120s → a 360s floor), computed from the configured value —
-   never hardcoded — and checked against the ACTUAL elapsed time each timeout
-   measured (`ResponseTimeoutError.elapsed`), not merely assumed from config.
-   This is a soft gate, not an invariant to crash on: the floor is computed
-   from the CURRENT config, while each `elapsed` was measured against
-   whatever was configured at the time, so raising
-   `response_start_timeout_seconds` between processes (the third trigger's
-   own restart path can land exactly here) can leave a true, honestly
-   measured wait below a floor computed from the new value. That is
-   insufficient evidence, not corruption — the loop logs
-   `response_silence_wait_below_floor` and keeps retrying ordinarily rather
-   than raising.
-3. **One FINAL reconciliation of the (still-current) conversation confirms no
-   assistant turn has started** — `BrowserChatGPT.reconcile_no_response`, an
-   explicit reload followed by the same "has the assistant begun answering our
-   turn" check `await_response` itself uses, so a reply that landed between the
-   third timeout and this check is not missed. A reply appearing here
-   **cancels** the rotation attempt entirely: the streak resets to 0, exactly
-   as if the timeouts had never happened, because the conversation was never
-   actually silent — it was just slow.
+A `stage="start"` timeout in `awaiting` advances two per-request counters,
+`PendingRequest.start_timeouts` and `start_timeout_wait_seconds` (the ACTUAL
+elapsed time each timeout measured, from `ResponseTimeoutError.elapsed`), and
+then goes to `_handle_browser_failure` like any other transport fault. The
+counters are persisted by that handler, so a crash resumes with the streak
+intact. Nothing reads them.
 
-Only once all three hold does the loop retire the old conversation, open
-exactly one replacement in the configured project, resend the same request id
-(the ordinary rotation continuation prompt — see below), and bind to it. It is
-bounded by the SAME `policy.max_conversation_rotations` budget as the other two
-triggers, not a separate allowance — a replacement chat that is also silent
-parks `loop_fatal` on the second attempt, same as any other rotation-cap
-refusal. Every occurrence, first through third, still goes through
-`_handle_browser_failure` first, every time, and is charged to the ordinary
-failure budget by it — with the one exemption that handler makes for a restart
-the cooldown refused (see "A restart that was never attempted is not a failed
-restart" below); the silent-conversation check is layered on top of it, never a
-bypass. A
-completed rotation resets `consecutive_failures` to 0 alongside the silence
-count, exactly like an ordinary successful `awaiting` step already does — the
-replacement conversation does not inherit the retired one's fault count. This
-is what makes the "replacement chat is also silent" case above reachable at
-all: without the reset, a single timeout in the replacement chat would push
-`consecutive_failures` straight past `max_consecutive_failures` (already at
-its ceiling from the three timeouts that earned the first rotation) and fail
-the loop before a second rotation attempt — and its cap refusal — is ever
-reached.
+Until brw-15 they were the entry condition for the third rotation trigger:
+three consecutive `stage="start"` timeouts for one request, an accumulated wait
+of at least 3× `response_start_timeout_seconds` (a soft gate, since the floor
+came from the CURRENT config while each `elapsed` was measured against whatever
+was configured at the time — hence `response_silence_wait_below_floor` rather
+than an assertion), and one FINAL reconciliation
+(`BrowserChatGPT.reconcile_no_response`) confirming no assistant turn had
+started, so that a reply landing in the gap cancelled the attempt. All three
+gates and the rotation they earned are gone; `reconcile_no_response` is never
+called from the orchestrator now, and a `stage="complete"` timeout never
+qualified for any of it and still does not.
 
-**Rotation proves before it binds.** ChatGPT does not mint a chat's durable
-address until it has its first turn, so the order is forced: retarget to the
-project page, submit there, read the URL the server assigned, check it is inside
-the configured project — and then **reconcile against it**. Until the new
-conversation itself confirms it holds the request, nothing is bound and the
-rotation has not happened. Trusting the address bar would be the same class of
-mistake as trusting an optimistic bubble.
-
-**Rotation primes the replacement before judging it.** The address a brand-new
-chat carries is not the project page — it is a placeholder,
-`https://chatgpt.com/c/WEB:<uuid>`, under no project at all. So "the address
-moved off the project page" was never evidence a chat exists, and the membership
-check applied to it refused every rotation (2026-08-16: one LOOP-FATAL park; an
-operator sent one message by hand and the same address became
-`/g/g-p-<project>-<slug>/c/<uuid>`, which passes the same check unchanged). The
-submit **is** the priming message — one send, never retried, because a second
-send from the project page opens a SECOND chat and orphans the first — and the
-wait after it polls for *an address inside the project*, not merely a changed
-one. Bounded by `ROTATION_URL_TIMEOUT_SECONDS`; on expiry the by-content search
-still runs, and if that also fails the park names **the address actually
-observed**, so the placeholder shape is visible rather than a generic timeout.
-The membership rule itself is unchanged and still refuses a replacement that
-really is outside the project. It is applied to the ADDRESS BAR only, and
-deliberately not re-applied to what the by-content search returns: that search
-reads the project's own chat list (its scoping *is* the containment check) and
-builds candidates with `urljoin`, so a chat inside the project legitimately
-comes back as a prefix-less `https://chatgpt.com/c/<id>` — the trap
-`_same_conversation` documents.
-
-**A failed rotation still costs its budget, and changes nothing else.** The
-budget is consumed *before* the send, durably — a rotation posts a message, and
-if the process dies between that send and the binding, recovery must not be able
-to open a second chat and post again. Same pessimism as `send_attempted`, for
-the same reason. Everything else is left exactly as it was: the request keeps
-its old conversation binding and, crucially, its **original prompt**. Rewriting
-the prompt before the send succeeded would leave a failed rotation holding text
-that announces the conversation is abandoned — sitting in the request that
-`--resubmit` would send into the conversation that was never abandoned.
+The counters are kept because they are the only durable record that a
+conversation went silent, and because `state.py` was outside brw-15's scope.
+Read them as diagnostics: three of them means "this chat produced nothing for
+three full windows", and the action is an operator's.
 
 **Every request owns its conversation.** `PendingRequest.conversation_url` and
 `conversation_epoch` are the authority for submitting, awaiting and reconciling
-that request — never `LoopState.conversation_url`, which moves. That is what makes
-a late reply in an abandoned chat structurally unable to authorize anything: it is
-not in the conversation the request is bound to, so it is never read. A request
-written before this field existed is adopted onto the loop's URL on first touch,
-which is only correct while `rotations == 0`; afterwards an unbound request raises
-rather than being guessed at.
+that request — never `LoopState.conversation_url`. That is what makes a late
+reply in a chat the loop has left structurally unable to authorize anything: it
+is not in the conversation the request is bound to, so it is never read. A
+request written before this field existed is adopted onto the loop's URL on
+first touch, which is only correct while `rotations == 0`; afterwards an
+unbound request raises rather than being guessed at. Nothing increments
+`rotations` any more, so that guard fires only on state left by an older
+process — which is exactly the state where the request cannot be attributed.
 
-**The config follows the state.** A completed rotation rewrites
-`[browser].conversation_url` so the next session does not walk back into the chat
-the loop just escaped. The write is line-surgical (comments and every other key
-survive), atomic, and **refuses a git-tracked path** — the config lives under the
-gitignored state dir, and a loop that can quietly edit tracked files while
-recovering from a browser fault is a worse problem than a failed heal. If the
-heal fails, the CLI's drift guard recognises the recorded rotation (state moved,
-config did not) and continues; any *other* disagreement still refuses to start.
+**The config is the operator's.** A completed rotation used to rewrite
+`[browser].conversation_url` (line-surgical, atomic, refusing a git-tracked
+path) so the next session did not walk back into the chat the loop had escaped.
+Nothing in the loop writes the config now; `config_writer` remains, unused by
+the orchestrator. `cli._drift_is_recorded_rotation` also remains, so a config
+that still names the chat an older process rotated away from does not refuse to
+start.
 
-`doctor` reports which conversation is actually live, how much rotation budget is
-left, and whether `project_url` looks like a project.
+`doctor` reports which conversation is actually live and whether `project_url`
+looks like a project. Its `conversation_rotations` line now always reads `0/N`
+and means nothing — there is no rotation to spend a budget on.
 
 **A restart that was never attempted is not a failed restart.** Two guards sit
 on the browser path and, until 2026-08-04, cancelled each other out.
@@ -4482,9 +4463,10 @@ send appended nothing to any durable conversation and can simply be re-issued �
 without it, every failed invocation would park a human on `submission_ambiguous`,
 a rule written for a shared chat thread that means nothing here.
 
-Rotation is unreachable rather than disabled: the adapter omits
-`retarget`/`current_url`, and every rotation trigger describes a browser
-conversation.
+Conversation rotation used to be the awkward part of that collapse — the
+adapter omits `retarget`/`current_url`, so it was unreachable in principle
+while `_step_submission_rejected` reached it in practice. brw-15 removed the
+machinery outright, so there is nothing left to be unreachable.
 
 **Why the browser stays.** Codex draws on your ChatGPT plan's **agentic**
 allowance (shared with ChatGPT Work and ChatGPT for Excel). Ordinary ChatGPT
@@ -4959,12 +4941,15 @@ Both halves are recorded: `transport_replay_authorized` with the provider and
 the count, `transport_replay_declined` with `not_idempotent`,
 `reconcile_failed` or `replay_budget`.
 
-**Rotation is refused for a non-browser transport, and this is the door that is
-actually reachable.** The two guards above sit in fault handlers;
-`_step_submission_rejected` reaches `_attempt_rotation` without passing any of
+**Two disproven sends park with the transport's own remedy, and this is the door
+that is actually reachable.** The two guards above sit in fault handlers;
+`_step_submission_rejected` reaches its terminal decision without passing any of
 them, and `codex_cli` returns `SubmitResult.REJECTED` on every non-zero exit and
 on a clean exit with empty stdout. So two ordinary consecutive codex failures on
-one request arrive at rotation. Both ways out were wrong:
+one request arrive there.
+
+Until brw-15 that decision was a conversation rotation, and both ways out of it
+were wrong:
 
 * with `browser.project_url` unset — the normal codex deployment — the park told
   the operator to set it "to the ChatGPT project this conversation belongs to";
@@ -4973,12 +4958,13 @@ one request arrive at rotation. Both ways out were wrong:
   then raised because the transport has no `retarget`/`current_url` — a park
   about a rotation that could never have happened, plus a consumed budget.
 
-`_attempt_rotation` now refuses before either, parking
-`rotation_unsupported_by_transport` with the transport's own remedy and spending
-no rotation budget. Nothing is lost: rotation opens a chat in a ChatGPT project
-and moves a turn into it, so a transport with no rotation surface is not being
-denied a recovery it ever had. For the browser both pre-existing refusals
-(`rotation_unavailable`, `rotation_cap_reached`) are untouched.
+recov-01 (2026-08-22) added a capability refusal in front of both, parking
+`rotation_unsupported_by_transport`. brw-15 went further and removed the
+machinery, so the refusal has nothing to guard: the fault now parks
+`send_rejected_twice` for EVERY transport, and only the remedy quoted in the
+question differs — `conversation.transport_remedy(provider)` for a non-browser
+run, browser advice for a browser run. `browser.project_url` is not consulted on
+this path at all, so a stale value left in the config changes nothing.
 
 ---
 
@@ -5048,15 +5034,16 @@ question nobody was asked. `packet.diff_part_id` transforms the id
 (`alr-x-0007` → `diffpart_alr_x_0007_01of02`) and `plan_chunked_delivery`
 re-checks the built values rather than trusting the format string.
 
-**A rotation gives up the parts.** The parts live in the conversation being
-abandoned, and a rotation (§5c) posts only the verdict message — which would
-name part ids the replacement chat does not contain. Re-sending them is not an
-option either, since the rotation posts the question itself and they would
-arrive after it. So `_attempt_rotation` falls back to the omission notice before
-rotating a chunked request. That happens AFTER both rotation preconditions: a
-rotation refused for a missing `project_url` or a spent budget posts nothing, so
-the old conversation still holds the whole delivery and there is nothing to give
-up.
+**A wedged conversation keeps the parts.** They live in the chat the loop is
+stopping on, and a park sends nothing — so the whole delivery is still there,
+and the `run --resubmit` an operator may authorize goes to that same chat. This
+used to be a two-sided rule: a conversation ROTATION (§5c) posted only the
+verdict message into the replacement chat, naming part ids that chat did not
+contain, so `_attempt_rotation` fell back to the omission notice
+(`rotation_leaves_parts_behind`) before rotating a chunked request — while a
+rotation its preconditions refused posted nothing and kept them. brw-15 removed
+the rotation, so only the keeping half remains and the omission fallback is
+reached solely by the delivery's own failures above.
 
 **Chunking is opt-in per provider.** `supports_chunked_delivery` is probed with
 `getattr`, like every other optional transport capability. `browser_chatgpt`

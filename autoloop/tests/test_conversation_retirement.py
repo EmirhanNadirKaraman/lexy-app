@@ -27,11 +27,20 @@ What these tests pin, in order:
 * a throttle discovered at the moment of conclusion is still routed as a
   throttle, and a browser whose probe cannot read the page keeps the
   lost-session fault — the two worlds this classification must not swallow;
-* at the orchestrator, the fault rotates WITHOUT restarting Chrome and
-  WITHOUT charging the browser failure budget (`consecutive_failures`) — the
-  brw-03 rule: a budget that decides recovery is hopeless must not be spent
-  on a fault no restart could fix — including end-to-end through the REAL
-  client code for the exact reported locator-timeout shape.
+* at the orchestrator, the fault PARKS (`conversation_unusable`) WITHOUT
+  restarting Chrome and WITHOUT charging the browser failure budget
+  (`consecutive_failures`) — the brw-03 rule: a budget that decides recovery is
+  hopeless must not be spent on a fault no restart could fix — including
+  end-to-end through the REAL client code for the exact reported locator-timeout
+  shape.
+
+Until brw-15 (2026-08-25) the last bullet said "rotates": the fault opened a
+replacement chat in the configured ChatGPT project and moved the request into
+it. That machinery is gone, and the classification is what survives it — which
+is the right way round, since the 2026-08-17 incident was a MISCLASSIFICATION
+(ten minutes of 45-second Chrome restarts against a chat no restart could fix),
+not a missing recovery. An operator now moves the loop by hand, which is what
+the operator did on the day.
 """
 
 import pytest
@@ -55,7 +64,6 @@ from test_chatgpt_client import (  # noqa: E402 - see conftest sys.path
 from test_chatgpt_client import CONV_URL as CLIENT_CONV_URL  # noqa: E402
 from test_transport_recovery import (  # noqa: E402 - see conftest sys.path
     CONV_URL,
-    NEW_CONV_URL,
     PROJECT_URL,
     RotatingFakeClient,
     build,
@@ -227,7 +235,8 @@ class DeadReadsSession(WedgedPageSession):
 def test_a_submission_that_never_appears_is_the_conversation_not_the_browser(tmp_path):
     """The 2026-08-17 state, classified: request absent, tail mounted to the
     demonstrable END, page attachable and un-throttled throughout — a wedged
-    conversation, raised as the one error that authorizes rotation."""
+    conversation, raised as the one error the orchestrator routes away from the
+    browser recovery."""
     session = WedgedPageSession(_filler(3))  # 6 messages, none the request
     client = make_client(session, FakeClock(), tmp_path, response_start_timeout=5.0)
 
@@ -273,7 +282,7 @@ def test_the_locator_timeout_on_the_missing_message_is_probed_not_restarted(tmp_
 def test_a_read_failure_with_the_request_present_keeps_the_browser_fault(tmp_path):
     """The transient world: the read died, but the probe finds the chat
     demonstrably HOLDING the loop's message. Nothing is wedged, so nothing may
-    authorize a rotation — the original lost-session fault stands and takes
+    condemn the conversation — the original lost-session fault stands and takes
     the restart recovery it always had."""
     history = _filler(1) + [("user", f"[autoloop request {RID} | iteration 1]")]
     session = WedgedPageSession(
@@ -324,7 +333,8 @@ def test_a_throttle_discovered_by_the_probe_is_still_a_throttle(tmp_path):
     """The probe's conclusion checks outrank BOTH labels: an overlay up at the
     moment absence settles routes as the account limit — never left as a lost
     session (a restart adds a request to the window that caused it), and never
-    relabelled a wedged chat (a rotation SENDS into the throttled account)."""
+    relabelled a wedged chat (a park about the conversation names the wrong
+    cause, and back-off is the only thing that clears a throttle)."""
     session = WedgedPageSession(
         _filler(3), throttle_after_scrolls=1, read_faults=[_locator_timeout()]
     )
@@ -342,8 +352,8 @@ def test_a_throttle_discovered_by_the_probe_is_still_a_throttle(tmp_path):
 def test_a_message_hidden_by_the_unmounted_tail_does_not_condemn_the_chat(tmp_path):
     """The request IS in the conversation — six scrolls down, exactly where
     virtualization left the 2026-08-05 request. The mount sights it, so the
-    ordinary silent-conversation timeout fires and rotation is never
-    authorized."""
+    ordinary silent-conversation timeout fires and the chat is never
+    condemned."""
     history = _filler(6) + [("user", f"[autoloop request {RID} | iteration 1]")]
     session = WedgedPageSession(history)  # initial window misses the tail
     client = make_client(session, FakeClock(), tmp_path, response_start_timeout=5.0)
@@ -375,8 +385,8 @@ def test_an_unprovable_absence_keeps_the_ordinary_timeout(tmp_path):
 
 def test_a_request_visible_in_the_window_never_triggers_the_mount(tmp_path):
     """The silent-conversation case unchanged: the request is on the page and
-    the model is merely quiet. No gesture is spent and the existing
-    `stage=\"start\"` machinery (three-strike rotation) keeps the case."""
+    the model is merely quiet. No gesture is spent and the ordinary
+    `stage=\"start\"` timeout keeps the case."""
     history = _filler(1) + [("user", f"[autoloop request {RID} | iteration 1]")]
     session = WedgedPageSession(history, window=len(history))
     client = make_client(session, FakeClock(), tmp_path, response_start_timeout=5.0)
@@ -393,8 +403,8 @@ def test_a_request_visible_in_the_window_never_triggers_the_mount(tmp_path):
 
 def test_a_throttle_arriving_mid_mount_is_still_a_throttle(tmp_path):
     """The overlay going up while the mount dwells must be routed as the
-    account limit it is — never relabelled a wedged conversation, because the
-    rotation it would authorize SENDS into the throttled account."""
+    account limit it is — never relabelled a wedged conversation, because that
+    park names the wrong cause and forecloses the back-off that clears it."""
     session = WedgedPageSession(_filler(3), throttle_after_scrolls=1)
     client = make_client(
         session, FakeClock(), tmp_path, response_start_timeout=5.0, tail_mount_attempts=8
@@ -404,7 +414,15 @@ def test_a_throttle_arriving_mid_mount_is_still_a_throttle(tmp_path):
         client.await_response(RID)
 
 
-# ---- 4. at the orchestrator: rotate, no restart, no budget ------------------
+# ---- 4. at the orchestrator: park, no restart, no budget --------------------
+#
+# The recovery this section asserted was ROTATION until brw-15 (2026-08-25)
+# removed it. The rule it was written for is untouched and is what these tests
+# still pin: a fault established THROUGH a working, un-throttled page must not
+# spend the browser recovery — no Chrome restart, no `consecutive_failures`
+# increment — because no restart could fix it. What changed is only where the
+# fault goes afterwards: a `conversation_unusable` park naming the wedged chat,
+# instead of a replacement chat opened automatically.
 
 
 def _missing_submission_error():
@@ -419,12 +437,13 @@ def _raise_missing_submission(client):
     raise _missing_submission_error()
 
 
-def test_a_missing_submission_rotates_without_restarting_or_charging_the_budget(tmp_path):
-    """The whole point of the classification: the recovery is rotation, the
-    browser is never restarted (a restart command IS configured, so one would
-    be visible if attempted), and the browser failure budget — the counter
-    that decides recovery is hopeless — is not spent on a fault no restart
-    could fix."""
+def test_a_missing_submission_parks_without_restarting_or_charging_the_budget(tmp_path):
+    """The whole point of the classification, and the half of it that outlives
+    the rotation: the browser is never restarted (a restart command IS
+    configured, so one would be visible if attempted), and the browser failure
+    budget — the counter that decides recovery is hopeless — is not spent on a
+    fault no restart could fix. The park names the chat and the error's own
+    code, so the operator sees WHICH shape of unusable this was."""
     client = RotatingFakeClient(responses=[_raise_missing_submission])
     state = LoopState.new(CONV_URL)
     state.phase = Phase.AWAITING.value
@@ -435,32 +454,35 @@ def test_a_missing_submission_rotates_without_restarting_or_charging_the_budget(
 
     orch.run(max_steps=1)
 
-    assert orch.state.rotations == 1
-    assert orch.state.conversation_url == NEW_CONV_URL
-    assert orch.state.conversation_epoch == 1
-    assert orch.state.pending_request.conversation_url == NEW_CONV_URL
-    assert orch.state.phase == Phase.AWAITING.value
-    # No restart, no browser-failure accounting: the fault is charged to the
-    # rotation budget alone.
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert orch.state.resume_phase == Phase.AWAITING.value
+    # Nothing moved: the loop is still pinned to the conversation it condemned,
+    # which is exactly what the park has to tell the operator.
+    assert orch.state.rotations == 0
+    assert orch.state.conversation_url == CONV_URL
+    assert orch.state.conversation_epoch == 0
+    assert orch.state.pending_request.conversation_url == CONV_URL
+    # No restart, no browser-failure accounting.
     assert orch.state.consecutive_failures == 0
     assert orch.state.browser_restart_skips == 0
     assert transcript_entries(config, "browser_restarted") == []
     assert transcript_entries(config, "browser_error") == []
-    rotated = transcript_entries(config, "conversation_rotated")
-    assert len(rotated) == 1
-    assert rotated[0]["data"]["reason"] == "submission_never_appeared"
-    assert rotated[0]["data"]["old_url"] == CONV_URL
-    assert rotated[0]["data"]["new_url"] == NEW_CONV_URL
+    assert transcript_entries(config, "conversation_rotated") == []
     unusable = transcript_entries(config, "conversation_unusable")
     assert unusable and unusable[0]["data"]["reason_code"] == "submission_never_appeared"
-    # Rotation opened the project page and bound the minted chat, as ever.
-    assert PROJECT_URL in client.retargets
-    assert client.retargets[-1] == NEW_CONV_URL
+    question = orch.state.question or ""
+    assert "submission_never_appeared" in question
+    assert CONV_URL in question
+    # And it never navigated anywhere to find a replacement.
+    assert PROJECT_URL not in client.retargets
+    assert client.submitted == []
 
 
-def test_the_rotation_survives_a_restart_of_the_process(tmp_path):
-    """Same durability rule as every other rotation trigger: the rebinding is
-    on disk before anything else runs."""
+def test_the_park_survives_a_restart_of_the_process(tmp_path):
+    """Same durability rule the rotation had: whatever this fault decided is on
+    disk before anything else runs, so the next process resumes on it rather
+    than re-deciding from a state that never got written."""
     client = RotatingFakeClient(responses=[_raise_missing_submission])
     state = LoopState.new(CONV_URL)
     state.phase = Phase.AWAITING.value
@@ -470,18 +492,19 @@ def test_the_rotation_survives_a_restart_of_the_process(tmp_path):
     orch.run(max_steps=1)
 
     reloaded = StateStore(config.state_file).load()
-    assert reloaded.rotations == 1
-    assert reloaded.conversation_url == NEW_CONV_URL
-    assert reloaded.pending_request.conversation_url == NEW_CONV_URL
-    assert reloaded.last_rotation["reason"] == "submission_never_appeared"
+    assert reloaded.phase == Phase.NEEDS_USER.value
+    assert reloaded.rotations == 0
+    assert reloaded.conversation_url == CONV_URL
+    assert reloaded.pending_request.conversation_url == CONV_URL
+    assert reloaded.last_rotation in (None, {})
+    assert "submission_never_appeared" in (reloaded.question or "")
 
 
 class IncidentAwaitClient(RotatingFakeClient):
     """`RotatingFakeClient` whose awaiting runs the REAL
     `BrowserChatGPT.await_response` over a scripted page — so an orchestrator
     test exercises the actual classification code rather than a stand-in that
-    raises the right error by fiat — while rotation keeps the fake's own
-    machinery."""
+    raises the right error by fiat."""
 
     def __init__(self, browser_client, **kwargs):
         super().__init__(**kwargs)
@@ -492,14 +515,15 @@ class IncidentAwaitClient(RotatingFakeClient):
         return self._browser.await_response(request_id)
 
 
-def test_the_reported_locator_timeout_rotates_without_restart_or_budget(tmp_path):
+def test_the_reported_locator_timeout_parks_without_restart_or_budget(tmp_path):
     """The full reported shape, through the orchestrator and the REAL client
     code: a locator/read timeout while waiting for the loop's own submitted
     message (`submitted=True`, `send_attempted=True`), then healthy-page and
-    mounted-tail evidence showing that message absent. The loop must rotate —
-    no Chrome restart (a restart command IS configured, so one would log
-    `browser_restarted`), and no browser-budget increment. This is the exact
-    path that spent 2026-08-17 restarting a healthy browser."""
+    mounted-tail evidence showing that message absent. No Chrome restart (a
+    restart command IS configured, so one would log `browser_restarted`), and no
+    browser-budget increment. This is the exact path that spent 2026-08-17
+    restarting a healthy browser; the classification is what stopped that, and
+    it is unaffected by brw-15 removing the recovery it used to feed."""
     session = WedgedPageSession(_filler(3), read_faults=[_locator_timeout()])
     browser_client = make_client(
         session, FakeClock(), tmp_path, response_start_timeout=5.0
@@ -513,16 +537,14 @@ def test_the_reported_locator_timeout_rotates_without_restart_or_budget(tmp_path
 
     orch.run(max_steps=1)
 
-    assert orch.state.rotations == 1
-    assert orch.state.conversation_url == NEW_CONV_URL
-    assert orch.state.phase == Phase.AWAITING.value
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.rotations == 0
+    assert orch.state.conversation_url == CONV_URL
     assert orch.state.consecutive_failures == 0
     assert orch.state.browser_restart_skips == 0
     assert transcript_entries(config, "browser_restarted") == []
     assert transcript_entries(config, "browser_error") == []
-    rotated = transcript_entries(config, "conversation_rotated")
-    assert len(rotated) == 1
-    assert rotated[0]["data"]["reason"] == "submission_never_appeared"
+    assert transcript_entries(config, "conversation_rotated") == []
     unusable = transcript_entries(config, "conversation_unusable")
     assert unusable and unusable[0]["data"]["reason_code"] == "submission_never_appeared"
 

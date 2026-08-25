@@ -35,7 +35,7 @@ from pathlib import Path
 import pytest
 
 from autoloop import packet as packet_mod
-from autoloop.errors import BrowserError, LoginExpiredError, StateError
+from autoloop.errors import ConversationUnusableError, LoginExpiredError, StateError
 from autoloop.browser.chatgpt import SubmitResult
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Directive
@@ -553,11 +553,18 @@ def test_a_patch_that_does_not_match_its_payload_is_not_chunked():
     assert plan is None
 
 
-def test_a_rotation_gives_up_the_parts_rather_than_pointing_at_a_chat_without_them(tmp_path):
-    """The parts live in the conversation being abandoned. A rotation carries
-    only the verdict message, which would name part ids the replacement chat
-    does not contain — a reviewer asked to decide on a patch that is not
-    there."""
+def test_a_wedged_conversation_parks_and_keeps_the_delivery_intact(tmp_path):
+    """Two tests used to live here: a rotation abandoned the delivered parts
+    (they live in the chat being left behind, so the verdict message would name
+    part ids the replacement chat does not contain) and fell back to the
+    omission notice, while a rotation the preconditions refused kept the whole
+    delivery because it had posted nothing.
+
+    brw-15 removed the rotation, so only the second shape is reachable and it is
+    now the whole rule: a wedged conversation parks, sends nothing, and the
+    parts stay exactly where they were delivered. The `--resubmit` an operator
+    may authorize afterwards goes to that same chat, which still holds them.
+    """
     client = ChunkingClient()
     orch, _store, _task = oversized_round(
         tmp_path, client, project_url="https://chatgpt.com/g/g-p-abc/project"
@@ -565,33 +572,19 @@ def test_a_rotation_gives_up_the_parts_rather_than_pointing_at_a_chat_without_th
     req = orch.state.pending_request
     orch._step_delivering()
     assert req.delivery.complete
+    payload_before = req.payload
+    submitted_before = len(client.submitted)
 
-    def rotation_fails(_req, _project_url):
-        raise BrowserError("the replacement chat never loaded")
-
-    orch._rotate_conversation = rotation_fails
-    orch._attempt_rotation(req, reason="conversation_unusable")
-
-    assert req.delivery is None
-    assert "Full diff: OMITTED" in req.payload
-    assert "`autoloop review diff part` messages appear above, IGNORE" in req.payload
-    assert hashlib.sha256(req.payload.encode("utf-8")).hexdigest() == req.report_sha256
-
-
-def test_a_rotation_refused_before_it_sends_anything_keeps_the_delivery(tmp_path):
-    """The other side of the same rule: a rotation the preconditions refuse
-    posts nothing, so the old conversation still holds the whole patch and
-    there is nothing to give up."""
-    client = ChunkingClient()
-    orch, _store, _task = oversized_round(tmp_path, client)   # project_url unset
-    req = orch.state.pending_request
-    orch._step_delivering()
-
-    orch._attempt_rotation(req, reason="conversation_unusable")
+    orch._handle_conversation_unusable(
+        Phase.DELIVERING, ConversationUnusableError("wedged")
+    )
 
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert req.delivery is not None and req.delivery.complete
     assert "DELIVERED ABOVE IN" in req.prompt
+    assert req.payload == payload_before, "no omission notice: nothing was given up"
+    assert "Full diff: OMITTED" not in req.payload
+    assert len(client.submitted) == submitted_before, "a park sends nothing"
 
 
 # =============================================================================
