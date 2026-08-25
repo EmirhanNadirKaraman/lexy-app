@@ -44,9 +44,10 @@ halt-03 (2026-08-25) adds the SECOND half of that table,
 `STALE_RECORD_RECOVERIES`: six codes whose fault is not a transport fault at
 all but a RECORD the loop is still holding that no longer describes anything —
 a base pinned behind the branch head, an approval binding naming a candidate
-that moved, a queued review that can never bind, a session pointer at an audit
-nobody minted. Their remedy is one action, `RECOVER_BY_REBUILDING_AT_HEAD`:
-archive the stale record, rebuild at the current head, re-dispatch. That is
+that moved, a packet that can never bind the review it is standing in front of,
+a session pointer at an audit nobody minted. Their remedy is one action,
+`RECOVER_BY_REBUILDING_AT_HEAD`: archive the stale record, rebuild at the
+current head, re-dispatch. That is
 exactly what an operator does by hand today, which is why the median park on
 `task_base_behind_head` was 0.54h across 15 parks — seeing it IS deciding it.
 The two dicts are merged into `AUTONOMOUS_RECOVERIES`, which stays the ONE
@@ -204,10 +205,14 @@ STALE_EXECUTION_RECORD = "execution_record"
 #: the execution record underneath is not touched.
 STALE_PUSH_BINDING = "push_binding"
 
-#: `LoopState.changeset` — an operator-queued changeset review whose packet
-#: cannot carry the four identifiers an approval binds by, so no round spent on
-#: it could ever publish. Dropped, with its identifiers written to the
-#: transcript first.
+#: The PACKET standing between an operator-queued changeset review
+#: (`LoopState.changeset`) and the reviewer: `LoopState.outbox` does not carry
+#: the four identifiers an approval binds by, so no round spent on it could ever
+#: publish. The queue entry is KEPT and the packet is rebuilt around it
+#: (`orchestrator._rebuild_changeset_packet_at_head`) — dropping the entry
+#: instead would send the unbindable payload as an ordinary unbound request and
+#: leave the operator's candidate unpublishable for the rest of the session,
+#: which is discarding the review rather than rebuilding it.
 STALE_QUEUED_REVIEW = "queued_review"
 
 #: `LoopState.current_task` pointing at an audit pseudo-task with no audit unit
@@ -452,16 +457,22 @@ STALE_RECORD_RECOVERIES: dict[str, AutonomousRecovery] = {
             max_attempts=1,
             stale_record=STALE_QUEUED_REVIEW,
             why=(
-                "A queued changeset review whose packet cannot carry the four "
-                "identifiers an approval binds by. It is raised BEFORE the packet "
-                "is sent and refuses every round for as long as the queue entry "
-                "stands, so the loop cannot make progress until it goes — this "
-                "is the one code here that halts the loop indefinitely rather "
-                "than costing it a round. Dropping it is what an operator does, "
-                "and the four identifiers plus the whole queued record go to the "
-                "transcript first: an operator's explicit `review-changeset` "
-                "must never evaporate with nothing saying so. The outbox is left "
-                "exactly as it stands, because that payload is theirs."
+                "A queued changeset review whose PACKET cannot carry the four "
+                "identifiers an approval binds by. It is raised BEFORE anything "
+                "is sent and refuses every round for as long as the payload "
+                "stands, so this is the one code here that halts the loop "
+                "indefinitely rather than costing it a round. The stale record "
+                "is the packet, never the queue entry: `build_changeset_packet` "
+                "always stamps the four identifiers and `review-changeset` sets "
+                "no `outbox_diff`, so the queued packet always binds and this "
+                "fault can only be raised once something ELSE has taken the "
+                "outbox (a corrective re-prompt, a plan request, a later task "
+                "review packet). So the entry is kept and the packet is rebuilt "
+                "around it, which is the park's own remedy — 're-queue with "
+                "`review-changeset`' — performed rather than requested. Dropping "
+                "the entry, as the first cut of this did, sent the unbindable "
+                "payload unbound and left the operator's candidate "
+                "unpublishable: a review discarded, not rebuilt."
             ),
         ),
     )

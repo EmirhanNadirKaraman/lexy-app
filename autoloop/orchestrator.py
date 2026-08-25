@@ -325,7 +325,7 @@ from .blockers import (
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
 from .browser.playwright_session import attachable_page_targets
-from .changeset_review import ChangesetBinding
+from .changeset_review import ChangesetBinding, build_changeset_packet
 from .config import AutoloopConfig
 from .context import build_context, render_context
 from .conversation import transport_is_browser_backed, transport_remedy
@@ -357,6 +357,7 @@ from .errors import (
     StateCorruptError,
     StateError,
     TaskGraphError,
+    TemplateError,
 )
 from .manifest import ManifestStore
 from .executor import ExecutionOutcome, TaskExecutor
@@ -503,6 +504,24 @@ RECUT_RETIREMENT_REASON = "recut-by-reviewer"
 #: charged to the same `recut_count`, so the two share a cap even though they
 #: do not share a label.
 AUTONOMOUS_REBUILD_RETIREMENT_REASON = "rebuilt-at-head-autonomously"
+
+#: The four identifiers an approval binds an operator changeset by, named ONCE
+#: (halt-03, 2026-08-25). Three places ask the same question of them — the
+#: producer of `changeset_binding_missing` in `_step_ready`, which reports the
+#: ones a payload is missing; `_rebuild_changeset_packet_at_head`, which reads
+#: them off the queued record and re-verifies them in the packet it rebuilds;
+#: and `_current_pending_changeset`, which is the check both of the others are
+#: predicting. A second literal tuple would agree today and drift the first time
+#: `ChangesetBinding` grew a field an approval binds by.
+CHANGESET_BINDING_FIELDS = ("base_sha", "candidate_sha", "branch", "dest_ref")
+
+#: How much of a displaced payload `_rebuild_changeset_packet_at_head` copies
+#: into the transcript. Enough to recognise WHICH packet was displaced (its
+#: opening lines name the task or the correction), not enough to duplicate a
+#: review diff into a log that is read line by line. The full payload's length
+#: and sha256 go beside it, so the entry identifies the displaced text exactly
+#: even though it does not contain it.
+DISPLACED_OUTBOX_LOG_CHARS = 800
 
 # ---- the attempt ceiling's classification bounds (ceil-01, 2026-08-25) ------
 #
@@ -2105,7 +2124,7 @@ class Orchestrator:
             queued = state.changeset or {}
             missing = [
                 name
-                for name in ("base_sha", "candidate_sha", "branch", "dest_ref")
+                for name in CHANGESET_BINDING_FIELDS
                 if not queued.get(name) or queued.get(name) not in (state.outbox or "")
             ]
             self._to_needs_user(
@@ -10476,8 +10495,9 @@ class Orchestrator:
         is the loop's own bookkeeping, `changeset_binding_missing` and the
         changeset arm of `push_candidate_unresolvable` are an operator's
         changeset, which has no roadmap task by construction — and their remedy
-        needs none: the stale record is a session pointer, and clearing it
-        rebuilds the round whether or not a task is in flight. Gating those on
+        needs none: the stale record is a session pointer or the round's own
+        payload, and rebuilding it is the same work whether or not a task is in
+        flight. Gating those on
         having a victim to quarantine would leave exactly the three loop-halting
         codes unautomated while the tests passed, because a test seeds
         `state.task_execution` and the real park sites do not.
@@ -10600,7 +10620,16 @@ class Orchestrator:
     # had". That is the direction every unknown falls in: an unrecognised
     # record kind, a missing store, a registry that refuses the move, an
     # unreadable record, a published candidate, a verdict still in flight, a
-    # spent recut cap, a retirement that left residue on disk.
+    # spent recut cap, a retirement that left residue on disk, a queued
+    # changeset missing an identifier, no git gateway to render a packet with,
+    # and a packet that cannot be rendered or that comes back unbindable.
+    #
+    # "Rebuild" is not a synonym for "discard", and the two live in one place
+    # each. `_replace_outbox` is the only way any of them swaps the payload, so
+    # a displaced packet's chunking leftovers cannot ride onto the next request;
+    # and the ONE handler whose record turned out to be the packet rather than
+    # the queue entry (`_rebuild_changeset_packet_at_head`) keeps what an
+    # operator queued and rebuilds around it.
 
     def _autonomous_rebuild(self, plan, blocker, *, code: str) -> bool:
         """Archive `plan`'s stale record, rebuild at the current head and leave
@@ -10623,7 +10652,7 @@ class Orchestrator:
         if record == STALE_PUSH_BINDING:
             return self._discard_stale_push_binding(task_id, code=code)
         if record == STALE_QUEUED_REVIEW:
-            return self._discard_unbindable_changeset(code=code)
+            return self._rebuild_changeset_packet_at_head(code=code)
         if record == STALE_AUDIT_POINTER:
             return self._discard_audit_pointer(code=code)
         if record == STALE_SESSION_ROUND:
@@ -10792,7 +10821,7 @@ class Orchestrator:
             },
         )
         state.last_response = None
-        state.outbox = (
+        self._replace_outbox(state, (
             f"REBUILT AT HEAD — task {task_id} is back in the queue.\n\n"
             f"Its recorded base {discarded_base[:12] or '(none)'} had fallen "
             "behind the branch head and the reviewed candidate "
@@ -10809,7 +10838,7 @@ class Orchestrator:
             "after that the task parks for a human instead of being cut again. "
             "Its next `implement` starts from the CURRENT head with an empty "
             "tree."
-        )
+        ))
         state.phase = Phase.READY.value
         return True
 
@@ -10830,6 +10859,17 @@ class Orchestrator:
         The changeset arm names no task at all. There the binding lives on the
         queued review, so that is what goes — with its identifiers written to
         the transcript first, because an operator queued it.
+
+        **Why THIS handler drops the queued changeset while
+        `_rebuild_changeset_packet_at_head` preserves it**, since the two sit a
+        page apart and look like the same decision made twice. They are not the
+        same case. There the packet is stale and the candidate is fine, so a
+        packet can be rebuilt around it. Here the park is
+        `push_candidate_unresolvable` raised by `_dispatch_changeset_push`: the
+        reviewed candidate does not resolve in this repository at all, so no
+        packet can be rendered from it and no approval to one could ever be
+        published. Dropping it is the only truthful action left, and it is what
+        an operator does with a commit that is gone.
 
         Returns False when there was nothing to drop and no task to attribute
         the drop to: re-dispatching without having changed anything is theatre
@@ -10871,7 +10911,7 @@ class Orchestrator:
         )
         state.last_response = None
         subject = f"task {task_id}" if task_id else "the queued changeset review"
-        state.outbox = (
+        self._replace_outbox(state, (
             f"STALE APPROVAL BINDING DISCARDED — {subject}.\n\n"
             "The reviewed candidate an approval named is no longer this task's "
             "current candidate, or no longer resolves at all, so the loop "
@@ -10879,49 +10919,150 @@ class Orchestrator:
             "Nothing was pushed and no execution record was archived: the "
             "candidate on disk, if there is one, is untouched.\n\n"
             "Re-review the current state before approving again."
-        )
+        ))
         state.phase = Phase.READY.value
         return True
 
-    def _discard_unbindable_changeset(self, *, code: str) -> bool:
-        """`changeset_binding_missing`: drop the queued changeset review whose
-        packet cannot carry the four identifiers an approval binds by.
+    def _rebuild_changeset_packet_at_head(self, *, code: str) -> bool:
+        """`changeset_binding_missing`: KEEP the operator's queued changeset and
+        rebuild a BINDABLE review packet for it, from the immutable git objects
+        as they stand now, so the very next round presents the same candidate
+        under a binding an approval can still resolve.
 
         The one code here that halts the loop INDEFINITELY rather than costing
         it a round: it is raised inside `_step_ready` before anything is sent,
         so for as long as the queue entry stands every future round refuses at
-        the same line. Dropping it is exactly what an operator does.
+        the same line.
 
-        **`state.outbox` is deliberately left alone**, unlike every other
-        rebuild. This park happens after `_step_ready` has already checked the
-        outbox is present, and that payload is the operator's — replacing it
-        with a report would discard the packet in order to explain that the
-        packet could not be sent.
+        **The stale record here is the PACKET, never the queue entry** — and an
+        earlier cut of this change had that exactly backwards. It cleared
+        `state.changeset` and left `state.outbox` alone, arguing that the payload
+        was the operator's. The argument was false and the consequence was the
+        thing this whole feature exists to avoid:
 
-        The identifiers go to the transcript BEFORE the clear. An operator's
-        explicit `review-changeset` must not evaporate with nothing saying so;
-        the blocker record carries the candidate and the missing fields, and
-        this carries the whole queued record.
+          * FALSE, because the queued packet always binds. `changeset_review.
+            build_changeset_packet` stamps branch / dest_ref / base_sha /
+            candidate_sha as literal labelled lines whatever body it is given,
+            and `review-changeset` sets no `outbox_diff`, so `_plan_delivery`
+            returns at its first line (`not diff`) and cannot rewrite the
+            payload. This fault is therefore only ever raised when `state.outbox`
+            is NOT that packet: a corrective re-prompt, a plan request, a task
+            review packet queued later in the same session, a hand-edited state
+            file.
+          * The CONSEQUENCE, because dropping the queue entry left that other
+            payload to be sent as an ordinary unbound request, and with
+            `state.changeset` gone no approval to it — or to anything after it —
+            could ever publish the candidate. The operator's review intent was
+            discarded rather than rebuilt at the current head, which is a park
+            performed instead of avoided.
+
+        So the queue entry is preserved untouched and the packet is rebuilt
+        around it. That is the park's own remedy — its text says to re-queue with
+        `review-changeset`, "its default rendering always includes the four
+        identifiers" — performed rather than requested, exactly as
+        `_discard_audit_pointer` performs its own.
+
+        **The four identifiers come ONLY from the stored entry.** Re-deriving
+        them by calling `build_changeset_binding` again would look like reuse and
+        is the dangerous move: it reads `git.current_branch()`, so a checkout
+        that has since switched branches would rebind the operator's candidate to
+        a destination they never named. Nothing here asks git what branch it is
+        on; the packet is re-rendered for the pinned base/candidate pair and
+        nothing else. `candidate_tree_sha` rides along as stored and is not used
+        by the rendering — `_current_pending_changeset` re-derives it from the
+        commit object at bind time, as it always has.
+
+        **Verified before it is dispatched.** The rebuilt payload is put through
+        the same four-literal test `_step_ready` will apply, and a packet that
+        fails it refuses rather than being sent: re-dispatching into the
+        identical fault would spend the round to arrive back here, which is the
+        livelock this must not buy.
+
+        Every other outcome is a refusal, and a refusal parks exactly as the loop
+        parks today: no queued changeset, a queue entry missing one of the four
+        identifiers (unreachable from the producer's own gate, which requires a
+        `candidate_sha`, but checked because a hand-edited state file is not),
+        no git gateway to render with, a render that raises, a rebuilt packet
+        that still does not carry the identifiers.
         """
         state = self.state
         queued = state.changeset
-        if not queued:
+        if not isinstance(queued, dict) or not queued:
             # Nothing queued means nothing stale — and this code cannot be
             # raised without one, so reaching here at all is a state nobody
             # wrote. Park.
             return self._refuse_rebuild(code, "no changeset is queued")
+        identifiers = {}
+        for name in CHANGESET_BINDING_FIELDS:
+            value = queued.get(name)
+            if not isinstance(value, str) or not value:
+                return self._refuse_rebuild(
+                    code, f"the queued changeset carries no {name}"
+                )
+            identifiers[name] = value
+        if self._git is None:
+            # A packet rendered from something other than the repository would
+            # be a review request the reviewer cannot see the change in, and an
+            # approval to it would publish a candidate nobody was shown.
+            return self._refuse_rebuild(
+                code, "this loop has no git gateway to re-render the packet with"
+            )
+        binding = ChangesetBinding(
+            base_sha=identifiers["base_sha"],
+            candidate_sha=identifiers["candidate_sha"],
+            candidate_tree_sha=str(queued.get("candidate_tree_sha") or ""),
+            branch=identifiers["branch"],
+            dest_ref=identifiers["dest_ref"],
+            packet_sha256="",
+        )
+        try:
+            packet_text = build_changeset_packet(self._git, binding)
+            rebuilt = TEMPLATES["changeset_review"].render(
+                branch=binding.branch, dest_ref=binding.dest_ref, packet=packet_text
+            )
+        except (GitError, TemplateError, OSError) as exc:
+            # A candidate an operator has since rewritten out of the repository
+            # renders nothing, and a park handler is the one place a second
+            # failure has nowhere to go: raising here would take the process
+            # down instead of parking on the question it already has.
+            return self._refuse_rebuild(
+                code, f"the packet could not be re-rendered ({type(exc).__name__}: {exc})"
+            )
+        absent = [name for name in CHANGESET_BINDING_FIELDS if identifiers[name] not in rebuilt]
+        if absent:
+            return self._refuse_rebuild(
+                code, f"the re-rendered packet still does not carry {', '.join(absent)}"
+            )
+        displaced = state.outbox or ""
         self._log(
             "autonomous_rebuild",
             data={
                 "code": code,
                 "task_id": NO_TASK,
                 "stale_record": STALE_QUEUED_REVIEW,
-                "discarded_changeset": (
-                    dict(queued) if isinstance(queued, dict) else str(queued)
-                ),
+                # The queued record is KEPT, so this names what the packet was
+                # rebuilt FOR rather than what was thrown away.
+                "rebound_changeset": dict(queued),
+                # The displaced payload is IDENTIFIED, not copied: a review
+                # packet can carry a whole diff, and the length plus the digest
+                # pin the exact text without duplicating it into a log read line
+                # by line. The head is what makes it recognisable to a human.
+                "displaced_outbox_chars": len(displaced),
+                # `errors="replace"`, because a payload can carry lone
+                # surrogates: `git_gateway.tree_entries` decodes paths with
+                # `surrogateescape` and a packet rendered over one reaches here
+                # unchanged. A strict encode would raise UnicodeEncodeError
+                # inside a park handler, which is the one place a second failure
+                # has nowhere to go — a crash instead of a park, for a log line.
+                "displaced_outbox_sha256": hashlib.sha256(
+                    displaced.encode("utf-8", "replace")
+                ).hexdigest(),
+                "displaced_outbox_head": displaced[:DISPLACED_OUTBOX_LOG_CHARS],
+                "packet_chars": len(rebuilt),
             },
         )
-        state.changeset = None
+        self._replace_outbox(state, rebuilt)
+        state.last_response = None
         state.phase = Phase.READY.value
         return True
 
@@ -10949,14 +11090,14 @@ class Orchestrator:
         )
         state.current_task = None
         state.last_response = None
-        state.outbox = (
+        self._replace_outbox(state, (
             "AUDIT POINTER DISCARDED — that `revise` named an audit this "
             "session has no record of, so there was nothing to revise and "
             "nothing was executed.\n\n"
             "The loop cleared the stale pointer rather than parking for an "
             "operator. Send `audit` to cut a fresh audit at the current head, "
             "or pick up the roadmap with any other decision."
-        )
+        ))
         state.phase = Phase.READY.value
         return True
 
@@ -11009,7 +11150,7 @@ class Orchestrator:
         )
         state.last_response = None
         state.pending_request = None
-        state.outbox = (
+        self._replace_outbox(state, (
             "ROUND REBUILT — the loop's own bookkeeping for the last round was "
             "inconsistent, so that round was discarded and this one is built "
             "fresh from the current head.\n\n"
@@ -11017,9 +11158,35 @@ class Orchestrator:
             "repositories and every committed candidate are exactly where they "
             "were. If a request was in flight, its reply will not be read — "
             "re-state any verdict you were about to give."
-        )
+        ))
         state.phase = Phase.READY.value
         return True
+
+    @staticmethod
+    def _replace_outbox(state: LoopState, payload: str) -> None:
+        """Make `payload` the WHOLE of the next request, dropping the delivery
+        leftovers of the packet it displaces (halt-03).
+
+        `outbox_diff` and `outbox_attachment` describe the payload being
+        REPLACED. `_plan_delivery` already refuses a stored diff that is not
+        inside the payload it is planning, but the ATTACHMENT has no such check:
+        `_step_ready` writes it near the top of the step and moves it onto the
+        request at the bottom, and every rebuild here parks in between — so a
+        path left in state would be attached to the NEXT request, presenting one
+        change's diff as another's under a `report_sha256` that does not cover
+        it. That is the substitution the comment at that line exists to prevent,
+        and every handler that swaps the outbox goes through here so that none of
+        them has to remember it separately.
+
+        Clearing `outbox_diff` is also what keeps a rebuilt packet from being
+        rewritten out from under its own verification: `_plan_delivery` runs
+        BEFORE the binding check on the next step, and with no stored diff it
+        returns at its first line — so the payload `_rebuild_changeset_packet_
+        at_head` proved bindable is the payload that step binds.
+        """
+        state.outbox = payload
+        state.outbox_diff = None
+        state.outbox_attachment = None
 
     def _refuse_rebuild(self, code: str, reason: str) -> bool:
         """Say in the transcript why a rebuild did not happen, and return False

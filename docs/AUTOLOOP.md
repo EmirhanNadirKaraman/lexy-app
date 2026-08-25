@@ -6851,7 +6851,7 @@ dispatches on.
 | `push_candidate_unresolvable` | the approval binding | Same. Its second producer — the changeset push — names no task, and there the queued changeset goes instead. |
 | `state_inconsistent` | the loop's own half-finished round | Drops `last_response` and `pending_request` and rebuilds the round at `ready`. |
 | `audit_revise_no_record` | `state.current_task` | Drops the pointer and asks the reviewer for a fresh `audit`, which mints a unit at the current head by construction. |
-| `changeset_binding_missing` | `state.changeset` | Drops the queue entry that can never bind. The outbox is left alone — it is the operator's packet. |
+| `changeset_binding_missing` | the PACKET in `state.outbox`, never the queue entry | Keeps `state.changeset` and re-renders the review packet for it from the immutable git objects, so the next round presents the same candidate under a binding an approval can resolve. |
 
 **Nothing new archives anything.** The one destructive step goes through the
 path recut-01 already built, so it inherits recut-01's five refusals rather than
@@ -6912,13 +6912,81 @@ kinds and True for everything else, including every halt-02 action. Left as it
 was, the three loop-halting codes would have stayed unautomated while a test
 suite that seeds `state.task_execution` passed.
 
-**`changeset_binding_missing` is the one that halts the loop indefinitely.** It
-is raised inside `_step_ready` before anything is sent, so for as long as the
-queue entry stands every future round refuses at the same line. The other five
-cost a round. Dropping the entry is what an operator does — and because there is
-no on-disk form to archive, the WHOLE queued record goes to the transcript
-first, so an explicit `review-changeset` can never evaporate with nothing saying
-so.
+**`changeset_binding_missing` is the one that halts the loop indefinitely, and
+the one whose stale record is the PACKET rather than the record it names.** It is
+raised inside `_step_ready` before anything is sent, so for as long as the
+payload stands every future round refuses at the same line; the other five cost a
+round.
+
+The first cut of this feature dropped `state.changeset` and left the outbox
+alone, on the ground that the payload was the operator's. That ground was false
+and the consequence was the failure this whole section exists to avoid:
+
+* FALSE, because a freshly queued packet always binds.
+  `changeset_review.build_changeset_packet` stamps `branch`, `dest_ref`,
+  `base_sha` and `candidate_sha` as literal labelled lines whatever body it is
+  given, and `review-changeset` sets no `outbox_diff`, so `_plan_delivery`
+  returns at its first line and cannot rewrite the payload. The fault is
+  therefore only reachable once something ELSE holds the outbox — a corrective
+  re-prompt, a plan request, a task review packet queued later in the same
+  session, a hand-edited state file.
+* The CONSEQUENCE, because dropping the queue entry left that other payload to be
+  sent as an ordinary unbound request, and with `state.changeset` gone no
+  approval — to it or to anything after it — could publish the candidate. The
+  operator's review intent was discarded rather than rebuilt: a park performed
+  instead of avoided.
+
+So `_rebuild_changeset_packet_at_head` keeps the queue entry untouched and
+rebuilds the packet around it, which is the park's own remedy ("re-queue with
+`review-changeset`, its default rendering always includes the four identifiers")
+performed rather than requested. Three properties make that safe to automate:
+
+* **The four identifiers come only from the stored entry.** Calling
+  `build_changeset_binding` again would look like reuse and is the dangerous
+  move: it reads `git.current_branch()`, so a checkout that has since switched
+  branches would rebind the operator's candidate to a destination they never
+  named. Nothing in the rebuild asks git what branch it is on.
+* **The rebuilt packet is verified before it is dispatched**, against the same
+  four-literal test `_step_ready` will apply. A packet that fails it refuses
+  rather than being sent — re-dispatching into the identical fault is the
+  livelock this must not buy.
+* **Everything else refuses**, and a refusal parks exactly as the loop parks
+  today: no queued changeset, an entry missing one of the four identifiers, no
+  git gateway to render with, a render that raises (an operator who has rewritten
+  the candidate out of the repository), a rebuilt packet that still does not
+  carry the identifiers.
+
+**What it costs, stated rather than left to be found.** The displaced payload is
+gone — identified in the transcript by length, sha256 and its opening
+characters, but not carried anywhere, because `LoopState` has no second outbox.
+Where that payload was a task review packet, that task's candidate stays
+committed on disk with its execution record and is re-presented by a later round
+rather than by this one. And a changeset the reviewer never approves now
+re-presents itself instead of being dropped once. Be precise about what bounds
+that, because the retry budget mostly does not: inside a live `run()` a
+completed step closes the recovered blocker, so the next occurrence gets a fresh
+allowance — the budget only bites for a second occurrence with no completed step
+between, and across a restart, where the record is still open. What actually
+bounds the repetition is that each round genuinely ASKS: the reviewer sees the
+changeset packet and can `push` it (which publishes and clears the queue entry)
+or `stop`, and the loop's own iteration budget is the ceiling. Both costs are
+the trade this direction buys: the loop halting for ever on a packet nobody can
+bind was the alternative.
+
+`push_candidate_unresolvable`'s changeset arm still DROPS the queue entry, and
+that is a different case rather than the same decision made twice: there the
+reviewed candidate does not resolve in the repository at all, so no packet can be
+rendered from it and no approval could ever publish it. Dropping is the only
+truthful action left.
+
+**Nothing that swaps the outbox leaves the old packet's delivery state behind.**
+Every rebuild goes through `_replace_outbox`, which clears `outbox_diff` and
+`outbox_attachment` with it. `_plan_delivery` already refuses a stored diff that
+is not inside the payload it is planning, but the ATTACHMENT has no such check —
+`_step_ready` writes it near the top of the step and moves it onto the request at
+the bottom, and every rebuild parks in between, so a path left in state would be
+attached to the NEXT request: one change's diff presented as another's, under a
+`report_sha256` that does not cover it.
 
 **Every refusal is loud.** `_to_needs_user` cannot rewrite the park's own
 question from inside itself, so a rebuild that refuses lands on the park the loop
@@ -6931,9 +6999,10 @@ what was discarded, including the archive and quarantine paths).
 **The five hard halts are unchanged and still unreachable.** They are refused by
 `blockers.autonomous_recovery` before the table is consulted at all, so growing
 the table cannot reach them; `test_stale_record_rebuild.py` re-asserts the
-disjointness against the MERGED table. Pinned there, and by the two AST checks
-that read the `task_base_behind_head` and `state_inconsistent` park sites to
-confirm they still pass the arguments the tests replay.
+disjointness against the MERGED table. Pinned there, and by the three AST checks
+that read the `task_base_behind_head`, `state_inconsistent` and
+`changeset_binding_missing` park sites to confirm they still pass the arguments
+the tests replay.
 
 ### 9d. Retired: superseded work is not blocked work
 

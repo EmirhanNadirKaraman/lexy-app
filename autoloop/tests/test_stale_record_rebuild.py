@@ -10,8 +10,17 @@ The one claim under test, stated as the loop has to satisfy it:
     no operator step. With the flag off every one of them parks exactly as it
     did before, and the five hard halts are unreachable from any of it.
 
-Three things about the shape of this file, because they are the three ways a
-test suite for this could look convincing and prove nothing:
+"Archives the stale record" is exact for five of the six and precise about the
+sixth: `changeset_binding_missing`'s stale record is the PACKET in
+`state.outbox`, not the queued review it stands in front of, so that one keeps
+`state.changeset` and rebuilds the packet around it. Dropping the queue entry —
+what the first cut of this feature did — sent the unbindable payload unbound and
+left the operator's candidate unpublishable for the rest of the session, which
+is a review discarded rather than rebuilt. `ChangesetWiring` below exists to
+prove the redispatched request is bound and an approval to it still publishes.
+
+Four things about the shape of this file, because they are the ways a test suite
+for this could look convincing and prove nothing:
 
 * **The task-free half is tested with no task in flight.** Three of the six
   codes carry no task and never could — `state_inconsistent` is the loop's own
@@ -30,6 +39,10 @@ test suite for this could look convincing and prove nothing:
   that archived a published candidate, or one whose verdict was still in
   flight, would satisfy "no operator step" while destroying approvable work —
   that is the failure this feature is one mistake away from.
+* **The default-off tests discriminate on what the rebuild CHANGES.** Three of
+  them originally keyed on `state.changeset is not None`, which the changeset
+  rebuild now preserves on the success path too — so they would have gone
+  vacuous and stayed green whatever the flag did. They key on the outbox.
 
 Self-contained per this codebase's convention (see `test_blockers.py`) — the
 config/orchestrator helpers are duplicated here rather than imported from
@@ -39,6 +52,7 @@ config/orchestrator helpers are duplicated here rather than imported from
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
 import json
 import subprocess
@@ -47,6 +61,7 @@ from pathlib import Path
 import pytest
 
 from autoloop import cli
+from autoloop.changeset_review import build_changeset_binding, build_changeset_packet
 from autoloop.blockers import (
     AUTONOMOUS_RECOVERIES,
     HARD_HALT_CODES,
@@ -69,11 +84,19 @@ from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import (
     AUTONOMOUS_REBUILD_RETIREMENT_REASON,
+    CHANGESET_BINDING_FIELDS,
+    DISPLACED_OUTBOX_LOG_CHARS,
     MAX_TASK_RECUTS,
     Orchestrator,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
-from autoloop.state import LoopState, PendingRequest, Phase, StateStore
+from autoloop.prompts import TEMPLATES
+from autoloop.publisher import (
+    Publisher,
+    provision_publisher_repo,
+    read_publisher_url_snapshot,
+)
+from autoloop.state import LastResponse, LoopState, PendingRequest, Phase, StateStore
 from autoloop.tasks import (
     HOLD_ORIGIN_OPERATOR,
     Task,
@@ -232,10 +255,10 @@ def run_git(cwd, *args):
     ).stdout
 
 
-def make_repo(tmp_path: Path) -> Path:
-    repo_root = tmp_path / "repo"
+def make_repo(tmp_path: Path, *, branch="main", name="repo") -> Path:
+    repo_root = tmp_path / name
     repo_root.mkdir(parents=True, exist_ok=True)
-    run_git(repo_root, "init", "-q", "-b", "main")
+    run_git(repo_root, "init", "-q", "-b", branch)
     run_git(repo_root, "config", "user.email", "test@example.com")
     run_git(repo_root, "config", "user.name", "Test")
     run_git(repo_root, "config", "commit.gpgsign", "false")
@@ -338,6 +361,136 @@ class RealWiring:
             task_id="t1",
             detail=f"base={self.base_sha} head={self.head_sha} review_round=1",
         )
+
+
+# =============================================================================
+# helpers — a real operator changeset, for the one rebuild that re-renders a
+# packet from git objects
+# =============================================================================
+
+
+class ChangesetWiring:
+    """An operator changeset queued exactly as `cli._cmd_review_changeset`
+    queues one, on a real repository, with a real Publisher behind it.
+
+    Real git and a real publisher because the claim being tested is not "a dict
+    survived": it is that the REDISPATCHED request still carries a changeset
+    binding and that an approval to it publishes the same candidate with nobody
+    intervening. Only the actual `_step_ready` → `_step_executing` path can show
+    that, and both ends of it read the repository.
+
+    `branch` is deliberately not `main`: `build_changeset_binding` refuses a
+    protected branch, and `PolicyConfig.protected_branches` holds main/master by
+    default.
+
+    `with_publisher` DEFAULTS OFF and one test turns it on. Provisioning a
+    publisher clones the repository, and only the end-to-end test publishes
+    anything — every other test here stops at the rebuild. Paid where it buys
+    something, per this suite's own "nothing here can publish" rule.
+    """
+
+    def __init__(self, tmp_path, *, enabled=True, with_publisher=False,
+                 branch="feature/x", max_recovery_attempts=2,
+                 with_blocker_store=True, tasks=()):
+        self.repo_root = make_repo(tmp_path, branch=branch)
+        self.config = make_config(
+            tmp_path, enabled=enabled, max_recovery_attempts=max_recovery_attempts
+        )
+        self.policy = PolicyEngine(self.config.policy)
+        self.git = GitGateway(self.repo_root, self.policy)
+        self.base_sha = self.git.head_sha()
+        (self.repo_root / "operator.md").write_text("hand-authored\n", encoding="utf-8")
+        run_git(self.repo_root, "add", "-A")
+        run_git(self.repo_root, "commit", "-q", "-m", "operator's own change")
+        self.candidate_sha = self.git.head_sha()
+
+        self.upstream = None
+        publisher = None
+        publisher_url_snapshot = None
+        if with_publisher:
+            self.upstream = tmp_path / "bare.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(self.upstream)], check=True)
+            run_git(self.repo_root, "remote", "add", "origin", str(self.upstream))
+            publisher_state_dir = tmp_path / "publisher-state"
+            publisher_repo = provision_publisher_repo(
+                publisher_state_dir, self.git, "origin"
+            )
+            publisher = Publisher(publisher_repo, "origin", PolicyEngine(self.config.policy))
+            publisher_url_snapshot = read_publisher_url_snapshot(publisher_state_dir)
+
+        self.binding = build_changeset_binding(
+            self.git, self.policy, self.base_sha, self.candidate_sha
+        )
+        self.queued = dataclasses.asdict(self.binding)
+        self.state = LoopState.new(URL)
+        self.state.changeset = dict(self.queued)
+        # THE state this fault is actually raised in: the queued packet always
+        # binds (`build_changeset_packet` stamps all four identifiers and
+        # `review-changeset` sets no `outbox_diff`), so `changeset_binding_
+        # missing` can only be reached once something else has taken the outbox.
+        # A corrective re-prompt is the commonest way.
+        self.state.outbox = (
+            "Your last reply could not be parsed: unexpected field 'notes'. "
+            "Re-send the same verdict in the documented shape."
+        )
+        self.state.phase = Phase.READY.value
+        self.store = StateStore(self.config.state_file)
+        self.store.save(self.state)
+        self.registry = TaskRegistry([
+            Task(id=tid, title=f"Title {tid}", description="d",
+                 approved_paths=("a.py",))
+            for tid in tasks
+        ])
+        self.task_store = TaskStore(self.config.tasks_file)
+        self.task_store.save(self.registry)
+        self.blocker_store = (
+            BlockerStore(self.config.blockers_dir) if with_blocker_store else None
+        )
+        self.orch = Orchestrator(
+            config=self.config,
+            store=self.store,
+            state=self.state,
+            policy=self.policy,
+            git=self.git,
+            executor=None,
+            transcript=TranscriptLogger(self.config.transcript_file),
+            client_factory=None,
+            registry=self.registry,
+            task_store=self.task_store,
+            manifest_store=ManifestStore(self.config.manifests_dir),
+            blocker_store=self.blocker_store,
+            publisher=publisher,
+            publisher_url_snapshot=publisher_url_snapshot,
+        )
+
+    def park_as_the_site_does(self, missing="base_sha"):
+        """`_step_ready`'s own arguments for `changeset_binding_missing` — see
+        that site. `test_the_changeset_park_site_still_passes_the_arguments_this
+        _fixture_replays` keeps this honest."""
+        self.orch._to_needs_user(
+            "a changeset review is queued but its packet does not contain "
+            f"{missing} as literal text, so the approval could never be bound to "
+            "the candidate. Nothing was sent. Re-queue with `review-changeset` "
+            "(its default rendering always includes the four identifiers) or add "
+            "them to your --packet body.",
+            kind="loop_fatal",
+            code="changeset_binding_missing",
+            detail=f"candidate={self.candidate_sha[:12]} missing={missing}",
+        )
+
+    def stamped_push_reply(self, req) -> str:
+        """The literal text a well-behaved approval sends: a `push` echoing
+        exactly the three stamps this request carried."""
+        return json.dumps({
+            "version": 3,
+            "decision": "push",
+            "reason": "approved the operator changeset",
+            "reviewed": {
+                "request_id": req.request_id,
+                "head_sha": req.head_sha,
+                "report_sha256": req.report_sha256,
+            },
+        })
 
 
 # =============================================================================
@@ -475,6 +628,24 @@ def test_with_the_flag_off_the_execution_record_is_left_on_disk(tmp_path):
     )
 
 
+def test_with_the_flag_off_the_unbindable_packet_is_left_for_the_operator(tmp_path):
+    """The off position for `changeset_binding_missing`, against a REAL queued
+    changeset. The parametrized test above covers all six codes with a
+    collaborator-free orchestrator, where this one code would refuse for want of
+    a git gateway whatever the flag said — so the off position for it is asserted
+    here, where the rebuild would otherwise have succeeded."""
+    wiring = ChangesetWiring(tmp_path, enabled=False)
+    displaced = wiring.state.outbox
+
+    wiring.park_as_the_site_does()
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.park_kind == "loop_fatal"
+    assert wiring.orch.state.outbox == displaced
+    assert wiring.orch.state.changeset == wiring.queued
+    assert "autonomous_rebuild" not in transcript_types(wiring.config)
+
+
 # =============================================================================
 # 3. the six rebuilds
 # =============================================================================
@@ -602,33 +773,207 @@ def test_push_candidate_unresolvable_on_the_changeset_arm_drops_the_queued_revie
     assert entry["discarded_changeset"]["dest_ref"] == "refs/heads/main"
 
 
-def test_changeset_binding_missing_drops_the_queue_entry_and_keeps_the_outbox(tmp_path):
+def test_changeset_binding_missing_rebuilds_the_packet_and_keeps_the_queue_entry(
+    tmp_path
+):
     """The one code that halts the loop INDEFINITELY: it is raised inside
     `_step_ready` before anything is sent, so every future round refuses at the
-    same line for as long as the queue entry stands.
+    same line for as long as the payload stands.
 
-    The outbox is the operator's packet and is left exactly as it stands —
-    replacing it with a report would discard the packet in order to explain
-    that the packet could not be sent."""
-    orch, config, _, _, _ = build(tmp_path, enabled=True, in_flight=None)
-    orch.state.phase = Phase.READY.value
-    orch.state.outbox = "the operator's own changeset packet"
-    orch.state.changeset = {
-        "candidate_sha": "c0ffee", "base_sha": "ba5e",
-        "branch": "main", "dest_ref": "refs/heads/main",
+    **The stale record is the PACKET, not the queue entry**, and the first cut of
+    this change had it the other way round. The queued packet always binds —
+    `build_changeset_packet` stamps all four identifiers whatever body it is
+    given, and `review-changeset` sets no `outbox_diff`, so `_plan_delivery`
+    returns at its first line and cannot rewrite it — so this fault can only be
+    raised once something ELSE holds the outbox. Dropping the entry and keeping
+    that payload sent it unbound and left the operator's candidate unpublishable
+    for the rest of the session: the review discarded, not rebuilt."""
+    wiring = ChangesetWiring(tmp_path)
+    displaced = wiring.state.outbox
+
+    wiring.park_as_the_site_does()
+
+    assert wiring.orch.state.phase == Phase.READY.value
+    assert wiring.orch.state.question is None
+    assert wiring.orch.state.park_blocker_id is None
+    # PRESERVED, byte for byte: the operator's review is still queued.
+    assert wiring.orch.state.changeset == wiring.queued
+    # REBUILT: the payload is now exactly what `review-changeset` would have
+    # rendered for this binding at this head, so all four identifiers are back.
+    expected = TEMPLATES["changeset_review"].render(
+        branch=wiring.binding.branch,
+        dest_ref=wiring.binding.dest_ref,
+        packet=build_changeset_packet(wiring.git, wiring.binding),
+    )
+    assert wiring.orch.state.outbox == expected
+    assert wiring.orch.state.outbox != displaced
+    for name in CHANGESET_BINDING_FIELDS:
+        assert wiring.queued[name] in wiring.orch.state.outbox
+    entry = transcript_entries(wiring.config, "autonomous_rebuild")[0]
+    assert entry["stale_record"] == STALE_QUEUED_REVIEW
+    assert entry["rebound_changeset"]["candidate_sha"] == wiring.candidate_sha
+    # The displaced payload is identified rather than copied.
+    assert entry["displaced_outbox_chars"] == len(displaced)
+    assert entry["displaced_outbox_head"] == displaced[:DISPLACED_OUTBOX_LOG_CHARS]
+
+
+def test_the_redispatched_request_binds_and_its_approval_publishes_that_candidate(
+    tmp_path
+):
+    """THE claim, end to end and with nobody intervening: after the rebuild the
+    next request carries a changeset binding again, and a stamped approval to it
+    publishes exactly the candidate the operator queued.
+
+    A rebuild that merely left a dict in `state.changeset` would satisfy every
+    assertion in the test above and still be useless — the binding is only real
+    if `_current_pending_changeset` can take it off the payload and
+    `_dispatch_changeset_push` can act on it.
+
+    `_step_ready` is called by hand twice, rather than driving `run()`, because
+    this suite has no transport: the first call raises the fault from its own
+    site and the rebuild answers it, the second is the round that rebuild made
+    possible. `run()` would step the same two phases and then try to submit.
+
+    The one test in this file that provisions a Publisher, because it is the one
+    that publishes."""
+    wiring = ChangesetWiring(tmp_path, with_publisher=True)
+
+    wiring.orch._step_ready()  # raises `changeset_binding_missing` -> rebuild
+
+    assert wiring.orch.state.phase == Phase.READY.value
+    assert wiring.orch.state.pending_request is None  # nothing was sent unbound
+    assert wiring.orch.state.changeset == wiring.queued
+
+    wiring.orch._step_ready()  # the round the rebuild bought
+
+    req = wiring.orch.state.pending_request
+    assert req is not None and req.changeset is not None
+    assert req.changeset.candidate_sha == wiring.candidate_sha
+    assert req.changeset.dest_ref == wiring.binding.dest_ref
+
+    wiring.orch.state.last_response = LastResponse(
+        request_id=req.request_id,
+        raw=wiring.stamped_push_reply(req),
+        received_at="now",
+        head_sha=req.head_sha,
+        base_sha=req.base_sha,
+        report_sha256=req.report_sha256,
+        changeset=req.changeset,
+    )
+    wiring.orch._step_executing()
+
+    assert wiring.orch.state.phase == Phase.READY.value
+    landed = run_git(wiring.upstream, "rev-parse", wiring.binding.dest_ref).strip()
+    assert landed == wiring.candidate_sha
+    assert wiring.orch.state.changeset is None  # cleared by the publish itself
+    # NO OPERATOR STEP: the record was written and never answered.
+    blockers = wiring.blocker_store.all_blockers()
+    assert [b.code for b in blockers] == ["changeset_binding_missing"]
+    assert blockers[0].answer is None and blockers[0].resolved_at is None
+
+
+def test_a_queued_changeset_missing_an_identifier_is_refused_not_guessed(tmp_path):
+    """The fail-open this must never take: `build_changeset_binding` would happily
+    supply a `branch`/`dest_ref` by reading `git.current_branch()`, so a checkout
+    that has since moved would rebind the operator's candidate to a destination
+    they never named. The four identifiers come off the stored entry or the
+    rebuild refuses."""
+    wiring = ChangesetWiring(tmp_path)
+    wiring.state.changeset = {
+        key: value for key, value in wiring.queued.items() if key != "dest_ref"
     }
 
-    orch._to_needs_user("a changeset review is queued but its packet does not "
-                        "contain base_sha as literal text",
-                        kind="loop_fatal", code="changeset_binding_missing",
-                        detail="candidate=c0ffee missing=base_sha")
+    wiring.park_as_the_site_does(missing="dest_ref")
 
-    assert orch.state.phase == Phase.READY.value
-    assert orch.state.changeset is None
-    assert orch.state.outbox == "the operator's own changeset packet"
-    entry = transcript_entries(config, "autonomous_rebuild")[0]
-    assert entry["stale_record"] == STALE_QUEUED_REVIEW
-    assert entry["discarded_changeset"]["candidate_sha"] == "c0ffee"
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.park_kind == "loop_fatal"
+    reasons = transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    assert reasons and reasons[0]["reason"] == "the queued changeset carries no dest_ref"
+    assert "autonomous_rebuild" not in transcript_types(wiring.config)
+
+
+def test_a_candidate_that_no_longer_renders_parks_instead_of_raising(tmp_path):
+    """A park handler is the one place a second failure has nowhere to go. A
+    candidate sha that resolves to nothing in this repository must come back as a
+    refusal, not as an exception out of `_to_needs_user`."""
+    wiring = ChangesetWiring(tmp_path)
+    gone = "0" * 39 + "1"
+    wiring.state.changeset = {**wiring.queued, "candidate_sha": gone}
+
+    wiring.park_as_the_site_does()
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    reasons = transcript_entries(wiring.config, "autonomous_rebuild_refused")
+    assert reasons and "could not be re-rendered" in reasons[0]["reason"]
+    # And the operator's queued record is still there to be repaired by hand.
+    assert wiring.orch.state.changeset["candidate_sha"] == gone
+
+
+def test_without_a_git_gateway_the_packet_is_not_invented(tmp_path):
+    """A packet rendered from anything but the repository would be a review
+    request the reviewer cannot see the change in — and an approval to it would
+    publish a candidate nobody was shown."""
+    orch, config, _, _, _ = build(tmp_path, enabled=True, in_flight=None)  # git=None
+    orch.state.phase = Phase.READY.value
+    orch.state.outbox = "a corrective re-prompt"
+    orch.state.changeset = {"candidate_sha": "c", "base_sha": "b",
+                            "branch": "feature/x", "dest_ref": "refs/heads/feature/x"}
+
+    orch._to_needs_user("unbindable", kind="loop_fatal",
+                        code="changeset_binding_missing")
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.outbox == "a corrective re-prompt"
+    reasons = transcript_entries(config, "autonomous_rebuild_refused")
+    assert reasons and "no git gateway" in reasons[0]["reason"]
+
+
+def test_the_rebuilt_packet_does_not_inherit_the_displaced_packets_attachment(
+    tmp_path
+):
+    """`_step_ready` writes `outbox_attachment` near the top of the step and moves
+    it onto the request at the bottom; every rebuild here parks in between. A path
+    left in state would be attached to the NEXT request — one change's diff
+    presented as another's, under a `report_sha256` that does not cover it."""
+    wiring = ChangesetWiring(tmp_path)
+    wiring.state.outbox_diff = "diff --git a/x b/x\n"
+    wiring.state.outbox_attachment = str(tmp_path / "review-diff.patch")
+
+    wiring.park_as_the_site_does()
+
+    assert wiring.orch.state.phase == Phase.READY.value
+    assert wiring.orch.state.outbox_attachment is None
+    assert wiring.orch.state.outbox_diff is None
+
+
+def test_the_changeset_park_site_still_passes_the_arguments_this_fixture_replays(
+    tmp_path
+):
+    """`ChangesetWiring.park_as_the_site_does` replays `_step_ready`'s call. If
+    that site is ever re-classified, given a `task_id`, or made resumable, these
+    tests would go on passing against arguments nothing raises — so the site is
+    read here rather than trusted."""
+    from autoloop import orchestrator as orchestrator_module
+
+    tree = ast.parse(inspect.getsource(orchestrator_module))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "_to_needs_user"
+        and any(
+            kw.arg == "code"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value == "changeset_binding_missing"
+            for kw in node.keywords
+        )
+    ]
+    assert len(calls) == 1, "changeset_binding_missing is raised in exactly one place"
+    passed = {kw.arg for kw in calls[0].keywords}
+    assert "task_id" not in passed, "the site names no task — the fixture assumes so"
+    assert "resume_phase" not in passed, "not resumable — the rebuild sets the phase"
+    kind = next(kw.value.value for kw in calls[0].keywords if kw.arg == "kind")
+    assert kind == "loop_fatal"
 
 
 def test_audit_revise_no_record_drops_the_pointer_and_asks_for_a_fresh_audit(tmp_path):
@@ -680,21 +1025,23 @@ def test_a_task_free_code_is_rebuilt_with_no_task_in_flight(tmp_path, code):
     off when `_autonomous_set_aside_task` found nothing to quarantine, and three
     of the six codes here carry no task and never could — so a suite that seeded
     `state.task_execution` (as every halt-02 test does) would pass against code
-    that leaves exactly the loop-halting codes halting the loop."""
-    orch, config, blocker_store, _, _ = build(tmp_path, enabled=True, in_flight=None)
-    orch.state.phase = Phase.EXECUTING.value
-    orch.state.current_task = {"task_id": "audit"}
-    orch.state.changeset = {"candidate_sha": "cafe", "base_sha": "beef",
-                            "branch": "main", "dest_ref": "refs/heads/main"}
-    orch.state.outbox = "packet"
+    that leaves exactly the loop-halting codes halting the loop.
 
-    orch._to_needs_user(f"stale: {code}", kind="loop_fatal", code=code)
+    Driven off `ChangesetWiring` — a REAL queued changeset on a real repository —
+    rather than a hand-written dict, because `changeset_binding_missing` now
+    re-renders the packet from git objects and a fabricated sha would refuse for
+    a reason that has nothing to do with the gate under test."""
+    wiring = ChangesetWiring(tmp_path)
+    wiring.state.phase = Phase.EXECUTING.value
+    wiring.state.current_task = {"task_id": "audit"}
 
-    assert orch.state.phase == Phase.READY.value, f"{code} was not rebuilt"
-    assert orch.state.park_kind is None
+    wiring.orch._to_needs_user(f"stale: {code}", kind="loop_fatal", code=code)
+
+    assert wiring.orch.state.phase == Phase.READY.value, f"{code} was not rebuilt"
+    assert wiring.orch.state.park_kind is None
     # The fault is still ON THE RECORD — nothing became invisible.
-    assert [b.code for b in blocker_store.all_blockers()] == [code]
-    assert transcript_entries(config, "autonomous_rebuild")[0]["code"] == code
+    assert [b.code for b in wiring.blocker_store.all_blockers()] == [code]
+    assert transcript_entries(wiring.config, "autonomous_rebuild")[0]["code"] == code
 
 
 def test_the_changeset_arm_is_not_captured_by_an_unrelated_task_in_flight(tmp_path):
@@ -761,20 +1108,15 @@ def test_a_task_free_rebuild_never_invents_a_task_to_quarantine(tmp_path):
     """The other half of the same rule: acting without a task must not mean
     acting ON a task. Nothing is set aside, so `run --continuous` keeps every
     task it had."""
-    orch, config, _, task_store, _ = build(tmp_path, enabled=True, in_flight=None,
-                                           tasks=("t1", "t2"))
-    orch.state.phase = Phase.READY.value
-    orch.state.outbox = "packet"
-    orch.state.changeset = {"candidate_sha": "c", "base_sha": "b",
-                            "branch": "main", "dest_ref": "refs/heads/main"}
+    wiring = ChangesetWiring(tmp_path, tasks=("t1", "t2"))
 
-    orch._to_needs_user("unbindable", kind="loop_fatal",
-                        code="changeset_binding_missing")
+    wiring.park_as_the_site_does()
 
-    reloaded = TaskStore(config.tasks_file).load()
+    assert wiring.orch.state.phase == Phase.READY.value  # it really did rebuild
+    reloaded = TaskStore(wiring.config.tasks_file).load()
     assert reloaded.state_of("t1") is TaskState.READY
     assert reloaded.state_of("t2") is TaskState.READY
-    assert orch.state.park_task_id is None
+    assert wiring.orch.state.park_task_id is None
 
 
 def test_a_transport_code_still_needs_a_task_with_nothing_in_flight(tmp_path):
@@ -988,20 +1330,20 @@ def test_an_unknown_record_kind_rebuilds_nothing(tmp_path):
 
 def test_without_a_blocker_store_nothing_is_rebuilt(tmp_path):
     """No durable record means no budget to count and no durable question. The
-    loop parks exactly as it always did."""
-    orch, config, _, _, _ = build(tmp_path, enabled=True, with_store=False,
-                                  in_flight=None)
-    orch.state.phase = Phase.READY.value
-    orch.state.outbox = "packet"
-    orch.state.changeset = {"candidate_sha": "c", "base_sha": "b",
-                            "branch": "main", "dest_ref": "refs/heads/main"}
+    loop parks exactly as it always did.
 
-    orch._to_needs_user("unbindable", kind="loop_fatal",
-                        code="changeset_binding_missing")
+    Discriminated on the OUTBOX, not on `state.changeset`: since the rebuild
+    preserves the queue entry on the success path too, "the changeset is still
+    there" no longer tells the two apart and would have made this test — and the
+    two below it — pass whatever the gate did."""
+    wiring = ChangesetWiring(tmp_path, with_blocker_store=False)
+    displaced = wiring.state.outbox
 
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert orch.state.changeset is not None
-    assert "autonomous_rebuild" not in transcript_types(config)
+    wiring.park_as_the_site_does()
+
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.outbox == displaced  # the packet was NOT rebuilt
+    assert "autonomous_rebuild" not in transcript_types(wiring.config)
 
 
 def test_a_corrupt_blocker_record_raises_rather_than_licensing_a_rebuild(tmp_path):
@@ -1025,37 +1367,29 @@ def test_a_corrupt_blocker_record_raises_rather_than_licensing_a_rebuild(tmp_pat
 def test_a_non_boolean_enabled_is_not_read_as_consent_to_rebuild(tmp_path):
     """A hand-built config is validated by nothing, so the gate is `is not True`
     rather than a truthiness test — `enabled = "no"` is a truthy string."""
-    orch, config, _, _, _ = build(tmp_path, enabled=True, in_flight=None)
-    object.__setattr__(config, "autonomy", AutonomyConfig(enabled="yes"))  # type: ignore[arg-type]
-    orch.state.phase = Phase.READY.value
-    orch.state.outbox = "packet"
-    orch.state.changeset = {"candidate_sha": "c", "base_sha": "b",
-                            "branch": "main", "dest_ref": "refs/heads/main"}
+    wiring = ChangesetWiring(tmp_path)
+    object.__setattr__(wiring.config, "autonomy", AutonomyConfig(enabled="yes"))  # type: ignore[arg-type]
+    displaced = wiring.state.outbox
 
-    orch._to_needs_user("unbindable", kind="loop_fatal",
-                        code="changeset_binding_missing")
+    wiring.park_as_the_site_does()
 
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert orch.state.changeset is not None
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.outbox == displaced
+    assert "autonomous_rebuild" not in transcript_types(wiring.config)
 
 
 def test_a_config_ceiling_of_zero_performs_no_rebuild_at_all(tmp_path):
     """`max_recovery_attempts` is a CEILING on the table, never a floor: at 0 no
     rebuild happens and the loop parks, which is how an operator switches the
     archival off without switching autonomy off."""
-    orch, config, _, _, _ = build(tmp_path, enabled=True, max_recovery_attempts=0,
-                                  in_flight=None)
-    orch.state.phase = Phase.READY.value
-    orch.state.outbox = "packet"
-    orch.state.changeset = {"candidate_sha": "c", "base_sha": "b",
-                            "branch": "main", "dest_ref": "refs/heads/main"}
+    wiring = ChangesetWiring(tmp_path, max_recovery_attempts=0)
+    displaced = wiring.state.outbox
 
-    orch._to_needs_user("unbindable", kind="loop_fatal",
-                        code="changeset_binding_missing")
+    wiring.park_as_the_site_does()
 
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert orch.state.changeset is not None
-    assert "autonomous_rebuild" not in transcript_types(config)
+    assert wiring.orch.state.phase == Phase.NEEDS_USER.value
+    assert wiring.orch.state.outbox == displaced
+    assert "autonomous_rebuild" not in transcript_types(wiring.config)
 
 
 # =============================================================================
@@ -1245,9 +1579,16 @@ def test_the_state_inconsistent_site_still_passes_the_recoverable_veto(tmp_path)
 
 
 def test_nothing_here_can_publish(tmp_path):
-    """A rebuild is an archive-and-requeue and nothing else. The orchestrator is
-    built with no publisher at all in every test above, and the one that
-    archives on disk asserts the record moved rather than a ref."""
+    """A rebuild is an archive-and-requeue and nothing else: no rebuild imports,
+    pushes or re-provisions anything, and the one that archives on disk asserts
+    the record moved rather than a ref.
+
+    The one publish in this file is deliberately NOT a rebuild's doing —
+    `test_the_redispatched_request_binds_and_its_approval_publishes_that_
+    candidate` publishes only after a stamped reviewer approval reaches
+    `_dispatch_changeset_push`, which is the whole point of restoring the
+    binding. That is why `ChangesetWiring` carries a Publisher and this
+    orchestrator has none."""
     wiring = RealWiring(tmp_path)
     assert wiring.orch._publisher is None
 

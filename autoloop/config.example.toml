@@ -402,6 +402,16 @@ test_selection = "reachable"
 # it is cleared, so an operator's queued `review-changeset` can never evaporate
 # with nothing saying so. Any refusal falls through to the park the loop has
 # today, with the question it always had, and says so in the transcript.
+#
+# NOTHING AN OPERATOR QUEUED IS DROPPED TO GET THE LOOP MOVING EITHER.
+# changeset_binding_missing is the one code here whose stale record is the
+# PACKET rather than the record it names: the queued review stays exactly as it
+# was and the packet is re-rendered from the immutable git objects, so the next
+# round presents the same candidate under a binding an approval can still
+# resolve. The four identifiers are read only off the queued entry — never
+# re-derived from the checkout's current branch, which could rebind a candidate
+# to a destination nobody named — and a packet that cannot be rendered, or that
+# comes back without them, parks instead of being sent.
 enabled = false
 
 # A CEILING on the per-code retry budgets in blockers.AUTONOMOUS_RECOVERIES,
