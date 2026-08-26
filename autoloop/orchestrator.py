@@ -10307,9 +10307,14 @@ class Orchestrator:
         parks, but `task_fatal` naming the task in flight, so the existing
         quarantine in `cli._handle_parked_task` sets that one task aside and
         the loop keeps working. Every step of that is fail-closed: no store, no
-        resolvable task, an unrecognised code, a hard halt, a `resume_phase`
-        that is missing or terminal, or a resubmit with no request all fall
-        through to the ordinary park below, unchanged.
+        resolvable task, a `task_id` naming a task other than the ONE active
+        task, a session whose two round records disagree about which task that
+        is (setaside-01), an unrecognised code, a hard halt, a
+        `resume_phase` that is missing or terminal, or a resubmit with no
+        request all fall through to the ordinary park below, unchanged — and
+        "unchanged" includes the site's own `kind`, so a loop-fatal site whose
+        set-aside is refused still ends the loop rather than quarantining
+        someone else's task.
 
         **halt-03 (2026-08-25) adds the second family of recoveries here, and
         nowhere else.** A `RECOVER_BY_REBUILDING_AT_HEAD` plan archives the
@@ -10344,10 +10349,18 @@ class Orchestrator:
         if plan is not None and self._autonomy_requires_a_task(plan):
             set_aside = self._autonomous_set_aside_task(task_id)
             if set_aside is None:
-                # There is no task to set aside, so the second half of
-                # autonomous recovery cannot happen — and the first half must
-                # not either. Retrying toward a park that would still stop the
-                # loop just spends rounds to arrive at the same halt.
+                # There is no task this loop is ENTITLED to set aside — none is
+                # in flight, or this site named one that is not the ONE active
+                # task, or the two round records disagree about which task that
+                # is and the loop will not guess (setaside-01). Either way the
+                # second half of autonomous recovery cannot happen, and the
+                # first half must
+                # not either: retrying toward a park that would still stop the
+                # loop just spends rounds to arrive at the same halt. Dropping
+                # the plan is also what PRESERVES the original terminal — the
+                # park below then uses the site's own `kind` and `task_id`,
+                # loop-fatal where the site said loop-fatal — instead of
+                # quarantining a bystander that has done nothing wrong.
                 plan = None
             else:
                 kind = "task_fatal"
@@ -10441,29 +10454,193 @@ class Orchestrator:
             return None
         return autonomous_recovery(code)
 
-    def _autonomous_set_aside_task(self, task_id: str | None) -> str | None:
-        """WHICH task autonomous mode would set aside for a fault raised here,
-        or `None` when there is no task to set aside.
+    @staticmethod
+    def _task_id_in(record) -> str | None:
+        """The task id a session record names, or `None` when it names none.
 
-        The park site's own `task_id` wins — it is the only one that knows a
-        fault belongs to a task other than the one currently executing (a push
-        approval's `binding.task_id`, say). Otherwise the task in flight, read
-        off `state.task_execution`, which is the serialised record of whichever
-        task is running the produce-then-review path.
-
-        `None` — a fault raised while no task is in flight, e.g. a login expiry
-        during a plan request — is a real answer and not a failure: there is
-        nothing to quarantine, so the loop parks as it always did rather than
-        inventing a victim.
+        Defensive about SHAPE rather than trusting it: `state.task_execution`
+        and `state.current_task` are plain JSON round-tripped through a file an
+        operator can edit, so a non-dict, a missing key, a non-string and a
+        blank string all have to read as "this record names no task". A park
+        handler is the one place a second failure has nowhere to go, so none of
+        them may raise here. The id is `.strip()`ped because that is what every
+        consumer of the answer (`BlockerStore.record`'s `blk-<task>-NNN` id,
+        `registry.has`) needs it to be; `tasks._ID_RE` forbids whitespace, so a
+        real id is unchanged by it.
         """
+        if not isinstance(record, dict):
+            return None
+        candidate = record.get("task_id")
+        if not isinstance(candidate, str) or not candidate.strip():
+            return None
+        return candidate.strip()
+
+    def _active_task_id(self) -> str | None:
+        """THE ONE task whose round is in flight, or `None` when this loop
+        cannot say which task that is. ONE identity, never a set of
+        candidates — a quarantine decision has exactly one victim, so the
+        question it is asked has to have exactly one answer.
+
+        TWO records are read, and they are NOT two independent authorities:
+
+        * `state.task_execution` is the serialised execution record, the
+          better answer whenever it exists — but `_dispatch_task_postcommit`
+          writes it only AFTER `_rebase_execution_if_stale` has already had
+          its chance to park `task_base_behind_head`, which is halt-03's
+          largest measured automation. A first dispatch therefore reaches that
+          park with `task_execution` holding the previous round's record or
+          nothing at all.
+        * `state.current_task` — written by `_dispatch` before it calls into
+          the produce-then-review path — already names the task being cut
+          there. Ignoring it would have made the match in
+          `_autonomous_set_aside_task` refuse at that park IN PRODUCTION while
+          every test passed, because the tests seed `task_execution` directly
+          and the real park site does not.
+
+        So a record that names a task is read only while NOTHING CONTRADICTS
+        IT: agreement, or exactly one of the two naming anything, resolves to
+        that id. **Disagreement is answered `None`, deliberately** — one
+        record naming t1 while the other names t2 is a stale or transitional
+        session (t1's reviewed candidate is still mirrored awaiting push while
+        t2 is being dispatched), and in that state the loop does not know which
+        of the two rounds is the one in flight. Picking either would license a
+        quarantine off a NON-ACTIVE id, which is the whole hazard setaside-01
+        exists to close, so this fails closed and the caller keeps the park the
+        site asked for. Reading `.strip()`ped ids through `_task_id_in` means a
+        blank, missing, non-string or non-dict record reads as "names no task"
+        rather than as agreement with whatever the other record says.
+        """
+        recorded = self._task_id_in(self.state.task_execution)
+        dispatched = self._task_id_in(self.state.current_task)
+        if recorded is not None and dispatched is not None and recorded != dispatched:
+            return None
+        return recorded if recorded is not None else dispatched
+
+    def _autonomous_set_aside_task(self, task_id: str | None) -> str | None:
+        """WHICH task autonomous mode is entitled to set aside for a fault
+        raised here, or `None` when there is none.
+
+        The answer is always A TASK WHOSE ROUND IS IN FLIGHT — never merely
+        whichever task a park site happened to name (setaside-01, 2026-08-26).
+
+        **Why the explicit id exists at all, and is therefore validated rather
+        than dropped.** A park site's own `task_id` is the only thing that
+        knows a fault belongs to a task other than the one currently
+        executing: `_dispatch_task_push` names `binding.task_id`, the identity
+        captured when the reviewed packet was SENT, and an approval that names
+        an older packet (`_approval_packet`) genuinely resolves a binding for a
+        task that is not the one `state.task_execution` describes. That is a
+        real and deliberate shape, so the parameter stays.
+
+        **What it must not do is decide the quarantine.** Returning it
+        unconditionally meant any park site that passed an id got THAT task set
+        aside, whether or not its round was the one in flight — so an
+        environment fault raised during t1's round could quarantine an eligible
+        registry task t2, which then sits `blocked` having done nothing wrong
+        while t1 carries on. `publisher_url_drift` is the live site with that
+        shape today: it is `RECOVER_UNAVAILABLE`, so it reaches the set-aside
+        on its first occurrence, and it names `binding.task_id`. (The two
+        `push_candidate_*` codes name a binding too but never consult this
+        helper — `_autonomy_requires_a_task` answers False for
+        `STALE_PUSH_BINDING`.)
+
+        So an explicit id is honoured ONLY when it EQUALS `_active_task_id` —
+        the loop's single active identity, compared exactly after `.strip()`
+        and never folded; the value returned is the one read off the round's
+        own record, so a caller-supplied string can never reach
+        `park_task_id`. On a MISMATCH the answer is `None`, which the one call
+        site turns back into the park the SITE asked for — its own `kind`, its
+        own `task_id`, the original loop-fatal terminal — rather than into a
+        quarantine of a bystander. Refusing is recorded
+        (`autonomous_set_aside_refused`, with the reason that decided it) so
+        the guard firing leaves evidence instead of looking like it never
+        fires.
+
+        `None` is a real answer and not a failure in the other cases too: a
+        fault raised while no task is in flight (a login expiry during a plan
+        request) has nothing to quarantine, and a session whose two round
+        records DISAGREE has no active identity to quarantine, so both park as
+        the loop always did rather than inventing a victim.
+
+        The fallback — a park site that names NO task — is still ANCHORED ON
+        `state.task_execution`, and the active identity can only VETO it,
+        never replace it. That asymmetry is the direction check for the whole
+        change, cell by cell against the behaviour before it:
+
+        | task_execution | current_task | explicit id honoured | no-id victim |
+        |---|---|---|---|
+        | t1 | (none) | t1 only | t1 — unchanged |
+        | t1 | t1 | t1 only | t1 — unchanged |
+        | t1 | t2 | NEITHER — disagreement | none — narrower |
+        | (none) | t2 | t2 (`task_base_behind_head`) | none — unchanged |
+        | (none) | (none) | none | none — unchanged |
+
+        Every cell is the same as before or narrower: an explicit id can now
+        only be refused, and the no-task-named fallback can now only refuse
+        where it used to name `task_execution`'s task. Returning
+        `_active_task_id()` there instead would have quarantined `current_task`'s
+        task in the fourth row, where the loop parks `loop_fatal` today — the
+        one direction this change must never move in.
+        """
+        recorded = self._task_id_in(self.state.task_execution)
+        active = self._active_task_id()
+        # The ONLY way a record naming a task yields no active identity: the
+        # two round records name different tasks (see `_active_task_id`).
+        # Named positively rather than as `active is None`, because the reason
+        # is what the refusal below has to report.
+        records_disagree = active is None and recorded is not None
         if task_id:
-            return task_id
-        execution = self.state.task_execution
-        if isinstance(execution, dict):
-            candidate = execution.get("task_id")
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate
-        return None
+            # `.strip()` on BOTH sides and nothing else — no case folding, no
+            # prefix match. A `task_id` that is only whitespace normalises to
+            # `""`, which `_task_id_in` never returns, so it refuses rather
+            # than matching a round record by accident.
+            named = task_id.strip()
+            if active is not None and active == named:
+                return active
+            self._refuse_set_aside(named_task_id=task_id, disagree=records_disagree)
+            return None
+        if recorded is None:
+            # No execution record names a task: nothing to quarantine, and
+            # `current_task` is deliberately NOT consulted here (see the table
+            # above). Silent, because there is no guard firing to leave
+            # evidence of — this is the ordinary "a fault with no task behind
+            # it" shape.
+            return None
+        if recorded != active:
+            # Reachable only through `records_disagree`: the execution record
+            # names a task the dispatched round contradicts, so the loop cannot
+            # say the record is the round in flight and will not set it aside
+            # on the strength of a guess.
+            self._refuse_set_aside(named_task_id="", disagree=True)
+            return None
+        return recorded
+
+    def _refuse_set_aside(self, *, named_task_id: str, disagree: bool) -> None:
+        """Record a refused set-aside, with the reason that decided it.
+
+        TWO reasons, kept distinct on purpose: `named_task_is_not_the_active_task`
+        is a park site naming somebody else, `round_identity_records_disagree`
+        is the session having no single active identity to name at all. A
+        single "refused" string would have made the two indistinguishable in
+        the transcript, and a regression proving that a STALE id cannot license
+        a quarantine has nothing but this field to prove it with. Both record
+        ids are logged raw so an operator reading a refusal can see the
+        disagreement itself rather than the conclusion drawn from it.
+        """
+        self._log(
+            "autonomous_set_aside_refused",
+            data={
+                "named_task_id": named_task_id,
+                "active_task_id": self._active_task_id() or "",
+                "execution_task_id": self._task_id_in(self.state.task_execution) or "",
+                "dispatched_task_id": self._task_id_in(self.state.current_task) or "",
+                "reason": (
+                    "round_identity_records_disagree"
+                    if disagree
+                    else "named_task_is_not_the_active_task"
+                ),
+            },
+        )
 
     @staticmethod
     def _autonomy_requires_a_task(plan) -> bool:

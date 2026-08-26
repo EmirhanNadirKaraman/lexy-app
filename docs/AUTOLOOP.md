@@ -6983,7 +6983,12 @@ without a human saying so.
 2. **when that path is exhausted, sets the ONE task in flight aside**: the park
    still happens, but classified `task_fatal` naming that task, which is the
    existing quarantine `cli._handle_parked_task` already knows how to work past.
-   The loop keeps going on the rest of the roadmap instead of stopping.
+   The loop keeps going on the rest of the roadmap instead of stopping. "The one
+   task in flight" is what this sentence always claimed and what the code
+   ENFORCES since setaside-01 — a park site may name a task, but only the loop's
+   ONE active task is ever quarantined, and a mismatch (or a session that cannot
+   say which task is active) keeps the site's own loop-fatal terminal. See
+   §9c-sexies.
 
 Stage 2 is the point; stage 1 is only worth doing where a recovery path
 genuinely exists. Nothing about §9c's machinery changed: the interception is at
@@ -7383,6 +7388,109 @@ that read the park sites: `task_base_behind_head`, `state_inconsistent` and
 the two `push_candidate_*` sites must still split into one that names a task and
 one that does not — a changeset site that started naming a task would route an
 operator's changeset into the task rebuild.
+
+### 9c-sexies. The set-aside quarantines the round in flight, never a task a park site merely names (setaside-01, 2026-08-26)
+
+**A correction to §9c-quater's stage 2, not a new capability.** That section
+already says the set-aside quarantines "the ONE task in flight"; until this
+change the code did not enforce it. `orchestrator._autonomous_set_aside_task`
+returned any explicit `task_id` a park site passed, unconditionally, before it
+ever consulted `state.task_execution` — so the victim was whichever task the
+SITE named, whether or not that task's round was the one running.
+
+**What that could do.** `publisher_url_drift` is the live site with the shape:
+it is `RECOVER_UNAVAILABLE`, so it reaches the set-aside on its first
+occurrence, and it names `binding.task_id` — the identity captured when the
+reviewed packet was SENT. An approval that names an older packet
+(`_approval_packet`) resolves a binding for a task that is not the one in
+flight, so an environment fault raised during t1's round could park
+`task_fatal` about **t2**, an eligible registry task that had done nothing
+wrong. `cli._handle_parked_task` would then mark t2 `blocked_by_operator` and
+report that continuous mode may carry on, while t1 — the task the fault
+actually belonged to — continued. Nothing observed had been mis-targeted when
+this was fixed; it was filed as latent.
+
+**The rule now.** The set-aside's answer is always the loop's ONE active task:
+
+* a park site that names NO task is still ANCHORED on `state.task_execution` —
+  `None` there still means "park exactly as this loop parks today" rather than
+  "invent a victim" — and the active identity can only VETO that answer, never
+  supply one;
+* a park site that DOES name one has that id validated against
+  `_active_task_id()` — an exact comparison after `.strip()`, never folded —
+  and the value that reaches `park_task_id` and the blocker record is the one
+  read off the round's own record, so a caller-supplied string never passes
+  through;
+* **a mismatch preserves the site's own terminal.** The plan is dropped, so the
+  park below runs with the `kind` and `task_id` the site chose: a `loop_fatal`
+  site still ends the loop, and no bystander is quarantined. Every path here
+  can therefore only ever set aside FEWER tasks than before, never more.
+
+**The parameter is validated rather than removed, and the reason it exists is
+real.** A park site's own `task_id` is the only thing that can know a fault
+belongs to a task other than the executing one; dropping it would have thrown
+that away. (The two `push_candidate_*` codes name a binding too, but never
+consult this helper at all — `_autonomy_requires_a_task` answers False for
+`STALE_PUSH_BINDING`, see §9c-quinquies.)
+
+**`_active_task_id()` reads TWO records, and they are ONE authority, not two.**
+`state.task_execution` is the better answer whenever it exists, but
+`_dispatch_task_postcommit` writes it only *after*
+`_rebase_execution_if_stale` has already had its chance to park
+`task_base_behind_head` — §9c-quinquies' largest measured automation. A first
+dispatch reaches that park with no execution record in state at all, while
+`state.current_task` (written by `_dispatch` before it calls into the
+produce-then-review path) already names the task being cut. Matching against
+the execution record alone would have refused there **in production while the
+whole suite passed**, because the tests seed `task_execution` directly and the
+real site does not — the same fail-silent shape §9c-quinquies describes for the
+gate it narrowed, met from the other side. `test_autonomous_recovery.py::
+test_the_dispatched_task_counts_as_the_round_even_before_its_record_exists`
+pins it.
+
+So a record is read only while **nothing contradicts it**: the two agreeing, or
+exactly one of them naming anything, resolves the active identity; the two
+naming DIFFERENT tasks resolves **nothing**, and every set-aside is refused
+until the session says one thing. The first cut of this section read them as two
+independent authorities — `task_execution`, then `current_task`, first match
+wins — which left the same hazard one level down: in a stale or transitional
+session (t1's reviewed candidate still mirrored while awaiting push, t2 being
+dispatched) an explicit id matching *either* record was honoured, so t1 could
+still be quarantined for a round that was not its own. The decision table, cell
+by cell against the behaviour before setaside-01:
+
+| `task_execution` | `current_task` | explicit id honoured | no-id victim |
+|---|---|---|---|
+| t1 | (none) | t1 only | t1 — unchanged |
+| t1 | t1 | t1 only | t1 — unchanged |
+| t1 | t2 | NEITHER — disagreement | none — narrower |
+| (none) | t2 | t2 (`task_base_behind_head`) | none — unchanged |
+| (none) | (none) | none | none — unchanged |
+
+Row 4 is what keeps the pre-execution `task_base_behind_head` automation alive;
+row 3 is the fail-closed one. **Its cost is real and is accepted rather than
+hidden:** a fault raised while the two records disagree — a `login_expired`
+during t2's dispatch while t1's record is still mirrored awaiting push — no
+longer quarantines anything, so the loop stops where it would previously have
+set a task aside and carried on. That is availability traded for never blocking
+work that did nothing wrong, and it is the only direction this helper is
+allowed to move in.
+
+**The refusal is loud, and it says WHICH refusal fired.**
+`autonomous_set_aside_refused` carries the id the site named, the resolved
+active id, and both records raw, under one of two reasons —
+`named_task_is_not_the_active_task` or `round_identity_records_disagree`. Same
+reason `autonomous_rebuild_refused` exists: a guard that fires with no evidence
+reads to the next person as a guard that never fires. Distinguishing the two is
+also what lets a regression prove that a *stale* id was refused for being
+stale, rather than merely refused.
+
+**Cross-reference.** This helper reached the base through halt-02/halt-03;
+halt-01's candidate is where a reviewer first found it, and halt-01 is blocked
+on `review_feedback_unchanged` — a code that is not in
+`blockers.AUTONOMOUS_RECOVERIES` and so has nothing to do with this path. Its
+remaining scope should still be re-checked against this diff before it is
+redispatched.
 
 ### 9d. Retired: superseded work is not blocked work
 

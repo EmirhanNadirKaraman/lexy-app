@@ -2323,8 +2323,18 @@ def test_without_an_execution_store_and_worker_manager_nothing_is_archived(tmp_p
 def test_a_task_missing_from_the_registry_is_never_archived(tmp_path):
     """Driven through the REAL wiring, not the collaborator-free build: without
     an execution store the earlier refusal fires first and the assertion below
-    would be checking a different branch than it names."""
+    would be checking a different branch than it names.
+
+    The round in flight is `ghost-99` too, which is the shape this refusal is
+    actually about — an execution record for a task the registry has lost, not
+    a park naming somebody else's task. Since setaside-01 the two are different
+    faults with different answers: a park naming a task the round is NOT about
+    never reaches the rebuild at all (`_autonomous_set_aside_task` refuses it,
+    and `test_autonomous_recovery.py` section 5b owns that claim), so seeding
+    the round here is what keeps this test checking the registry branch it
+    names rather than the set-aside guard in front of it."""
     wiring = RealWiring(tmp_path)
+    wiring.state.task_execution = {"task_id": "ghost-99"}
 
     wiring.orch._to_needs_user("base behind head", kind="task_fatal",
                                code="task_base_behind_head", task_id="ghost-99")
