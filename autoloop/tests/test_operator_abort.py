@@ -864,6 +864,47 @@ def test_a_flag_cleared_before_the_round_re_reads_it_is_still_an_abort(tmp_path)
     assert abort_file.exists() is False, "the test's own premise"
 
 
+#: The clause `killable_run` writes into the ledger when an abort kills a live
+#: validation process group.
+#:
+#: Held as ONE string because two places need it and they must not drift: the
+#: helper below, which REPLAYS the kill rather than performing one, and
+#: `test_the_replayed_kill_clause_is_the_one_production_actually_writes`, which
+#: runs the real thing and requires equality. Without that pin, a helper that
+#: writes the sentence by hand and a test that then asserts on it are an ECHO —
+#: the test reading back its own input — and production could change the wording
+#: with every assertion still green.
+VALIDATION_KILL_CLAUSE = (
+    "the validation subprocess and every process it spawned were killed"
+)
+
+
+def test_the_replayed_kill_clause_is_the_one_production_actually_writes(tmp_path):
+    """The echo guard for `VALIDATION_KILL_CLAUSE`, by equality rather than by
+    substring: `"validation subprocess" in reason` would still hold if
+    `killable_run` started writing a different sentence around those two words,
+    and the helper's replay would go on asserting about a clause nothing
+    produces. This kills a real process group and compares the whole string."""
+    abort_file = tmp_path / "ABORT"
+    abort_file.touch()
+    produced = AbortLedger()
+
+    killable_run(
+        [sys.executable, "-c", f"import time; time.sleep({LINGER_SECONDS})"],
+        cwd=tmp_path,
+        text=True,
+        abort_file=abort_file,
+        ledger=produced,
+        poll_seconds=0.05,
+        grace_seconds=2.0,
+    )
+
+    assert produced.reason == VALIDATION_KILL_CLAUSE, (
+        "the replayed clause drifted from the one production writes: "
+        f"{produced.reason!r}"
+    )
+
+
 def a_round_whose_suite_was_killed(tmp_path):
     """Run the REAL executor through the race's SECOND window and return what it
     reported: `(outcome, launched, abort_file)`.
@@ -887,10 +928,10 @@ def a_round_whose_suite_was_killed(tmp_path):
     def killed_mid_suite(argv, **kwargs):
         launched.append(tuple(argv))
         abort_file.touch()  # the operator arms it, mid-suite
-        # what `killable_run` does on its next 0.25s tick:
-        ledger.record(
-            "the validation subprocess and every process it spawned were killed"
-        )
+        # what `killable_run` does on its next 0.25s tick — the clause is
+        # production's, pinned by equality in the guard above rather than
+        # retyped here, so this replay cannot drift away from what it replays.
+        ledger.record(VALIDATION_KILL_CLAUSE)
         abort_file.unlink()  # `resume`, before the round classifies itself
 
         class Killed:
@@ -1540,6 +1581,206 @@ def test_a_killed_suite_costs_the_task_no_attempt_once_dispatch_has_seen_it(tmp_
     assert orch.state.stop_kind == ABORT_STOP_KIND
     assert orch._registry.get("t1").status == "pending", "resumable, not consumed"
     assert run_git(repo_root, "rev-parse", "HEAD").strip() == head_before
+
+
+#: A validation command that ARMS THE ABORT ITSELF, mid-run, and then lingers.
+#:
+#: The flag has to land WHILE a real validation process group is live, because
+#: that is the only moment `killable_run`'s kill branch can be reached — and
+#: nothing outside the suite knows when the suite actually started. So the
+#: command announces itself (the marker) and presses the button (the flag) from
+#: inside its own process. That makes the timing deterministic rather than a
+#: sleep this test hopes is long enough, which is the difference between a
+#: regression and a flake. It spawns a child FIRST, so what the kill has to
+#: reach is a GROUP with a grandchild in it, observable per pid.
+ARMS_THE_ABORT_MID_SUITE = f"""
+import os, subprocess, sys, time
+marker, flag = sys.argv[1], sys.argv[2]
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep({LINGER_SECONDS})"]
+)
+tmp = marker + ".tmp"
+with open(tmp, "w") as handle:
+    handle.write("%d %d\\n" % (os.getpid(), child.pid))
+os.replace(tmp, marker)
+open(flag, "w").close()
+time.sleep({LINGER_SECONDS})
+"""
+
+
+def abort_arming_command(tmp_path, marker: Path, abort_file: Path) -> tuple[str, ...]:
+    """A real validation command `run_validation_commands` will actually launch.
+
+    TWO things about it are load-bearing rather than incidental.
+
+    `validation.SAFE_VALIDATION_BINARIES` matches on BASENAME, and
+    `sys.executable` is commonly `python3.13` — which that allowlist REFUSES
+    unrun. A test built on it would assert about a command validation never
+    launched: a green-looking run that proves nothing, which is exactly the
+    fail-open this file exists to catch. The symlink named `python3` is what
+    makes this a command the runner really executes.
+
+    The script goes in a FILE rather than after `-c` so that the argv, and
+    therefore the per-command line in `state.last_validation`, stays readable.
+    `effective_validation_command` leaves it alone either way (it rewrites only
+    a `pytest` invocation), so what runs is what is written here.
+    """
+    interpreter = tmp_path / "python3"
+    if not interpreter.exists():
+        interpreter.symlink_to(sys.executable)
+    script = tmp_path / "arms_the_abort.py"
+    script.write_text(ARMS_THE_ABORT_MID_SUITE, encoding="utf-8")
+    return (str(interpreter), str(script), str(marker), str(abort_file))
+
+
+class NeverRuns:
+    """The STANDALONE agent binding, which `worker_repo_root_for` +
+    `agent_runner_factory` always beat. It raises rather than writing anything:
+    an agent rooted at the main checkout is what `escape_detector` exists to
+    catch, and a test that quietly reached one would be building the escape it
+    is meant to prove cannot happen."""
+
+    def run(self, spec):  # pragma: no cover - the factory wins in this wiring
+        raise AssertionError("the standalone agent binding was reached")
+
+
+def killed_suite_executor(
+    workers_root, repo_root, *, abort_file, ledger, marker, tmp_path
+):
+    """The REAL `ImplementExecutor`, wired as `cli._build_executor` wires it,
+    whose authoritative validation run is a real subprocess group an operator
+    kills mid-flight.
+
+    `command_runner` is a WRAPPER AROUND PRODUCTION'S `killable_run`, not a
+    stand-in for it, and that is the whole point of this construction: the
+    clause the round ends up reporting ("the validation subprocess and every
+    process it spawned were killed") is written into the ledger by
+    `killable_run` itself. A test that recorded that sentence by hand and then
+    asserted on it would be reading back its own input — an echo, and the
+    reviewer would be right to refuse it.
+
+    What the wrapper adds is the OPERATOR'S `resume`, at the one deterministic
+    moment it can land: after the kill, before the round classifies itself.
+    That is the race the ledger exists for, and doing it here rather than from a
+    second thread is what keeps this test a regression instead of a coin flip.
+    """
+    policy = PolicyEngine(PolicyConfig(implement_enabled=True))
+
+    def resume_after_the_kill(argv, **kwargs):
+        proc = killable_run(
+            argv,
+            abort_file=abort_file,
+            ledger=ledger,
+            poll_seconds=0.05,
+            grace_seconds=2.0,
+            **kwargs,
+        )
+        if abort_file.exists():
+            abort_file.unlink()
+        return proc
+
+    return ImplementExecutor(
+        git=GitGateway(repo_root, policy),
+        agent_runner=NeverRuns(),
+        validation_commands=(abort_arming_command(tmp_path, marker, abort_file),),
+        command_runner=resume_after_the_kill,
+        worker_repo_root_for=lambda task_id: Path(workers_root) / task_id,
+        policy=policy,
+        agent_runner_factory=lambda root: WritingAgent(root, {"A.py": "x\n" * 30}),
+        abort_file=abort_file,
+        abort_ledger=ledger,
+    )
+
+
+def test_a_killed_suite_is_carried_end_to_end_without_charging_the_task(tmp_path):
+    """THE REGRESSION the revision asked for, run END TO END rather than stitched.
+
+    `test_a_killed_suite_costs_the_task_no_attempt_once_dispatch_has_seen_it`
+    above produces a real outcome and then REPLAYS it through a scripted
+    executor. That proves both halves, but it proves them separately, and the
+    seam is precisely where the claim could still fail: nothing in it shows the
+    real executor's outcome reaching the real dispatch path in one run.
+
+    So this is one continuous run of the production pieces:
+
+        the agent writes real work into its worker repo
+        -> the authoritative suite launches a real process group
+        -> that group arms the abort flag from inside itself, mid-suite
+        -> `killable_run` kills the group and records the ledger
+        -> `resume` removes the flag BEFORE the round classifies itself
+        -> `_run_implementation` classifies from the LEDGER
+        -> `_dispatch_task_postcommit` routes to `_abort_round`
+
+    With the flag gone by classification time, `abort_requested(config)` is
+    False and `EXECUTION_ABORTED` is the only signal left carrying the round —
+    which is the direction that costs a task an attempt when it is wrong, and
+    enough of those are the `attempt_count_ceiling` this task exists to prevent.
+
+    Every constraint the task names is asserted here against that one run: the
+    process group dies (grandchild included), no attempt and no fault is
+    charged, mainline is untouched, the task is back in the queue, and what was
+    discarded is reported and measured.
+    """
+    abort_file = tmp_path / "ABORT"
+    marker = tmp_path / "suite-pids.txt"
+    ledger = AbortLedger()
+    orch, execution_store, repo_root, config = build(
+        tmp_path,
+        lambda workers_root, repo: killed_suite_executor(
+            workers_root,
+            repo,
+            abort_file=abort_file,
+            ledger=ledger,
+            marker=marker,
+            tmp_path=tmp_path,
+        ),
+    )
+    head_before = run_git(repo_root, "rev-parse", "HEAD").strip()
+    pids: tuple[int, ...] = ()
+
+    try:
+        orch._dispatch_executor(implement())
+
+        # KILL THE WHOLE PROCESS GROUP, proved per pid rather than inferred from
+        # the one handle the runner happened to hold.
+        assert marker.exists(), "the authoritative suite never launched"
+        parent_pid, child_pid = pids = read_pids(marker)
+        assert wait_until(lambda: not alive(parent_pid)), (
+            "the validation command outlived the abort"
+        )
+        assert wait_until(lambda: not alive(child_pid)), (
+            "a worker the validation command spawned outlived the abort"
+        )
+    finally:
+        reap(*pids)
+
+    # The premise: by the time the round was classified there was no flag left
+    # to read, so nothing below can be passing because of one.
+    assert abort_requested(config) is False, "`resume` never ran — premise broken"
+    assert ledger.killed, "the round classified itself from something else"
+
+    execution = execution_store.load("t1")
+    assert execution.attempt_count == 0, "the operator's stop spent the task's budget"
+    assert execution.fault_attempt_count == 0, "an abort is not an environment fault"
+    assert execution.attempt_ledger == (), "the open entry is removed, not settled"
+    assert_books_balance(execution)
+    assert execution.candidate_sha == "", "an aborted round commits nothing"
+    assert orch.state.stop_kind == ABORT_STOP_KIND
+    assert orch._registry.get("t1").status == "pending", "resumable, not consumed"
+    assert run_git(repo_root, "rev-parse", "HEAD").strip() == head_before
+
+    # REPORT WHAT WAS DISCARDED — and the clause naming what was killed is
+    # PRODUCTION's. Nothing in this test writes it into the ledger; the only
+    # writer on this path is `killable_run`'s own kill branch, which is what
+    # makes this an assertion about the code rather than about the fixture.
+    record = orch.state.aborted_round
+    assert record["partial_work_measured"] is True
+    assert "validation subprocess" in record["discarded_work"], record["discarded_work"]
+    assert "1 file(s) changed" in record["discarded_work"], record["discarded_work"]
+    assert "validation failed after implementation" not in record["discarded_work"]
+    # The suite LAUNCHED and was cut short — a different fact from the
+    # "Validation did not run" every pre-validation abort site reports.
+    assert "cut short by the abort" in record["discarded_work"]
 
 
 def test_the_next_dispatch_resumes_the_aborted_round(tmp_path):
