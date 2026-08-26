@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -29,9 +30,10 @@ import pytest
 
 from autoloop import cli
 from autoloop.auto_merge import MergeDeferralStore
+from autoloop.blockers import BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Directive
-from autoloop.errors import GitCommandError
+from autoloop.errors import GitCommandError, StateCorruptError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
@@ -51,7 +53,7 @@ from autoloop.state import (
     StateStore,
 )
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
-from autoloop.transcript import TranscriptLogger
+from autoloop.transcript import TranscriptLogger, read_records
 from autoloop.worktask import (
     IntentStore,
     TaskExecution,
@@ -1717,3 +1719,664 @@ def test_shelve_says_when_the_loop_will_pick_the_same_task_straight_back_up(
     assert _shelve() == 0
 
     assert "is still what `next_ready()` returns" in capsys.readouterr().out
+
+
+# =============================================================================
+# 15. `discard`: retire a BLOCKED task's execution, not only an in-progress one
+# =============================================================================
+#
+# Four combinations of "what status is the task in" and "is the round it holds
+# worth keeping". Three already had a verb: in_progress+discard is `release`,
+# in_progress+keep is `shelve` (section 14 above), blocked+keep is `answer`.
+# The fourth — blocked+discard — had NONE, and `TaskRegistry.release` refuses
+# anything that is not `in_progress` while the `unblock` its refusal points at
+# is not a CLI command at all.
+#
+# Hit for real on dash-12, 2026-08-20: it parked `task_fatal` on
+# `attempt_count_ceiling` while holding an unpublished candidate in its worker
+# repo, and the only route out was an operator doing by hand precisely what
+# `worktask.retire_execution` already implements — worker to quarantine, record
+# to `executions/archive/` — with the loop stopped.
+#
+# THE ONE CLAIM under test: a single command retires a BLOCKED task's execution
+# (both halves, one label), closes the blocker that quarantined it with a
+# recorded reason, and returns the task to the queue — and if EITHER execution
+# half fails, the blocker is left OPEN and the task is NOT returned.
+#
+# These live beside the worker-repo primitives for section 14's reason: the
+# claim is only checkable against a REAL worker repository, because the halves
+# being moved are a real directory and a real record.
+
+
+def _quarantined_round(
+    tmp_path,
+    source_repo,
+    *,
+    task_id="dash-12",
+    blocked_reason="attempt_count_ceiling: the attempt budget is spent",
+    kind="task_fatal",
+    code="attempt_count_ceiling",
+    **kwargs,
+):
+    """A task the LOOP quarantined while it still held a round.
+
+    `_stranded_round`'s shape (real worker repo, execution record naming it and
+    a candidate a reviewer has seen) plus the two things a `task_fatal` park
+    adds: `blocked` in the registry with the park's reason, and an open
+    `blockers.Blocker` record beside it. `TaskRegistry.block` writes
+    `hold_origin = ""` unconditionally, so this is a LOOP quarantine and not an
+    operator hold — the distinction `discard` turns on.
+    """
+    config, store, executions, worker = _stranded_round(
+        tmp_path, source_repo, task_id=task_id, **kwargs
+    )
+    registry = store.load()
+    registry.release(task_id)                # the dispatch ended...
+    registry.block(task_id, blocked_reason)  # ...and the park quarantined it
+    store.save(registry)
+
+    blockers = BlockerStore(config.blockers_dir)
+    blocker = blockers.record(
+        task_id=task_id,
+        kind=kind,
+        code=code,
+        question="the attempt budget is spent — what now?",
+        detail="attempt_count=5",
+        phase="executing",
+        now="2026-08-20T09:00:00+00:00",
+        session_id="sess-dash-12",
+    )
+    return config, store, executions, worker, blockers, blocker
+
+
+def _discard(task_id="dash-12", reason="the candidate is contaminated"):
+    return cli._cmd_discard(
+        argparse.Namespace(config=None, task_id=task_id, reason=reason)
+    )
+
+
+def _quarantine_dir(config):
+    return config.workers_root.parent / "quarantine"
+
+
+# ---- the claim ---------------------------------------------------------------
+
+
+def test_discard_retires_both_halves_closes_the_blocker_and_requeues(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The whole claim in one command: worker quarantined, record archived,
+    blocker closed with the recorded reason, task back in the queue."""
+    config, store, executions, worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    assert _discard(reason="its branch is contaminated") == 0
+
+    # 1. the task is selectable again
+    after = store.load()
+    assert after.get("dash-12").status == "pending"
+    assert after.state_of("dash-12") is TaskState.READY
+    # released is released: no hold marker, no stale quarantine reason
+    assert after.get("dash-12").blocked_reason == ""
+    assert after.get("dash-12").hold_origin == ""
+
+    # 2. BOTH halves of the execution moved, under ONE label, nothing deleted
+    assert executions.load("dash-12") is None
+    archived = sorted((config.executions_dir / "archive").glob("dash-12-*.json"))
+    assert len(archived) == 1
+    assert not worker.path.exists()
+    quarantined = sorted(_quarantine_dir(config).glob("dash-12-*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "half-done.txt").read_text(encoding="utf-8") == (
+        "work in progress"
+    )
+    assert archived[0].stem == quarantined[0].name, (
+        "the two halves must name each other on disk — one retire_execution "
+        "call, one label"
+    )
+    assert "discarded-by-operator" in quarantined[0].name
+
+    # 3. the blocker is CLOSED, with a reason and NOT with a forged answer
+    closed = blockers.load(blocker.id)
+    assert closed.resolved_at is not None
+    assert closed.answer is None, "a discard is not an operator answering a question"
+    assert "its branch is contaminated" in closed.archived_reason
+    assert "attempt_count_ceiling" in closed.archived_reason, (
+        "the account of WHY the task was quarantined survives nowhere else — "
+        "`discard` clears `blocked_reason`"
+    )
+    assert not blockers.open_blockers()
+
+    out = capsys.readouterr().out
+    assert "blocked -> pending" in out
+    assert "kept, not deleted" in out
+    assert "NOT an operator answer" in out
+
+
+def test_the_discard_is_written_to_the_transcript_with_the_reason_it_was_given(
+    tmp_path, repo, monkeypatch
+):
+    """A task that returns to the queue on an operator's say-so must not do it
+    silently — the same rule `_reconcile_unblocked_tasks` follows, and the only
+    durable place the prior `blocked_reason` survives besides the blocker."""
+    config, _store, _executions, _worker, _blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    assert _discard(reason="cut it again from the current base") == 0
+
+    records = [
+        r
+        for r in read_records(config.transcript_file).records
+        if r.get("type") == "task_execution_discarded"
+    ]
+    assert len(records) == 1
+    data = records[0]["data"]
+    assert data["task_id"] == "dash-12"
+    assert data["reason"] == "cut it again from the current base"
+    assert data["prior_blocked_reason"].startswith("attempt_count_ceiling")
+    assert data["closed_blockers"] == [blocker.id]
+    assert data["archived_record"] and data["quarantined_worker"]
+
+
+def test_discard_closes_every_open_task_fatal_blocker_naming_the_task(
+    tmp_path, repo, monkeypatch
+):
+    """`record` mints a separate blocker per (task, code, phase), so one task
+    can hold several. Leaving one open would return the task to the queue with
+    an unanswered question standing against it — the exact state this command
+    must never produce."""
+    config, _store, _executions, _worker, blockers, first = _quarantined_round(
+        tmp_path, repo
+    )
+    second = blockers.record(
+        task_id="dash-12",
+        kind="task_fatal",
+        code="review_packet_build_failed",
+        question="the packet would not build",
+        detail="",
+        phase="delivering",
+        now="2026-08-20T10:00:00+00:00",
+    )
+    _wire(monkeypatch, config)
+
+    assert _discard() == 0
+
+    assert blockers.open_task_ids() == set()
+    for closed in (blockers.load(first.id), blockers.load(second.id)):
+        assert closed.resolved_at is not None and closed.answer is None
+
+
+def test_discard_works_when_the_quarantined_task_never_committed_anything(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """A task parked before it ever produced a round has neither half. Absence
+    is not an error, and it must not be reported as a retirement either."""
+    config, store, executions, worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    executions.path_for("dash-12").unlink()
+    shutil.rmtree(worker.path)
+    _wire(monkeypatch, config)
+
+    assert _discard() == 0
+
+    assert store.load().get("dash-12").status == "pending"
+    assert blockers.load(blocker.id).resolved_at is not None
+    out = capsys.readouterr().out
+    assert "no execution record to retire" in out
+    assert "no worker repo to clear" in out
+
+
+# ---- the refusals: what must NOT become reachable ----------------------------
+
+
+def test_discard_refuses_a_completed_task(tmp_path, repo, monkeypatch, capsys):
+    """`release` is "Narrow on purpose... it cannot quietly un-complete finished
+    work", and that bound is inherited rather than relaxed."""
+    config, store, executions, worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    registry = store.load()
+    registry.get("dash-12").status = "completed"
+    store.save(registry)
+    _wire(monkeypatch, config)
+
+    assert _discard() == 1
+
+    assert store.load().get("dash-12").status == "completed"
+    assert executions.load("dash-12") is not None
+    assert worker.path.is_dir()
+    assert blockers.load(blocker.id).resolved_at is None
+    assert "task_not_blocked" in capsys.readouterr().out
+
+
+def test_discard_refuses_a_task_held_by_the_operator(tmp_path, repo, monkeypatch, capsys):
+    """`status == "blocked"` carries two meanings and they must not be reversible
+    by the same route. An operator hold is a human saying "not this one, not
+    now" and has NO blocker record at all, so "close the blocker with a recorded
+    reason" would have nothing to close — refused, with no override."""
+    config, store, executions, worker, _blockers, _blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    registry = store.load()
+    registry.unblock("dash-12")
+    registry.operator_block("dash-12", "parked while we decide the approach")
+    store.save(registry)
+    _wire(monkeypatch, config)
+
+    assert _discard() == 1
+
+    held = store.load().get("dash-12")
+    assert held.status == "blocked"
+    assert held.hold_origin == "operator"
+    assert executions.load("dash-12") is not None
+    assert worker.path.is_dir()
+    out = capsys.readouterr().out
+    assert "task_operator_hold" in out and "only the operator does" in out
+
+
+def test_discard_refuses_an_in_progress_task_and_release_still_handles_that_one(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The two verbs stay disjoint, and neither is widened. `discard` accepting
+    `in_progress` would rebuild `release` under a second name; `release`
+    accepting `blocked` is the relaxation the brief forbids."""
+    config, store, executions, _worker = _stranded_round(tmp_path, repo)
+    _wire(monkeypatch, config)
+
+    assert _discard() == 1
+    assert store.load().get("dash-12").status == "in_progress"
+    assert executions.load("dash-12") is not None
+    assert "task_not_blocked" in capsys.readouterr().out
+
+    assert cli._cmd_release(argparse.Namespace(config=None, task_id="dash-12")) == 0
+    assert store.load().state_of("dash-12") is TaskState.READY
+    assert executions.load("dash-12") is None
+
+
+def test_release_still_refuses_a_blocked_task_exactly_as_it_did(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The regression guard for the half of the brief that says what must NOT
+    change: `release` keeps its `task_not_in_progress` refusal for a quarantined
+    task, so nothing here launders a quarantine through the old verb."""
+    config, store, executions, worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    assert cli._cmd_release(argparse.Namespace(config=None, task_id="dash-12")) == 1
+
+    assert store.load().get("dash-12").status == "blocked"
+    assert executions.load("dash-12") is not None
+    assert worker.path.is_dir()
+    assert blockers.load(blocker.id).resolved_at is None
+    assert "task_not_in_progress" in capsys.readouterr().out
+
+
+def test_discard_refuses_while_a_loop_fatal_blocker_names_the_task(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """A loop_fatal record is a LOOP-WIDE safety condition — a dirty checkout,
+    an escaped write — that merely happened to name this task. Discarding a
+    candidate answers none of it, and closing it would let `start` proceed over
+    the condition. Refusing satisfies both halves of the claim at once."""
+    config, store, executions, worker, blockers, task_blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    loud = blockers.record(
+        task_id="dash-12",
+        kind="loop_fatal",
+        code="checkout_escape_detected",
+        question="a write landed outside the worker repo",
+        detail="",
+        phase="executing",
+        now="2026-08-20T11:00:00+00:00",
+    )
+    _wire(monkeypatch, config)
+
+    assert _discard() == 1
+
+    assert store.load().get("dash-12").status == "blocked"
+    assert executions.load("dash-12") is not None
+    assert worker.path.is_dir()
+    assert blockers.load(loud.id).resolved_at is None
+    assert blockers.load(task_blocker.id).resolved_at is None, (
+        "the refusal must run BEFORE anything is closed"
+    )
+    out = capsys.readouterr().out
+    assert "was NOT discarded" in out and "checkout_escape_detected" in out
+
+
+@pytest.mark.parametrize("kind", ["", "  ", "unclassified-by-this-build"])
+def test_a_blocker_whose_kind_cannot_be_classified_refuses_the_discard(
+    tmp_path, repo, monkeypatch, capsys, kind
+):
+    """FAIL CLOSED on the allowlist. `kind` is a bare string with no default, so
+    an old or hand-written record can carry anything — and a `!= "loop_fatal"`
+    denylist would wave every one of those straight through into "closeable"."""
+    config, store, _executions, _worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo, kind=kind
+    )
+    _wire(monkeypatch, config)
+
+    assert _discard() == 1
+
+    assert store.load().get("dash-12").status == "blocked"
+    assert blockers.load(blocker.id).resolved_at is None
+    assert "was NOT discarded" in capsys.readouterr().out
+
+
+def test_an_unreadable_blocker_store_refuses_rather_than_discarding(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The other fail-open shape, and the one that matters most. An unreadable
+    blocker store is exactly the store in which "does an open question still
+    name this task?" cannot be answered — and answering it "no" by default would
+    queue a task over a question nobody read."""
+    config, store, executions, worker, _blockers, _blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    (config.blockers_dir / "blk-dash-12-009.json").write_text("{torn", encoding="utf-8")
+    _wire(monkeypatch, config)
+
+    assert _discard() == 1
+
+    assert store.load().get("dash-12").status == "blocked"
+    assert executions.load("dash-12") is not None
+    assert worker.path.is_dir()
+    out = capsys.readouterr().out
+    assert "could not be read" in out and "Nothing changed" in out
+
+
+def test_a_blank_reason_is_refused_before_anything_is_read(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """A blocker closed with no account of why is a silent delete — the rule
+    `archive-blocker` already enforces. Refused before the lock, so a blank
+    reason cannot fail AFTER the execution has been retired."""
+    config, store, executions, worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    assert _discard(reason="   ") == 1
+
+    assert store.load().get("dash-12").status == "blocked"
+    assert executions.load("dash-12") is not None
+    assert worker.path.is_dir()
+    assert blockers.load(blocker.id).resolved_at is None
+    assert "must not be blank" in capsys.readouterr().out
+
+
+def test_discard_refuses_an_id_the_registry_has_never_heard_of(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """A typo must be reported as one, not answered with silence — the same
+    fail-closed reading `recut_obstacle` and `stranded_dependents` take."""
+    config, _store, _executions, _worker, _blockers, _blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    assert _discard(task_id="dash-21") == 1
+    assert "task_unknown" in capsys.readouterr().out
+
+
+# ---- both halves move or NEITHER does ----------------------------------------
+
+
+def test_a_failed_record_archive_leaves_the_blocker_open_and_the_task_blocked(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """`retire_execution` files the RECORD first, so a failure there moves
+    nothing at all. The task must stay blocked with its question standing — and
+    the command must be safe to simply run again, which is the property the
+    inverted order (retire BEFORE the status move) buys."""
+    config, store, executions, worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    def refuse(self, task_id, label):
+        raise StateCorruptError("the executions directory is read-only")
+
+    monkeypatch.setattr(TaskExecutionStore, "archive", refuse)
+
+    assert _discard() == 1
+
+    assert store.load().get("dash-12").status == "blocked"
+    assert blockers.load(blocker.id).resolved_at is None
+    assert executions.load("dash-12") is not None
+    assert worker.path.is_dir()
+    assert not _quarantine_dir(config).exists()
+    out = capsys.readouterr().out
+    assert "NEITHER half moved" in out
+    assert "still blocked" in out
+
+    # ...and re-running it once the cause is gone completes the discard.
+    monkeypatch.undo()
+    _wire(monkeypatch, config)
+    assert _discard() == 0
+    assert store.load().get("dash-12").status == "pending"
+    assert blockers.load(blocker.id).resolved_at is not None
+
+
+def test_a_failed_worker_quarantine_leaves_the_blocker_open_and_the_task_blocked(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The asymmetric half. `retire_execution` archives the record and THEN
+    moves the worker, so a worker failure leaves the two split — and the command
+    must still refuse to requeue, because a task back in the queue whose worker
+    repo is still at `workers/<id>` is one the next dispatch cannot create over.
+
+    The residue is named rather than merely reported failed: which half moved
+    decides what an operator does next."""
+    config, store, executions, worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    def refuse(self, task_id, label):
+        raise GitCommandError("quarantine destination already exists")
+
+    monkeypatch.setattr(WorkerRepoManager, "quarantine", refuse)
+
+    assert _discard() == 1
+
+    assert store.load().get("dash-12").status == "blocked", (
+        "a half-retired execution must not return the task to the queue"
+    )
+    assert blockers.load(blocker.id).resolved_at is None
+    assert worker.path.is_dir()
+    # The record half really did land — the report has to say so rather than
+    # claim nothing happened.
+    assert executions.load("dash-12") is None
+    out = capsys.readouterr().out
+    assert "HALF moved" in out
+    assert str(worker.path) in out
+    assert "still blocked" in out
+
+    # ...and the remedy the message names really works: move the worker aside,
+    # run it again, and the record half reports as ABSENT rather than as a
+    # retirement that never happened.
+    monkeypatch.undo()
+    shutil.rmtree(worker.path)
+    _wire(monkeypatch, config)
+
+    assert _discard() == 0
+    assert store.load().get("dash-12").status == "pending"
+    assert blockers.load(blocker.id).resolved_at is not None
+    again = capsys.readouterr().out
+    assert "no execution record to retire" in again
+    assert "no worker repo to clear" in again
+
+
+def test_a_reopen_that_itself_fails_says_the_record_is_still_closed(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The message that could have LIED. `_reopen_blocker` is best-effort, so
+    "every blocker closed above was written back open" is false whenever the
+    write-back itself failed — and an operator who believed it would go looking
+    for a record that is closed on disk. The two endings want different next
+    moves, which is why they are reported as different endings."""
+    config, store, _executions, _worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    real_save = BlockerStore.save
+    landed = {"count": 0}
+
+    def flaky(self, record):
+        landed["count"] += 1
+        if landed["count"] == 1:      # the archival lands...
+            return real_save(self, record)
+        raise OSError("the blockers directory went read-only")
+
+    def refuse(self, registry):       # ...and the save it precedes does not
+        raise OSError("tasks.json is read-only")
+
+    monkeypatch.setattr(BlockerStore, "save", flaky)
+    monkeypatch.setattr(TaskStore, "save", refuse)
+
+    assert _discard() == 1
+
+    assert store.load().get("dash-12").status == "blocked"
+    assert blockers.load(blocker.id).resolved_at is not None, (
+        "the undo failed, so the record really is closed — the report must say so"
+    )
+    out = capsys.readouterr().out
+    assert "could NOT be written back open" in out
+    assert "Every blocker closed above was written back open." not in out
+
+
+def test_a_failed_registry_save_writes_every_closed_blocker_back_open(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The blocker is closed BEFORE the registry is saved, so the state this
+    command must never produce — a task in the queue with an open blocker —
+    cannot be reached by a failure of the second write. The other direction is
+    undone instead: a save that fails writes the record back exactly as it was
+    read (`_reopen_blocker`, the idiom `answer` and `archive-blocker` use)."""
+    config, store, executions, _worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    def refuse(self, registry):
+        raise OSError("tasks.json is read-only")
+
+    monkeypatch.setattr(TaskStore, "save", refuse)
+
+    assert _discard() == 1
+
+    assert store.load().get("dash-12").status == "blocked"
+    reopened = blockers.load(blocker.id)
+    assert reopened.resolved_at is None and reopened.archived_reason == ""
+    assert blockers.open_task_ids() == {"dash-12"}
+    # The execution really is retired, and the message must say so rather than
+    # "nothing changed" — the two want different next moves.
+    assert executions.load("dash-12") is None
+    out = capsys.readouterr().out
+    assert "was reopened" in out
+    assert "execution HAS been retired" in out
+
+
+# ---- what the retirement is FOR: the merge window ----------------------------
+
+
+def test_the_merge_window_stops_naming_the_task_once_its_record_is_archived(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The reason the RECORD half exists at all, shown against its control.
+
+    A `blocked` task is exempt from `_merge_window_blockers` (`state_of` maps
+    every `blocked` row to BLOCKED_BY_OPERATOR), so its record costs nothing
+    while it stays quarantined — and starts holding the repository-wide window
+    shut the instant the task is queued again, because READY carries no such
+    exemption. The control is that exact state: requeue WITHOUT retiring and the
+    predicate names the task."""
+    config, store, _executions, _worker, _blockers, _blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    checkout = _wire(monkeypatch, config)
+
+    # Control: quarantined -> exempt.
+    reasons, _notes = cli._merge_window_blockers(config, set(), checkout)
+    assert not any(r.startswith("task dash-12 ") for r in reasons), reasons
+
+    # Control: the same record with the task back in the QUEUE holds it shut.
+    registry = store.load()
+    registry.unblock("dash-12")
+    store.save(registry)
+    reasons, _notes = cli._merge_window_blockers(config, set(), checkout)
+    assert any(r.startswith("task dash-12 has a candidate") for r in reasons), reasons
+
+    # Now the real thing: put it back and discard it properly.
+    registry = store.load()
+    registry.block("dash-12", "attempt_count_ceiling: the attempt budget is spent")
+    store.save(registry)
+    assert _discard() == 0
+
+    reasons, _notes = cli._merge_window_blockers(config, set(), checkout)
+    assert not any(r.startswith("task dash-12 ") for r in reasons), reasons
+    out = capsys.readouterr().out
+    assert "merge window OPEN" in out
+    assert "IS STILL NAMED" not in out
+
+
+def test_the_window_line_is_unknown_rather_than_open_when_it_cannot_be_evaluated(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The fail-open shape for the REPORT half: a predicate that raises must not
+    print anything an operator could read as "merging is fine now"."""
+    config, _store, _executions, _worker, _blockers, _blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    def boom(*_a, **_kw):
+        raise GitCommandError("rev-parse", "the checkout is unreadable")
+
+    monkeypatch.setattr(cli, "_merge_window_blockers", boom)
+
+    assert _discard() == 0, "the discard itself is durable before this is asked"
+    out = capsys.readouterr().out
+    assert "merge window: UNKNOWN" in out and "Treat it as SHUT" in out
+    assert "merge window OPEN" not in out
+
+
+# ---- `answer` is unchanged ---------------------------------------------------
+
+
+def test_answer_on_a_blocked_task_still_leaves_its_execution_exactly_where_it_is(
+    tmp_path, repo, monkeypatch, capsys
+):
+    """The other half of "what must not change". Most answers mean "carry on
+    with the work you have", so `answer` requeues the task and touches NEITHER
+    half of its execution — which is precisely why `discard` had to be a
+    separate verb rather than a widening of this one."""
+    config, store, executions, worker, blockers, blocker = _quarantined_round(
+        tmp_path, repo
+    )
+    _wire(monkeypatch, config)
+
+    assert (
+        cli._cmd_answer(
+            argparse.Namespace(config=None, blocker_id=blocker.id, text="carry on")
+        )
+        == 0
+    )
+
+    assert store.load().state_of("dash-12") is TaskState.READY
+    answered = blockers.load(blocker.id)
+    assert answered.answer == "carry on", "an answer, not a machine reason"
+    assert executions.load("dash-12") is not None, "answer must not retire the record"
+    assert worker.path.is_dir(), "answer must not quarantine the worker"
+    assert not (config.executions_dir / "archive").exists()
+    assert "is ready again" in capsys.readouterr().out

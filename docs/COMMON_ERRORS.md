@@ -3276,6 +3276,30 @@ digest deliberately carries no argv and no environment.
 
 ---
 
+## 16. Autoloop operator recovery verbs (`release` / `shelve` / `discard`)
+
+### A merge-window test asserts the predicate names a BLOCKED task, and it names nothing
+**Symptom:** you are pinning that retiring a quarantined task's execution record
+stops `cli._merge_window_blockers` naming it. The *after* assertion passes; the
+*before* one — "while the task is `blocked`, its record holds the window shut" —
+fails with an empty `reasons` list, so the test proves nothing either way.
+**Cause:** `tasks.TaskRegistry.state_of` maps EVERY `blocked` row to
+`TaskState.BLOCKED_BY_OPERATOR`, whatever its provenance, and
+`_merge_window_blockers` exempts that state alongside `COMPLETED`, `RETIRED` and
+`SHIPPED_ELSEWHERE`. A quarantined task's execution record is therefore
+invisible to the window by construction. The hazard is not "a blocked task holds
+the window shut"; it is that the record STARTS holding it the instant the task
+returns to the queue, because `READY` carries no such exemption.
+**Fix:** make the control the REQUEUE rather than the quarantine — assert
+exempt-while-blocked, then requeue without retiring the record and assert the
+predicate does name it, then retire properly and assert it does not.
+`autoloop/tests/test_worker_publisher.py::test_the_merge_window_stops_naming_the_task_once_its_record_is_archived`
+is that shape. **Do not "fix" the exemption**: `answer` requeues a quarantined
+task while deliberately leaving its record and worker repo in place, so
+narrowing it would close the merge window on every ordinary unblock.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found
@@ -3377,6 +3401,7 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | bind-02 | New §8 entry directly above the repeated-`stop` one, for the fault that CAUSED that livelock rather than the livelock itself: `legacy_git_path_retired` on a correctly stamped `push`, after a `parse_error` on a review packet. The two entries are deliberately adjacent and cross-referenced — stop-01 bounds the symptom, this removes the cause, and an operator meeting the stop park should read both. |
 | 2026-08-24 | bind-02 | That entry carries the recovery for an OLD build, which is the half nobody had: the candidate is a real commit on `autoloop/<task-id>` in the worker repo, so publish it from there and `release` the task — do NOT re-run it, which produces a second candidate for work that already exists. On a current build the denial names the candidate and asks for `revise`; resending `push` is refused identically. |
 | 2026-08-24 | bind-02 | Revision round: the same §8 entry has a second, later-discovered shape worth recognising in a transcript. The re-prompt before the refused `push` is a `review_mismatch`, not a `parse_error`, and the `push` before THAT named an earlier packet id. Cause is the seam: a ledger-resolved approval leaves `last_response.postcommit` None, so the correction had nothing to inherit — and `review_mismatch_payload` asks the reviewer to stamp THIS request, which walks it straight back into the same denial. Fixed by carrying the resolved binding. |
+| 2026-08-26 | release-02 | New §16 for the operator recovery verbs, with one entry: a merge-window test whose "before" arm asserts a BLOCKED task's execution record holds the window shut fails, because `state_of` maps every blocked row to BLOCKED_BY_OPERATOR and `_merge_window_blockers` exempts it. The hazard begins at the REQUEUE, so the control has to be requeue-without-retiring. The entry names the wrong fix outright: narrowing that exemption would close the window on every ordinary `answer`. |
 | 2026-08-24 | dash-21 | New §2 entry, beside the `inspect.getsource` one recov-01 added: the advisory validation channel returns pytest's `-q` short-summary line and truncates the WHOLE line at roughly 180 characters, so a number smuggled out through a deliberately failed assertion is cut off if the message is not terse. A descriptive node id spends most of the budget before the message starts. The entry gives the arithmetic and the surviving shape (`B 8/141/3.06s A 1/20/1.96s`). |
 | 2026-08-24 | shelve-01 | No new error entry, and the absence is deliberate — nothing this round produced a symptom that is not already logged. The one trap worth knowing is documented at its call site instead: a module-level `from .worker_env import …` inside `worktask.py` is an IMPORT CYCLE (`worker_env` → `git_gateway` → `worktask`) that breaks every importer of the package, so `preserve_execution` defers it into the function body, the shape `merge_sweep` already uses for `from . import cli`. |
 | 2026-08-24 | recut-01 | A `task_fatal` park with code `recut_cap` is WORKING AS INTENDED: the reviewer asked to recut a task already cut twice from the base (§9g). Nothing was discarded on the way to it. |
