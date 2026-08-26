@@ -15,9 +15,10 @@ Both halves are tested, and the OFF half is not an afterthought: a reversible
 flag whose off position has drifted is not reversible.
 
 "The ONE task in flight" is enforced since setaside-01 (2026-08-26) rather than
-merely claimed: a park site may NAME a task, but only a task whose round is
-actually running is ever quarantined, and a park naming any other keeps the
-site's own loop-fatal terminal. Section 5b owns that claim.
+merely claimed: a park site may NAME a task, but only the loop's ONE active task
+is ever quarantined, and a park naming any other — or raised while the session's
+two round records disagree about which task is active at all — keeps the site's
+own loop-fatal terminal. Section 5b owns that claim.
 
 Self-contained per this codebase's convention (see `test_blockers.py`'s
 docstring) — the small config/orchestrator helpers are duplicated here rather
@@ -101,12 +102,14 @@ def build(tmp_path, *, enabled=False, max_recovery_attempts=2, with_store=True,
     enough for every classification test here.
 
     `in_flight` seeds `state.task_execution` with a task id and `dispatched`
-    seeds `state.current_task` with one. Together they are the round in flight,
-    which is the ONLY thing `_autonomous_set_aside_task` will quarantine: it
-    reads `task_execution` when the park site names no task, and it requires a
-    site that DOES name one to name a task one of the two records already
-    holds (setaside-01). Pass `in_flight=None` for the "a fault with no task
-    behind it" cases.
+    seeds `state.current_task` with one. Between them they decide the loop's ONE
+    active task, which is the only thing `_autonomous_set_aside_task` will
+    quarantine (setaside-01): the two agreeing, or only one of them naming
+    anything, resolves that identity; the two naming DIFFERENT tasks resolves
+    nothing at all and every set-aside is refused. A park site that names no
+    task still reads `task_execution` alone, so `dispatched` can only ever veto
+    that fallback, never supply it. Pass `in_flight=None` for the "a fault with
+    no task behind it" cases.
     """
     config = make_config(
         tmp_path, enabled=enabled, max_recovery_attempts=max_recovery_attempts
@@ -586,8 +589,10 @@ def test_a_fault_with_no_task_behind_it_parks_exactly_as_today(tmp_path):
 # reviewed packet was sent, and an approval naming an older packet genuinely
 # resolves a binding for a task that is not the one `state.task_execution`
 # describes. What the site's id must not do is DECIDE the quarantine — it is
-# validated against the round in flight, and a mismatch keeps the site's own
-# terminal instead of setting a bystander aside.
+# validated against the ONE active task, and a mismatch keeps the site's own
+# terminal instead of setting a bystander aside. Every test here seeds records
+# that AGREE about which task that is (or only one record at all); the state
+# where they disagree is section 5c's.
 
 
 def test_a_named_task_that_is_not_the_round_in_flight_is_not_quarantined(tmp_path):
@@ -618,7 +623,10 @@ def test_a_named_task_that_is_not_the_round_in_flight_is_not_quarantined(tmp_pat
     # The refusal left evidence rather than firing invisibly.
     refusals = transcript_entries(config, "autonomous_set_aside_refused")
     assert refusals and refusals[0]["named_task_id"] == "t2"
-    assert refusals[0]["round_task_ids"] == ["t1"]
+    assert refusals[0]["active_task_id"] == "t1"
+    assert refusals[0]["reason"] == "named_task_is_not_the_active_task", (
+        "this round HAS an active task — the refusal is about who was named"
+    )
     # And no retry was spent walking toward a park that still stops the loop.
     assert "autonomous_recovery" not in transcript_types(config)
 
@@ -742,7 +750,7 @@ def test_the_dispatched_task_counts_as_the_round_even_before_its_record_exists(
 
 def test_with_no_round_at_all_the_same_park_refuses_instead(tmp_path):
     """The negative twin of the test above, and the two together are what fail
-    if `state.current_task` is ever dropped from `_round_task_ids()`.
+    if `state.current_task` is ever dropped from `_active_task_id()`.
 
     Identical park, identical code, identical named task — the ONLY difference
     is that no record of any kind names a round. Here the set-aside must
@@ -758,7 +766,11 @@ def test_with_no_round_at_all_the_same_park_refuses_instead(tmp_path):
                         task_id="t1")
 
     refusals = transcript_entries(config, "autonomous_set_aside_refused")
-    assert refusals and refusals[0]["round_task_ids"] == []
+    assert refusals and refusals[0]["active_task_id"] == ""
+    assert refusals[0]["reason"] == "named_task_is_not_the_active_task", (
+        "no record names anything — that is an absent active task, not a "
+        "disagreement between two of them"
+    )
     assert not transcript_entries(config, "autonomous_rebuild_refused"), (
         "the rebuild ran for a park with no round behind it"
     )
@@ -769,13 +781,18 @@ def test_with_no_round_at_all_the_same_park_refuses_instead(tmp_path):
 
 
 def test_a_task_named_by_neither_record_is_refused_even_with_both_seeded(tmp_path):
-    """Both records populated and neither naming t3: still a bystander."""
-    orch, _, _, _, _ = build(
-        tmp_path, enabled=True, tasks=("t1", "t2"), in_flight="t1", dispatched="t2"
+    """Both records populated, AGREEING, and neither naming t3: still a
+    bystander. The disagreement case is section 5c's, deliberately — with the
+    two records agreeing, the refusal here can only be about who was named."""
+    orch, config, _, _, _ = build(
+        tmp_path, enabled=True, tasks=("t1", "t2"), in_flight="t1", dispatched="t1"
     )
     orch._to_needs_user("push refused", kind="loop_fatal",
                         code="publisher_url_drift", task_id="t3")
     assert orch.state.park_kind == "loop_fatal"
+    refusals = transcript_entries(config, "autonomous_set_aside_refused")
+    assert refusals[0]["reason"] == "named_task_is_not_the_active_task"
+    assert refusals[0]["active_task_id"] == "t1"
 
 
 @pytest.mark.parametrize("execution", [
@@ -808,6 +825,191 @@ def test_the_id_that_is_quarantined_is_read_off_the_round_not_off_the_caller(tmp
     assert orch.state.park_kind == "task_fatal"
     assert orch.state.park_task_id == "t1"
     assert blocker_store.load(orch.state.park_blocker_id).task_id == "t1"
+
+
+# =============================================================================
+# 5c. ONE active identity — records that DISAGREE license nothing
+#     (setaside-01, review round 2)
+# =============================================================================
+#
+# The hole the first cut of setaside-01 left. It read the two round records as
+# INDEPENDENTLY authoritative — `task_execution`, then `current_task`, first
+# match wins — so in a stale or transitional session (t1's reviewed candidate
+# still mirrored while awaiting push, t2 being dispatched) an explicit id
+# matching EITHER record was honoured. That is the same bystander hazard one
+# level down: t1's round is not the one running, and quarantining it on the
+# strength of a record the other record contradicts is exactly the guess this
+# task exists to remove.
+#
+# The rule is now ONE active identity: agreement (or only one record naming
+# anything) resolves it, disagreement resolves nothing, and nothing is set
+# aside without it. The `task_base_behind_head` path §9c-sexies preserves is
+# unaffected — it is the `task_execution`-absent row, where `current_task` is
+# the only record naming anything and therefore is the active identity.
+
+
+#: The two round records naming DIFFERENT tasks — the state every test in this
+#: section is about. `t1` is the mirrored execution record (its candidate is
+#: awaiting push), `t2` is the task `_dispatch` has just stamped as dispatched.
+DISAGREEING = {"in_flight": "t1", "dispatched": "t2"}
+
+
+@pytest.mark.parametrize("named", ["t1", "t2"])
+def test_neither_disagreeing_record_licenses_a_quarantine(tmp_path, named):
+    """THE claim of this section, run against BOTH ids in turn.
+
+    t1 is what `state.task_execution` names and t2 is what `state.current_task`
+    names, so under the first cut each of these parks quarantined the task it
+    named. Neither may now: with the records in disagreement the loop has no
+    active task, so `publisher_url_drift`'s own `loop_fatal` terminal survives
+    and the transcript says which of the two refusals fired."""
+    orch, config, blocker_store, _, _ = build(
+        tmp_path, enabled=True, tasks=("t1", "t2"), **DISAGREEING
+    )
+    orch.state.phase = Phase.EXECUTING.value
+
+    orch._to_needs_user("push refused", kind="loop_fatal",
+                        code="publisher_url_drift", task_id=named)
+
+    assert (orch.state.park_kind, orch.state.park_task_id) == ("loop_fatal", named)
+    assert blocker_store.load(orch.state.park_blocker_id).kind == "loop_fatal"
+    refusals = transcript_entries(config, "autonomous_set_aside_refused")
+    assert refusals and refusals[0]["reason"] == "round_identity_records_disagree", (
+        "the refusal must name the disagreement, not merely happen"
+    )
+    assert refusals[0]["named_task_id"] == named
+    assert refusals[0]["active_task_id"] == ""
+    assert (refusals[0]["execution_task_id"], refusals[0]["dispatched_task_id"]) == (
+        "t1", "t2"
+    ), "both records are reported raw, so the disagreement itself is readable"
+    assert "autonomous_recovery" not in transcript_types(config)
+
+
+def test_a_denied_directive_naming_t2_during_t1s_round_leaves_both_dispatchable(
+    tmp_path, capsys
+):
+    """The brief's scenario in the state the review round called out, driven
+    through the `cli._handle_parked_task` the set-aside relies on.
+
+    A directive about t2 is refused while t1's record is the one this session
+    mirrors; the two records disagree about which round is in flight, so the
+    loop quarantines NOTHING and stops instead. Registry state is the claim
+    here — the transcript assertions above are the evidence for how."""
+    orch, config, _, task_store, registry = build(
+        tmp_path, enabled=True, tasks=("t1", "t2"), **DISAGREEING
+    )
+    orch.state.phase = Phase.EXECUTING.value
+
+    orch._to_needs_user("the git environment changed", kind="loop_fatal",
+                        code="worker_environment_drift", task_id="t2")
+
+    verdict = cli._handle_parked_task(
+        config, StateStore(config.state_file), task_store, registry, orch.state
+    )
+
+    assert verdict == "loop_fatal"
+    reloaded = TaskStore(config.tasks_file).load()
+    assert reloaded.state_of("t2") is TaskState.READY, "the named task was blocked"
+    assert reloaded.state_of("t1") is TaskState.READY, "the mirrored task was blocked"
+    capsys.readouterr()
+
+
+def test_a_disagreement_refuses_the_rebuild_path_too(tmp_path):
+    """`task_base_behind_head` needs its own case, because `park_kind` cannot
+    discriminate for it: the site is ALREADY `task_fatal` naming t1, so
+    "parked task_fatal about t1" is exactly what the broken code produces.
+
+    What only the working guard can produce is the pair asserted here — a
+    refusal carrying the disagreement reason, and NO `autonomous_rebuild_refused`
+    entry, because a set-aside that resolves nothing drops the plan before the
+    rebuild is ever entered. Compare
+    `test_the_dispatched_task_counts_as_the_round_even_before_its_record_exists`,
+    where the same park with only `current_task` seeded does reach it."""
+    orch, config, blocker_store, _, _ = build(
+        tmp_path, enabled=True, tasks=("t1", "t2"), **DISAGREEING
+    )
+    orch.state.phase = Phase.EXECUTING.value
+
+    orch._to_needs_user("its recorded base is behind the branch head",
+                        kind="task_fatal", code="task_base_behind_head",
+                        task_id="t1")
+
+    refusals = transcript_entries(config, "autonomous_set_aside_refused")
+    assert refusals and refusals[0]["reason"] == "round_identity_records_disagree"
+    assert not transcript_entries(config, "autonomous_rebuild_refused"), (
+        "the rebuild ran on a session with no single active task"
+    )
+    # The SITE's terminal, unchanged — the guard preserves it, it does not
+    # impose one, and t1 is still merely REPORTED rather than resolved.
+    assert (orch.state.park_kind, orch.state.park_task_id) == ("task_fatal", "t1")
+    assert blocker_store.load(orch.state.park_blocker_id).task_id == "t1"
+
+
+def test_a_disagreement_also_vetoes_the_no_task_named_fallback(tmp_path):
+    """The other half of the boundary, and the reason the fallback is a veto
+    rather than a second lookup.
+
+    A park site that names NO task still reads `state.task_execution` alone —
+    but only while nothing contradicts it. Here t2 does, so the fallback
+    refuses as well instead of quarantining t1 on a record the session
+    disagrees with. Strictly NARROWER than before this change, which is the
+    direction the whole helper is allowed to move in."""
+    orch, config, blocker_store, _, _ = build(
+        tmp_path, enabled=True, tasks=("t1", "t2"), **DISAGREEING
+    )
+    orch.state.phase = Phase.AWAITING.value
+
+    orch._to_needs_user("logged out", resume_phase=Phase.AWAITING.value,
+                        kind="loop_fatal", code="login_expired")
+
+    assert orch.state.park_kind == "loop_fatal"
+    assert orch.state.park_task_id is None
+    assert blocker_store.load(orch.state.park_blocker_id).task_id == NO_TASK
+    refusals = transcript_entries(config, "autonomous_set_aside_refused")
+    assert refusals and refusals[0]["reason"] == "round_identity_records_disagree"
+    assert refusals[0]["named_task_id"] == "", "no site named anything here"
+    assert "autonomous_recovery" not in transcript_types(config), (
+        "no retry was spent walking toward a park that still stops the loop"
+    )
+
+
+#: The whole decision table `_autonomous_set_aside_task`'s docstring states,
+#: as (task_execution id, current_task id, active identity, no-id victim).
+#: `None` for a record means the session holds no such record at all.
+IDENTITY_TABLE = (
+    ("t1", None, "t1", "t1"),
+    ("t1", "t1", "t1", "t1"),
+    ("t1", "t2", None, None),
+    (None, "t2", "t2", None),
+    (None, None, None, None),
+)
+
+
+@pytest.mark.parametrize("recorded,dispatched,active,victim", IDENTITY_TABLE)
+def test_the_active_identity_and_the_fallback_row_by_row(
+    tmp_path, recorded, dispatched, active, victim
+):
+    """The table read directly off the two helpers, so the asymmetry between
+    them is pinned rather than described.
+
+    Row 4 is what keeps `task_base_behind_head` automated (an explicit id CAN
+    resolve from `current_task` alone) and simultaneously what keeps the
+    fallback narrow (a park naming NO task still gets no victim there). A
+    single helper used for both would have to fail one of those two rows."""
+    orch, _, _, _, _ = build(
+        tmp_path, enabled=True, tasks=("t1", "t2"),
+        in_flight=recorded, dispatched=dispatched,
+    )
+
+    assert orch._active_task_id() == active
+    assert orch._autonomous_set_aside_task(None) == victim
+    # An explicit id is honoured only when it IS the active identity — every
+    # other id in the table's universe is refused, whichever record holds it.
+    for named in ("t1", "t2", "t3"):
+        expected = named if named == active else None
+        assert orch._autonomous_set_aside_task(named) == expected, (
+            f"named={named} recorded={recorded} dispatched={dispatched}"
+        )
 
 
 # =============================================================================

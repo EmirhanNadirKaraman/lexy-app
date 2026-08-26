@@ -6985,9 +6985,10 @@ without a human saying so.
    existing quarantine `cli._handle_parked_task` already knows how to work past.
    The loop keeps going on the rest of the roadmap instead of stopping. "The one
    task in flight" is what this sentence always claimed and what the code
-   ENFORCES since setaside-01 — a park site may name a task, but only a task
-   whose round is actually running is ever quarantined, and a mismatch keeps the
-   site's own loop-fatal terminal. See §9c-sexies.
+   ENFORCES since setaside-01 — a park site may name a task, but only the loop's
+   ONE active task is ever quarantined, and a mismatch (or a session that cannot
+   say which task is active) keeps the site's own loop-fatal terminal. See
+   §9c-sexies.
 
 Stage 2 is the point; stage 1 is only worth doing where a recovery path
 genuinely exists. Nothing about §9c's machinery changed: the interception is at
@@ -7409,14 +7410,14 @@ report that continuous mode may carry on, while t1 — the task the fault
 actually belonged to — continued. Nothing observed had been mis-targeted when
 this was fixed; it was filed as latent.
 
-**The rule now.** The set-aside's answer is always a task whose round is in
-flight:
+**The rule now.** The set-aside's answer is always the loop's ONE active task:
 
-* a park site that names NO task is unchanged — the victim is read off
-  `state.task_execution`, and `None` there still means "park exactly as this
-  loop parks today" rather than "invent a victim";
+* a park site that names NO task is still ANCHORED on `state.task_execution` —
+  `None` there still means "park exactly as this loop parks today" rather than
+  "invent a victim" — and the active identity can only VETO that answer, never
+  supply one;
 * a park site that DOES name one has that id validated against
-  `_round_task_ids()` — an exact comparison after `.strip()`, never folded —
+  `_active_task_id()` — an exact comparison after `.strip()`, never folded —
   and the value that reaches `park_task_id` and the blocker record is the one
   read off the round's own record, so a caller-supplied string never passes
   through;
@@ -7432,7 +7433,7 @@ that away. (The two `push_candidate_*` codes name a binding too, but never
 consult this helper at all — `_autonomy_requires_a_task` answers False for
 `STALE_PUSH_BINDING`, see §9c-quinquies.)
 
-**`_round_task_ids()` reads TWO records, and the second is load-bearing.**
+**`_active_task_id()` reads TWO records, and they are ONE authority, not two.**
 `state.task_execution` is the better answer whenever it exists, but
 `_dispatch_task_postcommit` writes it only *after*
 `_rebase_execution_if_stale` has already had its chance to park
@@ -7447,10 +7448,42 @@ gate it narrowed, met from the other side. `test_autonomous_recovery.py::
 test_the_dispatched_task_counts_as_the_round_even_before_its_record_exists`
 pins it.
 
-**The refusal is loud.** `autonomous_set_aside_refused` carries the id the site
-named and the round's own ids, for the same reason
-`autonomous_rebuild_refused` exists: a guard that fires with no evidence reads
-to the next person as a guard that never fires.
+So a record is read only while **nothing contradicts it**: the two agreeing, or
+exactly one of them naming anything, resolves the active identity; the two
+naming DIFFERENT tasks resolves **nothing**, and every set-aside is refused
+until the session says one thing. The first cut of this section read them as two
+independent authorities — `task_execution`, then `current_task`, first match
+wins — which left the same hazard one level down: in a stale or transitional
+session (t1's reviewed candidate still mirrored while awaiting push, t2 being
+dispatched) an explicit id matching *either* record was honoured, so t1 could
+still be quarantined for a round that was not its own. The decision table, cell
+by cell against the behaviour before setaside-01:
+
+| `task_execution` | `current_task` | explicit id honoured | no-id victim |
+|---|---|---|---|
+| t1 | (none) | t1 only | t1 — unchanged |
+| t1 | t1 | t1 only | t1 — unchanged |
+| t1 | t2 | NEITHER — disagreement | none — narrower |
+| (none) | t2 | t2 (`task_base_behind_head`) | none — unchanged |
+| (none) | (none) | none | none — unchanged |
+
+Row 4 is what keeps the pre-execution `task_base_behind_head` automation alive;
+row 3 is the fail-closed one. **Its cost is real and is accepted rather than
+hidden:** a fault raised while the two records disagree — a `login_expired`
+during t2's dispatch while t1's record is still mirrored awaiting push — no
+longer quarantines anything, so the loop stops where it would previously have
+set a task aside and carried on. That is availability traded for never blocking
+work that did nothing wrong, and it is the only direction this helper is
+allowed to move in.
+
+**The refusal is loud, and it says WHICH refusal fired.**
+`autonomous_set_aside_refused` carries the id the site named, the resolved
+active id, and both records raw, under one of two reasons —
+`named_task_is_not_the_active_task` or `round_identity_records_disagree`. Same
+reason `autonomous_rebuild_refused` exists: a guard that fires with no evidence
+reads to the next person as a guard that never fires. Distinguishing the two is
+also what lets a regression prove that a *stale* id was refused for being
+stale, rather than merely refused.
 
 **Cross-reference.** This helper reached the base through halt-02/halt-03;
 halt-01's candidate is where a reviewer first found it, and halt-01 is blocked
