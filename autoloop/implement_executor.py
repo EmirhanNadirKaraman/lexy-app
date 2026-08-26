@@ -3268,7 +3268,14 @@ class ImplementExecutor:
         )
 
     def _aborted_outcome(
-        self, task: Task, git: GitGateway, *, raw_text: str = "", note: str = ""
+        self,
+        task: Task,
+        git: GitGateway,
+        *,
+        raw_text: str = "",
+        note: str = "",
+        measured: tuple[tuple[str, ...], PartialWork] | None = None,
+        validation: str = "",
     ) -> ExecutionOutcome:
         """What a round killed by `abort` reports.
 
@@ -3294,24 +3301,69 @@ class ImplementExecutor:
         killed nothing at all. `AbortLedger.reason` is the clause whichever site
         acted wrote for itself; the fallback covers the flag-only case honestly
         rather than claiming a kill nobody performed.
+
+        **`measured` exists because this is also called AFTER validation ran**
+        (abort-01 revision, 2026-08-26). `_partial_work` reads the tree at the
+        moment it is called, and the authoritative run can itself write into the
+        worker repo — a `ruff` cache directory that `git status -uall` then
+        reports. Re-measuring at the post-validation site would therefore fold
+        validation's own residue into the agent's count and hand the operator a
+        file list containing paths no agent wrote. The caller there passes the
+        measurement taken BEFORE the suite launched, which is the same pair
+        every other branch at that depth reports from. `None` means "measure
+        now", which is what the two pre-validation sites want and what they got
+        before this parameter existed.
+
+        **`validation` exists because "did not run" stops being true there.** A
+        suite that was launched and killed mid-flight, and a list of commands
+        refused before launching, are different facts, and `run_validation_
+        commands` has already written the one that happened: a `PASS`/`FAIL`/
+        `NOT RUN` line per command, naming which ones got as far as executing.
+        Empty means no authoritative run was reached at all — the honest report
+        for every pre-validation site — and anything else is that run's own
+        summary, passed through rather than re-narrated here.
+
+        The sentence around it is keyed on the LEDGER, not on the flag, because
+        the flag can also land after the suite has finished. A run this round
+        killed or refused was cut short; a run that had already completed says
+        so and keeps its verdict. Claiming the abort cut short a suite that
+        finished would overstate what the operator's button did, and a suite
+        that went red on the task's own merits is evidence the next round needs.
         """
-        changed, partial = self._partial_work(git)
+        changed, partial = self._partial_work(git) if measured is None else measured
         acted = self._abort_ledger.reason or (
             "the round was stopped before it could finish"
         )
+        if not validation:
+            # No authoritative run was reached at all — every pre-validation
+            # site, and the honest report for them.
+            account = " Validation did not run."
+        elif self._abort_ledger.killed:
+            account = f" Validation was cut short by the abort: {validation}"
+        else:
+            # Reached on the flag ALONE, so nothing here killed or refused a
+            # command: the suite had already finished when the operator's flag
+            # landed, and calling that "cut short" would be this report
+            # overstating what the abort actually did. Its verdict still rides
+            # along — a run that went red on the task's own merits before
+            # anybody pressed anything is evidence the next round needs, and
+            # discarding it because the round ended as an abort would lose it.
+            account = (
+                f" Validation had already finished when the abort landed: {validation}"
+            )
         summary = (
             f"task '{task.id}': the round was ABORTED by the operator — "
             f"{acted}, nothing was committed, and the task goes back to the "
             "queue with this work intact."
             + _partial_work_note(changed, partial)
-            + " Validation did not run."
+            + account
             + note
         )
         return ExecutionOutcome(
             status=EXECUTION_ABORTED,
             summary=summary,
             details=raw_text,
-            validation="not run (aborted)",
+            validation=validation or "not run (aborted)",
             changed_paths=changed,
         )
 
@@ -3570,6 +3622,54 @@ class ImplementExecutor:
             command_runner=self._command_runner,
             validation_env=self._validation_env,
         )
+        if abort_in_effect(self._abort_file, self._abort_ledger):
+            # THE SECOND HALF OF THE ABORT-THEN-RESUME RACE (abort-01 revision,
+            # 2026-08-26), and the one the earlier round left open. The check at
+            # the top of this method covers an abort that lands while the AGENT
+            # runs; nothing covered an abort that lands while the AUTHORITATIVE
+            # SUITE runs — which is a window of minutes, and the longest one left
+            # in a round now that the agent itself is killable.
+            #
+            # The sequence: the flag appears mid-suite -> `killable_run` kills
+            # the validation process group and records the ledger -> `resume`
+            # removes the flag -> this line. Falling through to `not passed`
+            # below would report the killed suite's own `rc=-99` as "validation
+            # failed after implementation", which is a `status="error"` round:
+            # the orchestrator's `abort_requested` read at
+            # `_dispatch_task_postcommit` finds no flag either, so the task is
+            # charged an attempt for a suite the operator stopped, and enough of
+            # those build the `attempt_count_ceiling` this task exists to
+            # prevent. The ledger is what this process DID, so it survives the
+            # file being deleted.
+            #
+            # BEFORE `not passed`, for the same reason the agent check sits ahead
+            # of `result.ok`: the failure is a CONSEQUENCE of the kill, and
+            # naming it as the cause would tell a reviewer that the task's own
+            # tests were red.
+            #
+            # `measured` and `validation` are what keep the report honest at THIS
+            # depth, and neither is optional here. The counts are the pair taken
+            # before the suite launched — re-measuring now would fold validation's
+            # own residue into the agent's work — and the summary is the real
+            # per-command `PASS`/`FAIL`/`NOT RUN` account, because a suite that
+            # was launched and killed is not a suite that "did not run". The
+            # delete and revert notes are threaded for the reason every other
+            # branch below the restore threads them: those passes have ALREADY
+            # run by this line, and telling an operator their work is "intact"
+            # while silently omitting a file this round unlinked is exactly the
+            # disclosure del-01 forbids skipping.
+            return self._aborted_outcome(
+                task,
+                git,
+                raw_text=result.raw_text,
+                note=(
+                    _scoped_delete_note(deletes)
+                    + _revert_note(reverts, reverts_recorded)
+                    + advisory.note()
+                ),
+                measured=(tuple(changed), partial),
+                validation=validation_summary,
+            )
         if not passed:
             return ExecutionOutcome(
                 status="error",

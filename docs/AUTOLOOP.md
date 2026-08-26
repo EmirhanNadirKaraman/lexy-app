@@ -3837,6 +3837,49 @@ asks `abort_in_effect(flag, ledger)` rather than the flag alone, so:
   as aborted, refunding an attempt nobody spent and shelving a working task —
   and `test_operator_abort.py` pins it rather than trusting the comment.
 
+**A ROUND HAS TWO LONG WINDOWS, AND BOTH ARE CLASSIFIED.** Recording the kill is
+only half the fix; the round has to READ the ledger everywhere the kill can land.
+`_run_implementation` asks `abort_in_effect` at three points, and the third was
+missing until the abort-01 revision (2026-08-26):
+
+* BEFORE the agent is spawned — the flag arrived in the window between the
+  orchestrator's own top-of-step check and this call, so no agent is paid for.
+* AFTER the agent returns, ahead of `result.ok` — the agent's window, and the
+  killed agent's `not ok` is a CONSEQUENCE of the kill, so reporting it as the
+  cause would tell a reviewer a healthy agent had wedged.
+* AFTER the authoritative `run_validation_commands` returns, ahead of `not
+  passed` — the SUITE's window, which since impl-02 is minutes long and is the
+  longest one left in a round now that the agent itself is killable. Without it
+  the sequence `flag appears mid-suite → the validation group is killed →
+  `resume` clears the flag → the round classifies itself` reported the killed
+  suite's own `rc=-99` as "validation failed after implementation", a
+  `status="error"` round. The orchestrator's flag read then found nothing
+  either, so the task was charged an attempt for a suite the operator stopped —
+  the same `attempt_count_ceiling` this verb exists to keep out of the books.
+
+That third site reports two things the other two cannot, because both have
+already happened by the time it is reached. The partial-work counts are the pair
+measured BEFORE the suite launched, since the authoritative run can itself write
+into the worker repo (a `ruff` cache directory `git status -uall` then reports)
+and re-measuring would fold validation's residue into the agent's work. And the
+validation account is the run's own per-command `PASS`/`FAIL`/`NOT RUN` summary
+rather than the fixed "Validation did not run" — a suite that launched and was
+killed is not a suite that never started, and which command was interrupted is
+real evidence about a repository the operator is about to resume into. That
+account is THREE-WAY, keyed on the ledger rather than on the flag, because the
+flag can also land after the suite has finished: no run reached at all says
+"did not run"; a run the ledger shows was killed or refused says "cut short by
+the abort"; and a run that had already completed says so and carries its own
+verdict, since claiming a round cut short a suite that finished — or claiming a
+kill on a round where nothing was killed — is the report overstating what the
+operator's button did. A suite that went red on the task's own merits before
+anybody pressed anything is evidence the next round needs, so its summary rides
+along rather than being discarded because the round ended as an abort. The
+in-scope deletions and the recorded reverts are disclosed on this path too, for
+the reason every branch below those passes discloses them: they are already on
+disk, and telling an operator their work is "intact" while omitting a file the
+round unlinked is exactly the disclosure del-01 forbids skipping.
+
 **WHERE THE KILL STOPS, stated rather than implied.** It bounds the agent call
 and the executor's own validation, which is nearly all of a round's wall clock.
 A round that has already COMMITTED a candidate finishes — post-commit validation

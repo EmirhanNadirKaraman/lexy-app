@@ -864,6 +864,144 @@ def test_a_flag_cleared_before_the_round_re_reads_it_is_still_an_abort(tmp_path)
     assert abort_file.exists() is False, "the test's own premise"
 
 
+def a_round_whose_suite_was_killed(tmp_path):
+    """Run the REAL executor through the race's SECOND window and return what it
+    reported: `(outcome, launched, abort_file)`.
+
+    THE WINDOW the first abort-01 round left open. The check at the top of
+    `_run_implementation` covers an abort landing while the AGENT runs; this one
+    lands while the AUTHORITATIVE SUITE runs, which since impl-02 is a window of
+    minutes and the longest one left in a round.
+
+    The runner reproduces `killable_run`'s own kill branch IN ORDER, and the
+    order is the whole point. Arming the flag before `execute()` would exercise
+    `abort_aware_command_runner`'s outer refusal instead — a different branch
+    writing a different clause — so the flag is armed INSIDE the runner, after
+    that outer check has already let the command through.
+    """
+    worker = real_repo(tmp_path, "killed-suite-worker")
+    abort_file = tmp_path / "ABORT"
+    ledger = AbortLedger()
+    launched = []
+
+    def killed_mid_suite(argv, **kwargs):
+        launched.append(tuple(argv))
+        abort_file.touch()  # the operator arms it, mid-suite
+        # what `killable_run` does on its next 0.25s tick:
+        ledger.record(
+            "the validation subprocess and every process it spawned were killed"
+        )
+        abort_file.unlink()  # `resume`, before the round classifies itself
+
+        class Killed:
+            returncode = ABORT_RETURNCODE
+            stdout = ""
+            stderr = ""
+
+        return Killed()
+
+    executor = executor_with(
+        worker,
+        WritingAgent(worker, {"A.py": "x\n" * 30}),
+        abort_file,
+        command_runner=killed_mid_suite,
+        ledger=ledger,
+    )
+    return executor.execute(implement(), a_task()), launched, abort_file
+
+
+def test_a_suite_the_operator_killed_is_not_the_tasks_own_red_validation(tmp_path):
+    """THE REGRESSION, executor side.
+
+    Sequence: the flag appears while the suite is live -> the validation process
+    group is killed and the ledger records it -> `resume` removes the flag ->
+    the round classifies itself. Without a ledger read at that point the killed
+    suite's own `rc=-99` falls through to "validation failed after
+    implementation" — a `status="error"` round — and the orchestrator's own flag
+    read finds nothing either, so the task is charged an attempt for a suite the
+    operator stopped.
+    """
+    outcome, launched, abort_file = a_round_whose_suite_was_killed(tmp_path)
+
+    assert launched, "the round never reached the authoritative run"
+    assert abort_file.exists() is False, "the test's own premise"
+    assert outcome.status == EXECUTION_ABORTED, (
+        "a suite the operator killed was reported as the task's own failing "
+        f"tests: {outcome.summary}"
+    )
+    assert "validation failed after implementation" not in outcome.summary
+    assert outcome.fault_kind == "", "an abort spends neither budget"
+    # It took the KILLED branch and says so. "refused before launching" is the
+    # other clause a validation abort can write, and reporting one for the other
+    # would tell the operator a suite ran that did not, or the reverse.
+    assert "validation subprocess" in outcome.summary, outcome.summary
+    # The work is still MEASURED — the constraint the task states — and measured
+    # from the tree as it stood before the suite launched.
+    assert "1 file(s) changed" in outcome.summary, outcome.summary
+    assert outcome.changed_paths == ("A.py",)
+
+
+def test_a_killed_suite_is_never_reported_as_a_suite_that_did_not_run(tmp_path):
+    """The abort report's fixed sentence stops being true at this site.
+
+    Every pre-validation abort site returns before any command launches, so
+    "Validation did not run" is exactly right there. Here the suite LAUNCHED and
+    was killed, and `run_validation_commands` has already written the per-command
+    `PASS`/`FAIL`/`NOT RUN` account of how far it got. That account is real
+    evidence about a repository an operator is about to resume into, and
+    replacing it with a blanket denial would discard it.
+    """
+    outcome, _launched, _abort_file = a_round_whose_suite_was_killed(tmp_path)
+
+    assert "Validation did not run" not in outcome.summary, outcome.summary
+    assert "cut short by the abort" in outcome.summary, outcome.summary
+    assert outcome.validation != "not run (aborted)", (
+        "the round threw away the suite's own account of what it managed to run"
+    )
+    # `state.last_validation` is written from this field, so an operator reading
+    # the loop's status sees which command was interrupted rather than a phrase.
+    assert "ruff" in outcome.validation, outcome.validation
+
+
+def test_a_finished_suite_is_not_reported_as_one_the_abort_cut_short(tmp_path):
+    """The flag can also land AFTER the suite finishes, and the report must not
+    claim a kill that never happened.
+
+    Nothing refused or killed a command on this path — the ledger is EMPTY and
+    the flag alone ends the round — so "cut short by the abort" would be the
+    report overstating what the operator's button did, and "the agent and every
+    process it spawned were killed" would invent a kill outright.
+
+    It also pins the new check as UNCONDITIONAL rather than an extra clause on
+    the failure branch: this suite passed, and the round still ends as an abort
+    — which is what the orchestrator's own flag read would do with it anyway.
+    """
+    worker = real_repo(tmp_path, "worker")
+    abort_file = tmp_path / "ABORT"
+
+    def finished_then_aborted(argv, **kwargs):
+        # The command completes normally and the flag lands in the window
+        # between it returning and the round classifying itself, so
+        # `killable_run` never sees it and nothing is recorded.
+        abort_file.touch()
+        return _green()
+
+    outcome = executor_with(
+        worker,
+        WritingAgent(worker, {"A.py": "x\n"}),
+        abort_file,
+        command_runner=finished_then_aborted,
+    ).execute(implement(), a_task())
+
+    assert outcome.status == EXECUTION_ABORTED, outcome.summary
+    assert "cut short" not in outcome.summary, outcome.summary
+    assert "had already finished" in outcome.summary, outcome.summary
+    assert "were killed" not in outcome.summary, (
+        "the report claimed a kill on a round where nothing was killed: "
+        + outcome.summary
+    )
+
+
 def test_a_healthy_round_after_an_aborted_one_is_not_classified_as_aborted(tmp_path):
     """THE DANGEROUS DIRECTION, and the reason the reset is unconditional.
 
@@ -1356,6 +1494,48 @@ def test_the_executors_signal_alone_aborts_a_round_whose_flag_is_already_gone(tm
     assert execution.attempt_count == 0, "an operator's abort spent an attempt"
     assert execution.fault_attempt_count == 0
     assert execution.attempt_ledger == ()
+    assert execution.candidate_sha == "", "an aborted round commits nothing"
+    assert orch.state.stop_kind == ABORT_STOP_KIND
+    assert orch._registry.get("t1").status == "pending", "resumable, not consumed"
+    assert run_git(repo_root, "rev-parse", "HEAD").strip() == head_before
+
+
+def test_a_killed_suite_costs_the_task_no_attempt_once_dispatch_has_seen_it(tmp_path):
+    """The BUDGET half of the killed-suite regression, driven end to end.
+
+    `fault_kind == ""` on its own does not prove the budgets are untouched: that
+    field is only consulted on the `outcome.status != "ok"` branch, which is the
+    branch this fix exists to avoid reaching at all. What actually leaves the
+    counters alone is the routing to `_abort_round` and its refund, so this
+    asserts the counters themselves — with the flag ABSENT, so `EXECUTION_ABORTED`
+    is the only signal left and the executor's own report has to carry the round.
+
+    The outcome is PRODUCED by the real executor rather than written out here.
+    An `ExecutionOutcome` typed into this test would prove only that the
+    orchestrator handles a shape a test author invented — the echo this file
+    grades everywhere else.
+    """
+    outcome, _launched, _abort_file = a_round_whose_suite_was_killed(tmp_path)
+    assert outcome.status == EXECUTION_ABORTED, "the premise this test replays"
+
+    def replay(worktree: Path):
+        worktree.mkdir(parents=True, exist_ok=True)
+        (worktree / "A.py").write_text("x\n" * 30, encoding="utf-8")
+        return outcome
+
+    orch, execution_store, repo_root, config = build(
+        tmp_path, lambda wr, rr: ScriptedExecutor(wr, [replay])
+    )
+    head_before = run_git(repo_root, "rev-parse", "HEAD").strip()
+
+    orch._dispatch_executor(implement())
+
+    assert abort_requested(config) is False, "the test's own premise"
+    execution = execution_store.load("t1")
+    assert execution.attempt_count == 0, "the operator's stop spent the task's budget"
+    assert execution.fault_attempt_count == 0, "an abort is not an environment fault"
+    assert execution.attempt_ledger == (), "the open entry is removed, not settled"
+    assert_books_balance(execution)
     assert execution.candidate_sha == "", "an aborted round commits nothing"
     assert orch.state.stop_kind == ABORT_STOP_KIND
     assert orch._registry.get("t1").status == "pending", "resumable, not consumed"
