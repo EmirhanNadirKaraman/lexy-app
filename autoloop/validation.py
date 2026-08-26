@@ -481,20 +481,95 @@ def run_validation_commands(
 # does not parse at all. None of those are argued away — every such file is put
 # on the frontier UNCONDITIONALLY (`ImportGraph.opaque`), so it is reachable
 # from any change and therefore always selected. It also cannot see a
-# non-Python input: a `.toml` a test reads, a fixture, an `.ini` that decides
-# collection. Those are not modelled at all; a commit touching one runs the FULL
-# suite. Every judgement in this section resolves the same way — when
-# reachability cannot be established, the answer is "run everything", never
-# "assume unrelated".
+# non-Python input: a `.toml` a test reads, a fixture, a markdown tracker, an
+# `.ini` that decides collection. The import graph models none of those, so
+# reachability is not what decides them — the next block is. Every judgement in
+# this section resolves the same way — when the answer cannot be established,
+# the answer is "run everything", never "assume unrelated".
 #
-# A KNOWN BOUND ON THE SAVING, stated because it is easy to over-read the
-# feature: `autoloop/tests/conftest.py` imports `autoloop.orchestrator`, which
-# imports most of the package, and a conftest is treated as imported by every
-# file beneath it. So a change to almost any `autoloop/` module selects the whole
-# `autoloop/tests` tree — soundly, since every test in it really does execute
-# that conftest. What such a round saves is the OTHER configured commands (the
-# root `tests/` suite, the `isolated` re-run) being skipped as unreachable, and
-# the counts `evidence()` reports say plainly which case a round is in.
+# ONE UNRESOLVABLE PATH MUST NOT VETO THE WHOLE SELECTION (select-01,
+# 2026-08-26).
+#
+# Until this change, ONE changed path the import graph could not resolve
+# discarded the graph's answer for every path that DID resolve, and the run went
+# full-suite. Measured over the loop's whole transcript on 2026-08-25: selection
+# had evaluated 154 rounds and chosen FULL SUITE in 146 of them; on the last day
+# every one of the 18 full-suite decisions named this same cause, and the paths
+# it named were the documentation trackers (`tasks.TRACKER_PATHS`) — files every
+# task is authorized to write and every task updates BY DESIGN. So the
+# conservative fallback fired on a path set present in essentially every commit
+# the loop makes, and a feature that shipped 2026-08-20 had never once narrowed
+# a real round.
+#
+# The defect was the SCOPE of the fallback, not the fallback. Failing safe on a
+# path whose effect cannot be established is right; discarding the answer for
+# the paths that DID resolve is not. The selected set is therefore a UNION:
+#
+#   * tests reachable through the import graph from each changed path that IS a
+#     resolvable Python module — unchanged behaviour, and
+#   * for each changed path that is NOT, a conservative set attributed to THAT
+#     path alone, from repository CONTENT references (`_reference_tokens`,
+#     `_files_referencing`): every `.py` file in the checkout whose source names
+#     the path, its basename, its stem, its extension or any directory above it,
+#     closed over the same reverse-import edges as any other seed, so a file
+#     that names the path drags in everything that imports it.
+#
+# Only when a specific unresolved path can be attributed NOTHING does the run go
+# full-suite, and the reason then NAMES that path rather than counting it.
+#
+# WHY MARKDOWN IS NOT TREATED AS INERT, AND WHY THE RULE IS SAFE ANYWAY. 33 test
+# files under `autoloop/tests/` named a documentation tracker before this change
+# and 34 do after it, `test_test_selection.py` having joined the population by
+# asserting on the seven filenames (measured 2026-08-26 by grep for those names;
+# the argument does not depend on the count, and the test that carries it reads
+# the population off the checkout rather than hard-coding a number). Skipping
+# them on a tracker change would be skipping real coverage —
+# `test_markdown_policy.py` exists to assert on
+# markdown handling, and `test_docs_merge.py` merges real branches through the
+# production note-merge path. This rule skips NONE of them, for a mechanical
+# reason rather than a judgement about each file: every one of those files
+# contains a `.md` filename literal, so the EXTENSION token alone makes each of
+# them a seed for every tracker path. Whether a given file reads the
+# repository's own `docs/SUMMARY.md` or builds its own fixture of the same name
+# — both shapes are in there — never has to be decided, which is the point: a
+# rule that had to tell those apart is a rule that could get one wrong.
+#
+# WHAT THIS SAVES, STATED SO IT CANNOT BE OVER-READ — AND IT IS SMALL ON EXACTLY
+# THE ROUND IT WAS WRITTEN FOR. The brief for this change estimated ~10-15% of
+# round wall-clock, on the assumption that the root `tests/` command (the
+# language app's suite, which shares no import with the loop) would be dropped
+# as unreachable on an autoloop-only round. Measuring the rule before writing it
+# says otherwise, and the reason is worth reading before trusting any number
+# here: THIS repository's modules document themselves by NAMING their docs.
+# `autoloop/__init__.py` names `docs/AUTOLOOP.md` in its module docstring, and
+# importing `autoloop.anything` is an edge to it, so every test that imports the
+# package at all is attributed to any changed `docs/*.md`. The evaluation
+# package's `__init__.py` names `docs/INGESTION_PIPELINE.md` the same way, and
+# `lexy-app/backend/tests/conftest.py` names a tracker, which through the
+# conftest edge covers that whole tree. So on a tracker-markdown round the
+# `autoloop/tests` tree and most of the app's trees are selected nearly whole,
+# and what is actually dropped is the TAIL: test files that name nothing and
+# import nothing that names anything. Real, bounded, and not a headline.
+#
+# That is not an argument against the change, because the alternative was not a
+# cheaper round — it was FULL SUITE, every time, forever. What this buys is that
+# a narrowed round becomes POSSIBLE at all: the resolvable half of every diff is
+# now used, and a round whose unresolved paths are LOCALIZED (a JSON fixture, a
+# generated reference, a workflow file — anything the repository names in one or
+# two places rather than in every module docstring) narrows properly. A rule
+# tuned to make the markdown case look good would have to stop following the
+# import edge out of a production module that names the path, and that edge is
+# the only reason the rule is sound at all.
+#
+# A BOUND THAT USED TO APPLY HERE AND NO LONGER DOES, corrected rather than
+# deleted because the old sentence is quoted in briefs:
+# `autoloop/tests/conftest.py` imported `autoloop.orchestrator` until brw-16
+# (2026-08-25), and a conftest counts as imported by every file beneath it, so a
+# change to almost any `autoloop/` module selected the whole `autoloop/tests`
+# tree — 92 files, measured the same day. That import is GONE (see that file's
+# own docstring, which explains why it must not come back), so an `autoloop/`
+# module change no longer selects the tree wholesale. Changing the conftest
+# ITSELF still selects everything under it, correctly.
 
 #: The two answers to "which tests does this commit need?", i.e. the accepted
 #: values of `[audit] test_selection`.
@@ -920,6 +995,95 @@ def build_import_graph(root: Path) -> ImportGraph:
     )
 
 
+def _reference_tokens(rel: str) -> tuple[str, ...]:
+    """Every literal a repository file would have to contain to NAME `rel`.
+
+    The path itself, its basename, its stem, its extension, and every ancestor
+    directory in both spellings (full prefix and bare name). A file that reads
+    `rel` has to say at least one of them somewhere: `open("docs/SUMMARY.md")`
+    says the first, `docs / "SUMMARY.md"` the second and the ancestor,
+    `docs / f"{name}.md"` the ancestor and the extension, and a directory sweep
+    like `root.rglob("*.md")` says the extension.
+
+    Deliberately over-broad and deliberately UN-TUNED: no minimum token length,
+    no word-boundary requirement, and no attempt to tell a docstring mention
+    from a real `open()`. Every one of those refinements would make the seed set
+    SMALLER, which is the direction that drops a test which executes the change;
+    a token that matches too much only makes more tests run. A one-character
+    directory name matching most of the checkout is the acceptable failure here,
+    and it degrades to today's behaviour (run everything) rather than to a
+    silent gap.
+
+    Sorted, so the seed set — and therefore the selection built from it — does
+    not depend on set iteration order.
+
+    The ancestor walk has TWO stops and the second is the load-bearing one: the
+    familiar roots, and a parent that is not SHORTER than the one before it.
+    `PurePosixPath("//x").parent` is `//`, whose own parent is `//` again —
+    POSIX leaves a leading double slash implementation-defined and pathlib
+    preserves it — so the root list alone spins forever on a shape git would
+    never report and nothing here validates. A selector that hangs is worse
+    than one that widens.
+    """
+    path = PurePosixPath(rel)
+    tokens = {rel, path.name, path.stem, path.suffix}
+    parent = path.parent
+    while parent.as_posix() not in (".", "/", ""):
+        tokens.add(parent.as_posix())
+        tokens.add(parent.name)
+        nxt = parent.parent
+        if len(nxt.as_posix()) >= len(parent.as_posix()):
+            break
+        parent = nxt
+    return tuple(sorted(token for token in tokens if token))
+
+
+def _files_referencing(
+    root: Path,
+    files: Sequence[str],
+    tokens_by_path: dict[str, tuple[str, ...]],
+) -> dict[str, frozenset[str]]:
+    """`{changed path: every graph file whose SOURCE names it}`.
+
+    One read per file for the WHOLE batch rather than one pass per changed path,
+    because the caller has just parsed the same files to build the graph and a
+    second full walk per path would multiply that cost by the size of the diff.
+
+    **A file this cannot read is a seed for EVERY path, not for none.** That is
+    the whole failure mode this function could have: a scan that quietly drops
+    its unreadable input is a check that silently passes, and the alarm never
+    fires. `build_import_graph` usually catches the same file on the same
+    `read_text` and marks it `opaque`, which `reachable_from` unions into every
+    seed set — but "usually" is not an argument: a file that parsed during the
+    walk and became unreadable a moment later is in neither set, and relying on
+    the graph to have covered it would make correctness here depend on a race.
+    Adding it can only run more tests. `ValueError` is in the tuple deliberately:
+    `UnicodeDecodeError` (a binary file named `.py`) is a `ValueError`, not an
+    `OSError`, and letting it propagate would abort a selection rather than
+    widen it.
+    """
+    hits: dict[str, set[str]] = {path: set() for path in tokens_by_path}
+    for rel in files:
+        try:
+            source = (root / rel).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            for found in hits.values():
+                found.add(rel)
+            continue
+        for path, tokens in tokens_by_path.items():
+            if any(token in source for token in tokens):
+                hits[path].add(rel)
+    return {path: frozenset(found) for path, found in hits.items()}
+
+
+def _listed(paths: Sequence[str], limit: int = _EVIDENCE_MAX_CONSIDERED) -> str:
+    """`paths` as evidence text, bounded — it reaches `state.last_validation`."""
+    shown = ", ".join(paths[:limit])
+    if len(paths) > limit:
+        shown += f" (+{len(paths) - limit} more)"
+    return shown
+
+
 @dataclass(frozen=True)
 class TestSelection:
     """What a per-commit validation run decided to execute, and why.
@@ -950,6 +1114,51 @@ class TestSelection:
     #: `False` when the configured list has no pytest command at all, i.e.
     #: there was no test selection to make. `evidence()` is then empty.
     applicable: bool = True
+    #: Changed paths the import graph resolved to a module it knows.
+    resolved: tuple[str, ...] = ()
+    #: `(changed path, number of test files)` for each UNRESOLVED path that was
+    #: given a conservative set of its own instead of widening the whole run.
+    #: Sorted by path, like everything else a reviewer compares between rounds.
+    attributed: tuple[tuple[str, int], ...] = ()
+    #: Unresolved paths nothing could be attributed to. Non-empty only on a
+    #: widened result, where `reason` names them too — this is the field that
+    #: says WHICH path forced a full run, rather than how many did.
+    unattributed: tuple[str, ...] = ()
+    #: `True` once the import graph has actually been consulted for this
+    #: decision. `False` on the widenings that happen BEFORE it is built (no
+    #: pytest command, `mode="full"`, a caller-supplied reason, no changed
+    #: paths, a graph that could not be read), where reporting "0 resolved"
+    #: would read as a failure to resolve rather than as work never done.
+    graph_consulted: bool = False
+
+    def _path_accounting(self) -> str:
+        """How each changed path was handled, in counts a reader can check.
+
+        Present in BOTH `evidence()` branches: a full-suite run needs to say how
+        much of the diff DID resolve just as much as a narrowed one does, since
+        that is the difference between "nothing could be established" and "one
+        path out of six forced this".
+        """
+        if not self.graph_consulted:
+            return ""
+        text = (
+            f" Path accounting: {len(self.considered)} changed path(s) — "
+            f"{len(self.resolved)} resolved as Python modules the import graph "
+            f"knows, {len(self.attributed)} not resolvable and attributed a "
+            "conservative set by repository content reference, "
+            f"{len(self.unattributed)} not resolvable and attributable to "
+            "nothing."
+        )
+        if self.attributed:
+            shown = [
+                f"{path} -> {count} test file(s)"
+                for path, count in self.attributed[:_EVIDENCE_MAX_CONSIDERED]
+            ]
+            if len(self.attributed) > _EVIDENCE_MAX_CONSIDERED:
+                extra = len(self.attributed) - _EVIDENCE_MAX_CONSIDERED
+                shown.append(f"(+{extra} more)")
+            text += " Attributed: " + "; ".join(shown) + "."
+        return text
 
     def evidence(self) -> str:
         if not self.applicable:
@@ -957,7 +1166,7 @@ class TestSelection:
         if self.widened:
             return (
                 "test selection: FULL SUITE — every configured test command ran "
-                f"unmodified ({self.reason})."
+                f"unmodified ({self.reason}).{self._path_accounting()}"
             )
         selected = list(self.selected[:_EVIDENCE_MAX_SELECTED])
         if len(self.selected) > _EVIDENCE_MAX_SELECTED:
@@ -973,7 +1182,7 @@ class TestSelection:
         return (
             "test selection: SUBSET by import-graph reachability — "
             f"{len(self.selected)} of {self.total_test_files} test file(s) are "
-            f"reachable from the {len(self.considered)} changed path(s) in this "
+            f"selected from the {len(self.considered)} changed path(s) in this "
             f"commit range [{', '.join(considered)}] by following the reverse of "
             "every import edge in the repository, transitively, so a test file "
             "the commit did not touch is still selected whenever it can reach "
@@ -986,9 +1195,14 @@ class TestSelection:
             "another repository module, and the cases where that cannot be read "
             "statically are not assumed away: a file using a dynamic import or "
             "spawning an interpreter, or one that fails to parse, is selected "
-            "unconditionally, and a commit touching anything outside the "
-            "resolvable Python import graph (config, fixtures, docs) runs the "
-            f"FULL suite instead.{dropped} {PRECOMMIT_EVIDENCE} To widen, "
+            "unconditionally, and a changed path outside the resolvable Python "
+            "import graph (config, fixtures, docs) is not assumed unrelated "
+            "either — it is attributed its OWN conservative set, every "
+            "repository file whose source names that path, its basename, its "
+            "stem, its extension or any directory above it, closed over the "
+            "same import edges, while a path that can be attributed nothing at "
+            f"all still widens the whole run.{self._path_accounting()}"
+            f"{dropped} {PRECOMMIT_EVIDENCE} To widen, "
             "either OPERATOR lever (a `plan` directive can set neither): "
             '`[audit] test_selection = "full"` in the loop config, which takes '
             "effect on the next round and — since the pre-commit run is not "
@@ -1152,19 +1366,30 @@ def select_validation_commands(
     is sorted before it is used. Two runs over the same diff produce the same
     commands and the same evidence string.
 
-    Every uncertainty widens. In order: no pytest command to narrow, mode
-    `full`, a caller-supplied reason, no changed paths, a graph that could not
-    be built or was truncated, a changed path that is not a Python file the
-    graph resolves, a reachability result of zero test files — which is treated
-    as a gap in the model rather than as proof that no test exercises the change
-    — and finally a configured pytest command that cannot be retargeted safely
+    Every uncertainty widens, but each widening is as LOCAL as it can honestly
+    be. In order: no pytest command to narrow, mode `full`, a caller-supplied
+    reason, no changed paths, a graph that could not be built or was truncated,
+    a changed `.py` path the graph does not contain, an unresolved path nothing
+    in the checkout names, a selection of zero test files — which is treated as
+    a gap in the model rather than as proof that no test exercises the change —
+    and finally a configured pytest command that cannot be retargeted safely
     (`_RETARGET_BLOCKED`), which widens the WHOLE run rather than leaving that
     one command as configured, because a `TestSelection` reporting a subset must
     describe every command it returned.
 
-    The one thing that does NOT widen is a pytest command none of the selected
-    files live under: that is a reachability answer rather than an unknown, so
-    the command is dropped, named in `skipped`, and disclosed by `evidence()`.
+    Two things do NOT widen, and both are ANSWERS rather than unknowns:
+
+    * **A changed path the import graph cannot resolve** — a `.md`, a `.toml`, a
+      fixture — no longer discards the answer for the paths that did resolve.
+      It is given a conservative set of its own (`_reference_tokens` /
+      `_files_referencing`: every repository file whose source names it, closed
+      over the same import edges) and the result is UNIONED with reachability
+      from the resolved paths. Only a path that can be attributed nothing goes
+      back to the full suite, and `reason` then names that path. See the
+      "one unresolvable path must not veto the whole selection" block above for
+      the measurement that forced this and the argument that it is safe.
+    * **A pytest command none of the selected files live under**: the command is
+      dropped, named in `skipped`, and disclosed by `evidence()`.
     """
     commands = tuple(tuple(argv) for argv in commands)
     applicable = any(_pytest_index(argv) is not None for argv in commands)
@@ -1174,7 +1399,15 @@ def select_validation_commands(
     # belt-and-braces against a later reordering of the checks below.
     considered = tuple(sorted({path for path in changed_paths if path.strip()}))
 
-    def full(reason: str, total: int = 0) -> TestSelection:
+    def full(
+        reason: str,
+        total: int = 0,
+        *,
+        resolved: tuple[str, ...] = (),
+        attributed: tuple[tuple[str, int], ...] = (),
+        unattributed: tuple[str, ...] = (),
+        consulted: bool = False,
+    ) -> TestSelection:
         return TestSelection(
             commands=commands,
             widened=True,
@@ -1182,6 +1415,10 @@ def select_validation_commands(
             considered=considered,
             total_test_files=total,
             applicable=applicable,
+            resolved=resolved,
+            attributed=attributed,
+            unattributed=unattributed,
+            graph_consulted=consulted,
         )
 
     if not applicable:
@@ -1204,23 +1441,82 @@ def select_validation_commands(
     total = len(graph.test_files)
     if not total:
         return full("the import graph found no test files at all", total)
-    unresolved = [path for path in considered if path not in graph.files]
-    if unresolved:
-        shown = ", ".join(unresolved[:_EVIDENCE_MAX_CONSIDERED])
-        if len(unresolved) > _EVIDENCE_MAX_CONSIDERED:
-            shown += f" (+{len(unresolved) - _EVIDENCE_MAX_CONSIDERED} more)"
+    resolved = tuple(path for path in considered if path in graph.files)
+    unresolved = tuple(path for path in considered if path not in graph.files)
+    # A changed `.py` path the graph does NOT contain is the one unresolved kind
+    # that cannot be attributed: it was deleted by this commit, or it lives
+    # outside the walk. The files that import it name it as a dotted module
+    # (`from autoloop.gone import x`), never as a path, so a content-reference
+    # scan cannot find them either — and those importers are exactly what a
+    # deletion breaks. Widen, and name the path.
+    unusable = tuple(path for path in unresolved if path.endswith(".py"))
+    if unusable:
         return full(
-            f"{len(unresolved)} changed path(s) are not Python modules the import "
-            f"graph resolves, so reachability cannot be established for them: {shown}",
+            f"{len(unusable)} changed Python path(s) are absent from the import "
+            "graph (deleted by this commit, or outside the walk), so neither "
+            "reachability nor a content-reference attribution can be established "
+            f"for them: {_listed(unusable)}",
             total,
+            resolved=resolved,
+            unattributed=unusable,
+            consulted=True,
         )
-    reachable = graph.reachable_from(considered)
-    selected = tuple(sorted(path for path in reachable if _is_test_file(path)))
+    # Everything else unresolved gets a set of its OWN rather than vetoing the
+    # paths that resolved. One scan of the checkout serves the whole diff, and
+    # an all-Python diff pays for no scan at all.
+    references = (
+        _files_referencing(
+            repo_root,
+            sorted(graph.files),
+            {path: _reference_tokens(path) for path in unresolved},
+        )
+        if unresolved
+        else {}
+    )
+    attributed: list[tuple[str, int]] = []
+    attributed_tests: set[str] = set()
+    unattributed: list[str] = []
+    for path in unresolved:
+        seeds = references[path]
+        # Tested on the SEEDS, not on the closure: `reachable_from` unions
+        # `graph.opaque` into every call, so an empty seed set still comes back
+        # with the always-selected files and would look like an established
+        # answer built from no evidence at all. That is the fail-open this
+        # branch exists to refuse.
+        tests = (
+            frozenset(p for p in graph.reachable_from(seeds) if _is_test_file(p))
+            if seeds
+            else frozenset()
+        )
+        if not tests:
+            unattributed.append(path)
+            continue
+        attributed.append((path, len(tests)))
+        attributed_tests |= tests
+    if unattributed:
+        return full(
+            f"{len(unattributed)} changed path(s) are not Python modules the "
+            "import graph resolves AND no repository file names them, so no "
+            "conservative test set can be attributed to them: "
+            f"{_listed(tuple(unattributed))}",
+            total,
+            resolved=resolved,
+            attributed=tuple(attributed),
+            unattributed=tuple(unattributed),
+            consulted=True,
+        )
+    reachable = graph.reachable_from(resolved)
+    selected = tuple(
+        sorted({path for path in reachable if _is_test_file(path)} | attributed_tests)
+    )
     if not selected:
         return full(
             "reachability selected no test file at all, which is likelier a gap "
             "in the model than a change no test exercises",
             total,
+            resolved=resolved,
+            attributed=tuple(attributed),
+            consulted=True,
         )
     kept: list[tuple[str, ...]] = []
     skipped: list[tuple[tuple[str, ...], str]] = []
@@ -1244,12 +1540,18 @@ def select_validation_commands(
             "run widens rather than record a subset they did not execute: "
             + "; ".join(blocked),
             total,
+            resolved=resolved,
+            attributed=tuple(attributed),
+            consulted=True,
         )
     if not kept:
         return full(
             "every configured command would have been skipped, leaving nothing "
             "to validate",
             total,
+            resolved=resolved,
+            attributed=tuple(attributed),
+            consulted=True,
         )
     return TestSelection(
         commands=tuple(kept),
@@ -1260,4 +1562,7 @@ def select_validation_commands(
         total_test_files=total,
         skipped=tuple(skipped),
         applicable=True,
+        resolved=resolved,
+        attributed=tuple(attributed),
+        graph_consulted=True,
     )

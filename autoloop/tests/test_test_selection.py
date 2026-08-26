@@ -9,12 +9,27 @@ matter more than the rest and are pinned first:
   on 2026-08-06 (auto-01's f06454b5), reproduced here against the REAL
   repository rather than a fixture, because a fixture would only prove the
   fixture;
-* every case where reachability cannot be established runs the whole suite.
+* every case where the answer cannot be established runs the whole suite. Read
+  that with the third block below: since select-01 the unestablished thing is a
+  single PATH rather than the whole commit, so the widening is per-path — but
+  nothing narrows on an answer the model does not have.
 
 A block in the middle pins the resolution rule those two properties rest on: an
 import NAME is looked up in the importing file's own directory context, not only
 at the repo root, because `autoloop/tests/` is not a package and its modules
 import each other by bare name — including this one, twice, at the top.
+
+A block after that one pins what happens to a changed path the graph CANNOT
+resolve — a `.md`, a `.toml`, a fixture. Until select-01 (2026-08-26) one such
+path discarded the answer for every path that did resolve and the run went
+full-suite, which fired on 146 of 154 rounds because the documentation trackers
+are edited by design on every round. The fallback is now per-path: an
+unresolvable path is attributed its own conservative set from repository content
+references, the whole run widens only when a SPECIFIC path can be attributed
+nothing, and the reason names that path. The soundness claim those tests carry
+is the one that matters — no test that names a tracker is ever skipped on a
+tracker change — and it is asserted against the REAL repository over the whole
+population, not against a fixture that would only prove the fixture.
 
 A third block, at the bottom, pins the PHASE this round reached. A loop round
 validates twice — once inside `ImplementExecutor` before the commit, once
@@ -38,6 +53,8 @@ from autoloop.tasks import Task
 from autoloop.validation import (
     TEST_SELECTION_FULL,
     TEST_SELECTION_REACHABLE,
+    _files_referencing,
+    _reference_tokens,
     build_import_graph,
     select_validation_commands,
 )
@@ -55,6 +72,20 @@ from test_implement_executor import (
 from test_orchestrator import URL, build_postcommit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: `build_import_graph(REPO_ROOT)` costs an `ast.parse` of every `.py` file in
+#: the checkout, and several tests here need the same answer about the same
+#: tree — which does not change while the suite runs. Cached per process, so
+#: adding a real-repository test costs an assertion rather than another walk.
+_REAL_GRAPH = None
+
+
+def real_repository_graph():
+    global _REAL_GRAPH
+    if _REAL_GRAPH is None:
+        _REAL_GRAPH = build_import_graph(REPO_ROOT)
+    return _REAL_GRAPH
+
 
 RUFF = ("ruff", "check", ".")
 SUITE = ("python3", "-m", "pytest", "suite", "-q", "-n", "auto", "-p", "no:cacheprovider")
@@ -171,7 +202,7 @@ def test_the_real_repository_selects_test_v1_smoke_for_a_publisher_change():
     assertion is what makes the first one mean something: it is selected by an
     import edge, not because the model gave up and marked it opaque.
     """
-    graph = build_import_graph(REPO_ROOT)
+    graph = real_repository_graph()
     assert "autoloop/tests/test_v1_smoke.py" not in graph.opaque
 
     chosen = selection(
@@ -246,7 +277,7 @@ def test_a_bare_sibling_import_is_a_real_edge_in_the_real_repository():
     one that can tell the two apart, and it is false unless the bare name
     resolves in this file's own directory.
     """
-    graph = build_import_graph(REPO_ROOT)
+    graph = real_repository_graph()
     me = "autoloop/tests/test_test_selection.py"
 
     for imported in (
@@ -454,8 +485,18 @@ def test_a_changed_test_file_selects_itself(repo):
 
 
 def test_a_non_python_change_runs_the_full_suite(repo):
-    """A `.md`, a `.toml` a test reads, a fixture — the graph models none of
-    them, so nothing is narrowed."""
+    """A `.md`, a `.toml` a test reads, a fixture — the import graph models none
+    of them.
+
+    Since select-01 that is no longer the END of the story (an unresolvable path
+    gets a conservative set of its own — see the block below), but it is still
+    the story HERE: not one `.py` file this fixture writes contains `docs`,
+    `.md`, `NOTES` or `NOTES.md`, so nothing can be attributed to
+    `docs/NOTES.md` and the run widens exactly as it always did. This test is
+    left byte-identical on purpose — the local fallback is a narrowing of WHEN
+    the full-suite rule fires, not a replacement for it, and a rule that had to
+    rewrite this assertion would be the other thing.
+    """
     chosen = selection(repo, ["pkg/publisher.py", "docs/NOTES.md"])
 
     assert chosen.widened
@@ -469,6 +510,365 @@ def test_a_changed_path_absent_from_the_tree_runs_the_full_suite(repo):
 
     assert chosen.widened
     assert chosen.commands == COMMANDS
+
+
+# ---- one unresolvable path does not veto the others -------------------------
+#
+# The defect select-01 fixed: ONE changed path the graph could not resolve threw
+# away the answer for every path that did. Measured 2026-08-25, that fired on
+# 146 of 154 rounds, and on the last day 18 of 18 — always on the documentation
+# trackers, which every task edits by design. The tests below pin the union that
+# replaced it, the per-path widening that survived it, and the coverage claim
+# the whole rule stands on.
+
+
+def attribution_repo(root: Path) -> Path:
+    """`scaffold` plus ONE test file that names the markdown file by hand.
+
+    Nothing else in `scaffold` contains `docs`, `.md`, `NOTES` or `NOTES.md`
+    (see `test_a_non_python_change_runs_the_full_suite`), so this single file is
+    the entire reference set for `docs/NOTES.md` and every count below is
+    exact rather than approximate.
+    """
+    scaffold(root)
+    write(
+        root,
+        "suite/test_reads_notes.py",
+        'from pathlib import Path\n\n\n'
+        'def test_notes():\n'
+        '    assert Path("docs/NOTES.md").name\n',
+    )
+    return root
+
+
+def test_the_reference_tokens_cover_every_way_a_file_can_name_the_path():
+    """The rule stated as data: path, basename, stem, extension, ancestors.
+
+    The extension is the one that carries the tracker argument — a file that
+    sweeps a directory (`rglob("*.md")`) names no tracker and no `docs/`, and it
+    is caught by `.md` alone.
+    """
+    tokens = set(_reference_tokens("docs/SUMMARY.md"))
+
+    assert {"docs/SUMMARY.md", "SUMMARY.md", "SUMMARY", ".md", "docs"} <= tokens
+
+
+def test_the_ancestor_walk_terminates_on_a_doubled_root_slash():
+    """A hang, not a widening, is what an unbounded ancestor walk costs.
+
+    `PurePosixPath("//x").parent` is `//`, whose own parent is `//` again —
+    POSIX leaves a leading double slash implementation-defined and pathlib
+    preserves it — so stopping on a LIST of known roots never terminates here.
+    Git reports repo-relative paths and never this shape, and nothing in the
+    selector validates that, which is exactly why the walk is bounded by the
+    parent getting shorter instead. If this regresses the suite hangs rather
+    than failing, so it is worth having.
+    """
+    tokens = set(_reference_tokens("//weird/x.md"))
+
+    assert {"x.md", ".md", "x"} <= tokens
+    assert "weird" in tokens
+
+
+def test_an_unresolvable_path_no_longer_vetoes_the_paths_that_resolved(tmp_path):
+    """The whole point. One diff, two kinds of path, both used.
+
+    `suite/test_smoke.py` is selected by the import graph from
+    `pkg/publisher.py`; `suite/test_reads_notes.py` is selected by content
+    reference from `docs/NOTES.md`. Before this change the second path threw the
+    first one's answer away and all four test files ran.
+    """
+    root = attribution_repo(tmp_path / "union")
+
+    chosen = select_validation_commands(
+        COMMANDS, ["pkg/publisher.py", "docs/NOTES.md"], root
+    )
+
+    assert not chosen.widened, chosen.reason
+    assert chosen.resolved == ("pkg/publisher.py",)
+    assert chosen.attributed == (("docs/NOTES.md", 1),)
+    assert "suite/test_smoke.py" in chosen.selected, "from the resolved half"
+    assert "suite/test_reads_notes.py" in chosen.selected, "from the unresolved half"
+    assert "suite/test_unrelated.py" not in chosen.selected
+    assert "suite/test_lonely.py" not in chosen.selected
+
+
+def test_a_documentation_only_round_narrows_instead_of_widening(tmp_path):
+    """The commonest revise-round shape: no Python changed at all.
+
+    Nothing resolves, so the resolved half contributes nothing and the whole
+    selection is attribution. It must still be a SUBSET rather than a full run,
+    or a docs-only round pays for the entire suite to learn nothing.
+    """
+    root = attribution_repo(tmp_path / "docs-only")
+
+    chosen = select_validation_commands(COMMANDS, ["docs/NOTES.md"], root)
+
+    assert not chosen.widened, chosen.reason
+    assert chosen.resolved == ()
+    assert chosen.selected == ("suite/test_reads_notes.py",)
+
+
+def test_a_module_that_names_the_path_drags_in_the_tests_that_import_it(tmp_path):
+    """Why attribution is CLOSED over import edges instead of stopping at tests.
+
+    `suite/test_via_module.py` never says `docs`, `.md` or `NOTES` — its only
+    route to the changed file runs through a production module that holds the
+    path. A rule that selected only test files naming the path would skip it,
+    and it is the shape a test of a config/tracker READER always has.
+    """
+    root = tmp_path / "indirect"
+    scaffold(root)
+    write(root, "pkg/notes.py", 'PATH = "docs/NOTES.md"\n')
+    write(
+        root,
+        "suite/test_via_module.py",
+        "from pkg.notes import PATH\n\n\ndef test_path():\n    assert PATH\n",
+    )
+
+    chosen = select_validation_commands(COMMANDS, ["docs/NOTES.md"], root)
+
+    assert not chosen.widened, chosen.reason
+    assert chosen.selected == ("suite/test_via_module.py",)
+
+
+def test_an_unparseable_file_is_still_selected_on_a_documentation_only_round(tmp_path):
+    """The opaque frontier survives the new path too.
+
+    `test_broken.py` names nothing at all — not `docs`, not `.md` — and is
+    selected anyway, because `reachable_from` unions `graph.opaque` into every
+    seed set including an attribution one. A file the model cannot read is not
+    argued away on the new path any more than it was on the old.
+    """
+    root = attribution_repo(tmp_path / "opaque-docs")
+    write(root, "suite/test_broken.py", "def test_x(:\n")
+    graph = build_import_graph(root)
+    assert "suite/test_broken.py" in graph.opaque
+
+    chosen = select_validation_commands(COMMANDS, ["docs/NOTES.md"], root)
+
+    assert not chosen.widened, chosen.reason
+    assert "suite/test_broken.py" in chosen.selected
+
+
+def test_a_file_that_cannot_be_read_becomes_a_seed_for_every_path(tmp_path):
+    """The fail-open this function could have been, closed rather than argued.
+
+    A scan that quietly DROPS unreadable input is a check that silently passes
+    — the alarm never fires and nothing says so. Leaning on
+    `build_import_graph` having marked the same file `opaque` would not close
+    it either: a file that parsed during the walk and became unreadable a
+    moment later is in neither set, so correctness would rest on a race. It is
+    seeded for every unresolved path instead, which can only run more tests.
+    """
+    root = attribution_repo(tmp_path / "unreadable")
+
+    hits = _files_referencing(
+        root,
+        ["suite/test_reads_notes.py", "suite/vanished.py", "suite/test_unrelated.py"],
+        {
+            "docs/NOTES.md": _reference_tokens("docs/NOTES.md"),
+            "config/settings.toml": _reference_tokens("config/settings.toml"),
+        },
+    )
+
+    assert hits["docs/NOTES.md"] == frozenset(
+        {"suite/test_reads_notes.py", "suite/vanished.py"}
+    )
+    assert hits["config/settings.toml"] == frozenset({"suite/vanished.py"}), (
+        "a path nothing NAMES still gets the unreadable file, and nothing else"
+    )
+
+
+def test_an_unresolvable_path_nothing_names_widens_and_the_reason_names_it(repo):
+    """The fallback that survived, and the evidence requirement on it: a reader
+    gets the PATH that forced the full run, not a count of paths."""
+    chosen = selection(repo, ["pkg/publisher.py", "docs/NOTES.md"])
+
+    assert chosen.widened
+    assert chosen.unattributed == ("docs/NOTES.md",)
+    assert chosen.resolved == ("pkg/publisher.py",)
+    assert "docs/NOTES.md" in chosen.evidence()
+    assert "no repository file names them" in chosen.reason
+
+
+def test_a_deleted_python_module_is_named_as_the_cause(repo):
+    """A `.py` path the graph does not hold is the one unresolvable kind that
+    cannot be attributed: its importers name it as a dotted module, never as a
+    path, so a content scan cannot find the very files a deletion breaks."""
+    chosen = selection(repo, ["pkg/deleted.py"])
+
+    assert chosen.widened
+    assert chosen.unattributed == ("pkg/deleted.py",)
+    assert "pkg/deleted.py" in chosen.reason
+    assert "absent from the import graph" in chosen.reason
+
+
+def test_one_unattributable_path_widens_but_the_accounting_shows_the_rest(tmp_path):
+    """A widened run still has to account for the paths that DID resolve.
+
+    "Nothing could be established" and "one path out of three forced this" are
+    different evidence, and the counts are what tells them apart.
+    """
+    root = attribution_repo(tmp_path / "mixed")
+
+    chosen = select_validation_commands(
+        COMMANDS,
+        ["pkg/publisher.py", "docs/NOTES.md", "config/settings.toml"],
+        root,
+    )
+
+    assert chosen.widened
+    assert chosen.commands == COMMANDS
+    assert chosen.resolved == ("pkg/publisher.py",)
+    assert chosen.attributed == (("docs/NOTES.md", 1),)
+    assert chosen.unattributed == ("config/settings.toml",)
+    evidence = chosen.evidence()
+    assert "FULL SUITE" in evidence
+    assert "config/settings.toml" in evidence
+    assert "3 changed path(s)" in evidence
+    assert "1 resolved as Python modules" in evidence
+    assert "docs/NOTES.md -> 1 test file(s)" in evidence
+
+
+def test_the_accounting_is_absent_when_the_graph_was_never_consulted(repo):
+    """`mode="full"` short-circuits before any graph work. Reporting "0
+    resolved" there would read as a failure to resolve rather than as work never
+    done, which is the kind of true-but-misleading count this record exists to
+    avoid."""
+    asked = selection(repo, ["pkg/publisher.py"], mode=TEST_SELECTION_FULL)
+    consulted = selection(repo, ["pkg/publisher.py", "docs/NOTES.md"])
+
+    assert "Path accounting" not in asked.evidence()
+    assert asked.graph_consulted is False
+    assert "Path accounting" in consulted.evidence()
+    assert consulted.graph_consulted is True
+
+
+def test_a_narrowed_round_reports_its_accounting(tmp_path):
+    root = attribution_repo(tmp_path / "narrowed-accounting")
+
+    evidence = select_validation_commands(
+        COMMANDS, ["pkg/publisher.py", "docs/NOTES.md"], root
+    ).evidence()
+
+    assert "SUBSET" in evidence
+    assert "2 changed path(s)" in evidence
+    assert "1 resolved as Python modules" in evidence
+    assert "docs/NOTES.md -> 1 test file(s)" in evidence
+
+
+def test_attribution_is_deterministic_and_order_independent(tmp_path):
+    """Same diff, same answer — including the evidence string, which now carries
+    per-path counts a reviewer compares between rounds."""
+    root = attribution_repo(tmp_path / "stable")
+
+    first = select_validation_commands(
+        COMMANDS, ["docs/NOTES.md", "pkg/publisher.py"], root
+    )
+    second = select_validation_commands(
+        COMMANDS, ["pkg/publisher.py", "docs/NOTES.md"], root
+    )
+
+    assert first.selected == second.selected
+    assert first.attributed == second.attributed
+    assert first.commands == second.commands
+    assert first.evidence() == second.evidence()
+
+
+# ---- the same rule against the REAL repository ------------------------------
+
+
+TRACKER_NAMES = (
+    "SUMMARY.md",
+    "TESTS.md",
+    "COMMON_ERRORS.md",
+    "SECURITY.md",
+    "SCHEMA.md",
+    "CLAUDE.md",
+    "AUTOLOOP.md",
+)
+
+AUTOLOOP_SUITE = ("python3", "-m", "pytest", "autoloop/tests", "-q", "-n", "auto")
+ROOT_SUITE = ("python3", "-m", "pytest", "tests/", "-q", "-n", "auto")
+
+#: The DONE-WHEN round, computed once for this module for the same reason
+#: `real_repository_graph` is: `select_validation_commands` walks the whole
+#: checkout, and both real-repository tests below ask about the SAME round.
+_TRACKER_ROUND = None
+
+
+def tracker_round_selection():
+    """One `autoloop/` module beside the tracker markdown every task updates."""
+    global _TRACKER_ROUND
+    if _TRACKER_ROUND is None:
+        _TRACKER_ROUND = selection(
+            REPO_ROOT,
+            ["autoloop/merge_sweep.py", "docs/SUMMARY.md", "docs/TESTS.md"],
+            commands=(RUFF, AUTOLOOP_SUITE, ROOT_SUITE),
+        )
+    return _TRACKER_ROUND
+
+
+def test_a_module_plus_tracker_markdown_narrows_in_the_real_repository():
+    """DONE-WHEN, asserted against the checkout this loop actually validates.
+
+    This is the round shape that produced 18 of 18 full-suite decisions on
+    2026-08-25: one `autoloop/` module beside the tracker markdown every task
+    updates. It must now come back NARROWED, with each tracker carrying a set
+    attributed to it alone.
+    """
+    chosen = tracker_round_selection()
+
+    assert not chosen.widened, chosen.reason
+    assert chosen.resolved == ("autoloop/merge_sweep.py",)
+    assert [path for path, _ in chosen.attributed] == ["docs/SUMMARY.md", "docs/TESTS.md"]
+    assert all(count > 0 for _, count in chosen.attributed)
+    assert "autoloop/tests/test_merge_sweep.py" in chosen.selected
+
+
+def test_every_test_naming_a_tracker_still_runs_on_a_tracker_change():
+    """The soundness claim, over the whole population rather than a sample.
+
+    The brief for select-01 named ~34 test files under `autoloop/tests/` that
+    reference a tracker filename and warned that a rule treating markdown as
+    inert would skip real coverage — `test_markdown_policy.py` exists to assert
+    on markdown handling. This asserts the opposite property directly: not one
+    of them is missing from a tracker change's selection. Whether a given file
+    reads the repository's own copy or builds its own fixture of the same name
+    is never decided, and does not need to be: naming the file is enough.
+
+    The last assertion is what stops the rest being vacuous. This round also
+    changes `autoloop/merge_sweep.py`, so a file could in principle be selected
+    by ordinary reachability rather than by the markdown at all —
+    `test_markdown_policy.py` is NOT reachable from that module (it imports
+    `autoloop.audit.markdown` and `autoloop.errors`, neither of which touches
+    the sweep), so its presence in `selected` can only have come from
+    attribution.
+    """
+    graph = real_repository_graph()
+    referencing = sorted(
+        rel
+        for rel in graph.test_files
+        if rel.startswith("autoloop/tests/")
+        and any(
+            name in (REPO_ROOT / rel).read_text(encoding="utf-8")
+            for name in TRACKER_NAMES
+        )
+    )
+    assert len(referencing) >= 30, "the population the rule has to justify"
+
+    chosen = tracker_round_selection()
+
+    assert not chosen.widened, chosen.reason
+    assert [rel for rel in referencing if rel not in chosen.selected] == []
+    assert "autoloop/tests/test_docs_merge.py" in chosen.selected
+    policy_test = "autoloop/tests/test_markdown_policy.py"
+    assert policy_test in chosen.selected
+    assert policy_test not in graph.reachable_from(["autoloop/merge_sweep.py"]), (
+        "if the module change reached it, this test would pass without the "
+        "markdown attribution having done anything"
+    )
 
 
 def test_no_changed_paths_runs_the_full_suite(repo):

@@ -529,6 +529,28 @@ document you are writing the number into. Budget it as `180 − len("FAILED ") �
 len(nodeid) − len(" - AssertionError: ")`, and remember the deliberate failure
 costs you every command configured after that one.
 
+### Advisory validation says `autoloop/tests: TIMEOUT` while `ruff check .` PASSes
+**Symptom:** every advisory run comes back
+`ruff check .: PASS; python3 -m pytest -n 4 autoloop/tests -q -p no:cacheprovider: TIMEOUT; python3 -m pytest -n 4 tests/ -q -p no:cacheprovider: NOT RUN`,
+with no failing test named. Two runs in a row, over different trees. Measured
+2026-08-26 (select-01).
+**Cause:** the ADVISORY channel bounds one run at
+`implement_executor.ADVISORY_VALIDATION_TIMEOUT_SECONDS` = 600s — deliberately
+far below `run_validation_commands`' own 1800s default, which is what the
+executor's post-agent run uses, because an advisory run writes no files and to
+`stall.WorkerTreeProbe` a long one looks exactly like a wedged agent. So the
+message is "this exceeded the ADVISORY cap", not "this tree fails". A TIMEOUT
+here is neither a pass nor the round's verdict, and per §4h fail-fast every
+command after it reads `NOT RUN` — no evidence either way.
+**Fix:** do not read it as a verdict and do not re-run it unchanged; a second
+identical run buys nothing but ten minutes. Cut what YOUR change costs the
+suite first — anything real-repository-wide (`build_import_graph` over the
+checkout, an `rglob` of every file, a spawned interpreter) belongs behind one
+module-level cache rather than one call per test — then spend a run. If the
+cost is already no higher than before your task, say so and let the executor's
+1800s run decide; check what merged since the last recorded passing advisory
+run before blaming your own diff.
+
 ### Backend suite: hundreds of `asyncpg` errors, or one unreproducible failure
 **Symptom:** `python3 -m pytest -n auto` in `lexy-app/backend` reports something
 like `1260 errors` with tracebacks bottoming out in
@@ -3506,3 +3528,4 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-26 | port-05 | REVISION: `scripts/seed_validation_db.py:48` imports `autoloop.validation_env` — the only file outside `autoloop/` here that imports the package. `git rm -r autoloop/` turns it into an ImportError before the script reads an argument, and NEITHER validation command notices: ruff does not resolve imports, and nothing under `tests/` imports the script. Green tooling over a dead script is the trap. Lift the one function before the removal, not after — docs/TODO.md #46. |
 | 2026-08-26 | esc-02 | Two new §8 entries: `checkout_escape_detected` naming `.ruff_cache/` or `.claude/rules/` (your own tooling, fixed by moving the observed tree rather than by exempting a path — ruff's cache is ignored only because ruff writes its own `.gitignore` containing `*`, and a process manufacturing its own invisibility must never become an exemption rule), and the new `observed_checkout_unusable` park with what each of its four refusals means. |
 | 2026-08-26 | esc-02 | The remedy for the second one is "look before you delete". Nothing in the sync resets, repairs or removes anything the clone holds, because residue there IS the evidence — including residue a detected escape left in an earlier round. An empty directory is treated as absent and is not a refusal; `resolve-blocker` answering "does not exist yet" is not a failure either, since the loop rebuilds the clone at the next round's boundary. |
+| 2026-08-26 | select-01 | New §2 entry: advisory validation says `autoloop/tests: TIMEOUT` while `ruff check .` PASSes and `tests/` reads `NOT RUN`. The cap is `implement_executor.ADVISORY_VALIDATION_TIMEOUT_SECONDS` = 600s, deliberately far below the 1800s `run_validation_commands` default the executor's own post-agent run uses, so it is neither a pass nor the round's verdict. Hit twice in this round over two different trees; the entry says to cut your own repo-wide test cost before spending another run rather than re-running unchanged. |
