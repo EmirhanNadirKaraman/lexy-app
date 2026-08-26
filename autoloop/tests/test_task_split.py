@@ -1584,9 +1584,17 @@ def test_the_split_transition_is_in_the_transcript(tmp_path):
     assert event["artifacts_retired"] is True
 
 
-def test_the_decision_vocabulary_is_unchanged(tmp_path):
-    """No new verb was added: the trigger and the budget rule were what was
-    missing, and both answers ride on decisions the protocol already has."""
+def test_the_decision_vocabulary_is_pinned(tmp_path):
+    """ceil-01 added NO verb — its trigger and its budget rule were what was
+    missing, and both of its answers ride on decisions the protocol already had.
+    That is still true of the ceiling flow, and this test is what keeps it true:
+    the pin is here so a verb can only join the vocabulary deliberately.
+
+    split-03 joined it deliberately, and `split` is the ONE addition since. It
+    is a different claim from the ceiling's — a task can be correct and still
+    undeliverable in one piece — and it is exercised in
+    `test_split_decision.py`. Renamed from `..._is_unchanged`, because a test
+    asserting a changed set under that name is a lie about what it pins."""
     assert {d.value for d in Decision} == {
         "audit",
         "plan",
@@ -1596,6 +1604,7 @@ def test_the_decision_vocabulary_is_unchanged(tmp_path):
         "push",
         "commit_and_push",
         "recut",
+        "split",
         "stop",
         "ask_user",
     }

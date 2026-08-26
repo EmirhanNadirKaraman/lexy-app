@@ -377,9 +377,21 @@ def test_the_instructions_say_which_of_recut_and_stop_to_use():
     assert "YOU deciding" in text and "a HUMAN to decide" in text
 
 
+#: The verbs that did NOT exist before recut-01 wrote this file: `recut`, whose
+#: compatibility claim is the point of the test below, and `split` (split-03),
+#: which arrived later still. Excluding both is what keeps the test about the
+#: vocabulary that predates this task — including one of them would build a
+#: payload for a verb that had not been invented and assert it parses as legacy.
+_ADDED_SINCE_THE_PREVIOUS_VOCABULARY = {Decision.RECUT, Decision.SPLIT}
+
+
 @pytest.mark.parametrize(
     "decision",
-    sorted(d.value for d in ACTIVE_DECISIONS | RETIRED_DECISIONS if d != Decision.RECUT),
+    sorted(
+        d.value
+        for d in ACTIVE_DECISIONS | RETIRED_DECISIONS
+        if d not in _ADDED_SINCE_THE_PREVIOUS_VOCABULARY
+    ),
 )
 def test_a_reply_written_against_the_previous_vocabulary_still_parses(decision):
     """The compatibility claim, checked against every decision that existed
@@ -430,12 +442,17 @@ def test_wanted_decision_is_accepted_on_every_active_decision(decision):
     them — so forbidding it per-decision would forbid it exactly where it is
     used."""
     payload = {"version": 3, "decision": decision, "reason": "r", "wanted_decision": "split"}
-    if decision in ("implement", "revise", "recut"):
+    if decision in ("implement", "revise", "recut", "split"):
         payload["task_id"] = "t1"
     if decision == "revise":
         payload["feedback"] = "fix it"
     if decision == "plan":
         payload["tasks"] = [{"id": "t1", "title": "T", "description": "d"}]
+    if decision == "split":
+        # A successor id distinct from `task_id` above: a split naming its own
+        # parent is refused at dispatch, and a fixture that quietly wrote one
+        # would read as if the parser had blessed it.
+        payload["tasks"] = [{"id": "t1-a", "title": "T", "description": "d"}]
     if decision in ("commit", "commit_and_push"):
         payload["commit"] = {"message": "m", "paths": ["a.py"]}
     if decision in ("commit", "push", "commit_and_push"):

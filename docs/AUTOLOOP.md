@@ -8191,6 +8191,119 @@ question has an answer shape; "anything else worth recording" does not.
 one. Surfacing the same line in `python -m autoloop status` beside `repeat stops`
 would be the natural next step and was out of this task's approved scope.
 
+### 9h. `split` — the reviewer says a task is too big to review (split-03, 2026-08-26)
+
+**The gap, and it was already conclusive without counting anything.** brw-14
+(2026-08-24) produced a **416,193-byte** range diff against a 400,000-byte packet
+cap (`packet.RANGE_DIFF_MAX_BYTES`) and parked on
+`review_packet_build_failed`. It had **PASSED** post-commit review. It was refused
+only because the reviewer could not be shown the diff in full — so a task can be
+CORRECT and still undeliverable, and nothing in the decision vocabulary could say
+that. The same day, **five** task descriptions (brw-14, port-05, auto-02,
+shrink-01, del-01) each carried a hand-written sentence — *"this is ONE ROADMAP
+ITEM, NOT ONE COMMIT — produce a split plan if it is too large"* — which is an
+operator working around a missing verb five times in one day. auto-02 is 48 park
+codes in one task and nothing could propose that it be four.
+
+**Why none of the three existing verbs fits.**
+
+| Verb | What it orders | Why it is wrong here |
+|---|---|---|
+| `revise` | the same task, again, at the same SIZE | brw-14's round 1 was not wrong. Repeating it produces the same 416KB. |
+| `recut` (§9g) | the same task, from a clean BASE | Right for a contaminated branch. A recut of an oversized task is the same oversized task. |
+| `stop` | a human decides | Ends the round with a reason nobody acts on automatically. The task stays exactly as large. |
+
+**What it does.** `split` names a task and carries the SUCCESSORS it is retired
+into, in the same `tasks` key a `plan` uses:
+
+    decision: split
+    task_id:  brw-14
+    reason:   "the range diff is 416KB against a 400KB cap; it cannot be reviewed
+               in one piece"
+    tasks:    [ {id, title, description, approved_paths, depends_on?}, ... ]
+
+The successors are added, they inherit the parent's spent attempts, and the
+parent is RETIRED into them — `superseded_by` naming every one, its execution
+record archived to
+`.autoloop/executions/archive/<task>-split-by-reviewer-<stamp>.json` and its
+worker repo quarantined at `quarantine/<task>-split-by-reviewer-<stamp>`, under
+one label so the two name each other. Nothing is deleted. A `task_reviewer_split`
+transcript event carries the reviewer's own reason and both destinations.
+
+**There is ONE acceptance mechanism and this did not add a second.** The verb
+routes into `orchestrator._apply_split` — the body a ceiling decomposition
+(ceil-01, §9's attempt-ceiling classification) has used since it shipped: the
+durable `SplitIntent` marker, `TaskRegistry.add_many`,
+`retire(superseded_by=…)`, `release_task_to_pending`, and the startup
+reconciliation (split-04) that settles a crash between the three stores. What
+differs between the two triggers is LABELS ONLY, held in one frozen
+`SplitOrigin` table: the denial codes, the `retire_execution` label, and the
+transcript event. A second acceptance path is what `contract.Decomposition`
+forbids by name, and `Decomposition` itself stays PROSE — it is forbidden on a
+`split` by the parser.
+
+**ONE LEVEL, not recursion.** The payload is FLAT: a `TaskSpec` has no key
+through which a successor could carry a split of its own, so a nested proposal
+dies at `unknown_keys` rather than being applied — recursion is unrepresentable,
+not merely refused. And the successors are bounded by the same
+`MAX_SPLIT_DEPTH` (1) a ceiling decomposition's children are, through the same
+`tasks.Task.split_depth` field: **a split of an ordinary task spends the one
+level**, so its successors can afterwards be neither `split` nor
+ceiling-decomposed. The report says so in as many words, because a reviewer who
+discovers it by being refused has already spent a round. Exempting the verb from
+that cap was the alternative and it is unbounded subdivision — "one testable
+claim" is a judgement that can always be applied again, and every extra task
+costs a full round (measured 2026-08-24: 21.9-minute median plus a 4.3-minute
+gap, so a ten-way split is roughly four hours of fixed overhead before any work
+happens).
+
+**The bounds. Every one of them refuses before anything moves, and each says
+"Nothing was changed" because nothing was.**
+
+| Bound | How |
+|---|---|
+| **One level per planned task** | `MAX_SPLIT_DEPTH`, read off the durable `Task.split_depth`. A successor of an earlier split draws `reviewer_split_depth` — checked BEFORE the execution record is read, so it holds whatever state that successor's own round is in. The read is FAIL-CLOSED: a value that is not a non-negative int refuses rather than going through `_nonneg_int`, which answers 0 — and 0 means *may be split*, so an unreadable bound would switch this rule off exactly where it does its work. |
+| **Not a task that already has an outcome** | `reviewer_split_task_terminal`. `policy._check_task_reference` refuses a completed or retired parent, but has NO arm for `shipped_elsewhere`, which would otherwise reach `retire`'s own refusal from INSIDE `release_task_to_pending` — after the successors are in the registry. The ceiling trigger cannot reach that shape (`ceiling_plan_pending` filters terminal rows), so the guard lives on this path. |
+| **Not a task that is already ONE claim** | At least `MIN_CEILING_SPLIT_TASKS` (2) successors, or `reviewer_split_too_small`. A single successor inherits the parent's spend and hands the SAME unit of work a fresh floor of attempts under a new id — a rename that buys budget. A reviewer that believes the work is one unit is asking for `revise`. |
+| **Evidence, not speculation** | `reviewer_split_no_candidate` refuses a task that has committed no candidate. "Too large to review" is a judgement about something the reviewer has SEEN; a split proposed before any work exists is a re-scoping that defers a task nobody has attempted. (The ceiling trigger deliberately tolerates no candidate — it reads an attempt ledger instead.) |
+| **Never a published candidate** | `reviewer_split_candidate_published`. Published work is never retired by this loop. |
+| **Never one whose verdict is outstanding** | `_recut_outstanding_verdict`, shared with §9g and for the same budget-01 reason: a candidate still named by a packet this reply does not answer can still be approved. `reviewer_split_verdict_outstanding`. |
+| **No successor may strand** | `_successors_that_would_strand`: a successor may not depend on the parent being retired, nor on an already-retired task. `state_of` satisfies a dependency only on `completed`/`shipped_elsewhere`, so either waits forever and no supported command releases it. |
+| **The parent does not vanish** | `retire(superseded_by=<successors>)` plus the transcript event plus the report — three records, and a reader follows the parent's row straight to its successors. |
+| **The graph still decides** | The successors are ORDINARY tasks: `add_many` validates ids, descriptions, `approved_paths` and cycles atomically, `state_of` schedules them, and each still needs its own `decomposition` on the `implement` that starts it. A successor only the splitter understands would have moved the problem rather than solved it. |
+
+The strand rule is not theoretical. `add_many` ACCEPTS a successor that depends
+on the parent (the parent is still live at that moment); `retire` then re-points
+that edge at every live sibling, and a plan whose successors all name the parent
+is a cycle raised from INSIDE `retire`, after the children are already in the
+registry — the half-applied `*_parent_not_retired` park, from a plan a refusal
+catches for free. `--rewrite-dependents` had to be used by hand twice on
+2026-08-24 to clear the manual equivalent.
+
+**Policy gate.** `policy.authorize_directive` applies exactly one check to
+`split`: the same `_check_task_reference` every task-naming decision passes, so a
+completed, blocked, quarantined or retired parent is refused before dispatch —
+and `task_retired`'s denial is the one that NAMES the successor, which is what a
+reviewer asking to split an already-split task needs to hear. It is deliberately
+NOT phase-gated on `implement_enabled`, like `recut`: a split runs no executor.
+Every other bound is dispatch-time state and lives in `_dispatch_split`.
+
+**Everything else is a policy denial, not a park** — §9g's reasoning applies
+unchanged. The two `task_fatal` parks that remain are the shared acceptance's own
+half-applied endings (`reviewer_split_parent_not_retired`,
+`reviewer_split_retirement_failed`); recover from them exactly as from the
+`recut_retirement_failed` row in §10, moving the named worker repo and execution
+record aside by hand. A surviving execution record holds the repository-wide
+merge window shut (§3f), so it is the half worth moving first.
+
+**Old replies still parse.** Adding `split` widens `ACTIVE_DECISIONS` (derived by
+subtraction from `Decision`), so nothing that parsed before stops parsing.
+
+**This verb was NOT found by the `wanted_decision` tally**, and that is worth
+saying beside the subsection above: it was found by an operator writing the same
+workaround five times in one day, which is the slow way that subsection already
+documents. The tally stays a measurement and is never acted on.
+
 ---
 
 ## 10. Recovery procedures

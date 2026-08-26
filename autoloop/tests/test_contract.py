@@ -466,6 +466,12 @@ _COMPLETE_PAYLOADS = {
         "reviewed": REVIEWED,
     },
     "recut": {"task_id": "t1"},
+    # ONE successor parses on purpose. `split` requires at least
+    # `orchestrator.MIN_CEILING_SPLIT_TASKS`, and that count is authorization
+    # rather than shape — the same layering `approved_paths` and
+    # `decomposition` already use, so a one-successor split draws a bounded
+    # denial that explains itself instead of spending the parse-retry budget.
+    "split": {"task_id": "t1", "tasks": [task_spec()]},
     "stop": {},
 }
 
@@ -537,8 +543,18 @@ def test_reviewed_forbidden_for_implement():
     )
 
 
-def test_tasks_forbidden_outside_plan():
-    expect_code(block(base("stop", tasks=[task_spec()])), "unexpected_field")
+@pytest.mark.parametrize(
+    "decision", sorted(set(_COMPLETE_PAYLOADS) - {"plan", "split"})
+)
+def test_tasks_forbidden_outside_the_decisions_that_carry_them(decision):
+    """`tasks` is accepted by exactly two decisions (`contract.
+    CARRIES_TASK_SPECS`): `plan` ADDS them to the roadmap, `split` proposes them
+    as the successors a named task is retired into. Anywhere else it is a batch
+    of task definitions nothing would ever apply — and, since split-03, a
+    plausible-looking way to attach successors to a decision that cannot retire
+    anything. Generalizes the `stop`-only case this replaces."""
+    payload = base(decision, **_COMPLETE_PAYLOADS[decision], tasks=[task_spec()])
+    expect_code(block(payload), "unexpected_field")
 
 
 def test_notes_must_be_string():
@@ -1252,8 +1268,47 @@ def test_contract_stays_within_its_budget():
     "unsalvageable" means, how the cap survives the retirement that charges it,
     and the whole argument for the wanted-verb field. Those are in
     `docs/AUTOLOOP.md` §9g and in the source comments — the reviewer needs the
-    RULE every turn and the reasoning never."""
-    assert len(CONTRACT_INSTRUCTIONS) <= 4550
+    RULE every turn and the reasoning never.
+
+    **The ceiling MOVED a second time (split-03, 2026-08-26), to 5,300, and this
+    is that accounting.** A TENTH decision is the same "genuine new requirement"
+    recut-01's move was: the reviewer could not previously say "this task cannot
+    be delivered as one reviewable candidate", so brw-14 PASSED review and was
+    refused anyway for a 416,193-byte range diff, and an operator hand-wrote the
+    same workaround into five task descriptions in one day. A decision the
+    reviewer is never told about is a decision it will not use.
+
+    Paid down first, again. The `split` entry was drafted at eleven lines and
+    compressed to six, and its `vs revise vs recut` trailer from three lines to
+    two, by moving every WHY into the source comment on `Decision.SPLIT` and
+    into `docs/AUTOLOOP.md` §9h — both of which cost nothing per turn. What
+    survives in the prompt is only what the reviewer must apply while choosing:
+    what the verb does, that `tasks` are the successors, at least 2, ONE LEVEL,
+    no successor may depend on task_id, when it is refused, and that nothing is
+    deleted. What did NOT survive: why one level and not two, why a
+    one-successor split is a rename, what "stranded" means, and the whole
+    brw-14 account.
+
+    The remaining cost is a hand-summed +634 against the 4,478 hand sum above —
+    +457 for the six-line entry, +153 for the trailer, and +24 across the three
+    key lines (`decision`, `tasks`, `task_id`) that had to name the new verb.
+    That predicted roughly 5,112.
+
+    And this time the prediction was CHECKED. A temporary parametrized probe
+    (`len(...) > floor` for six floors) was run through the advisory validation
+    channel, which reports failing test ids but no numbers: 4,900 / 5,000 /
+    5,100 passed and 5,200 / 5,300 / 5,400 failed, so the real length is in
+    (5,100, 5,200] — the hand sum lands inside its own bracket. 5,300 is that
+    observed upper bracket plus the same order of headroom every earlier move
+    kept, and it is NOT room to write in. The probe was deleted; the reading it
+    left behind is `test_split_decision.test_the_measured_length_brackets_the_
+    ceiling`, which asserts the tighter 5,200 and so fails BEFORE this ceiling
+    does. Tighten this number against that one rather than against the hand sum.
+
+    The second copy of this number is `test_context.py::test_no_scheduling_
+    advice_moved_into_the_context_block`, which asserts the same ceiling for its
+    own reason. Move both or neither."""
+    assert len(CONTRACT_INSTRUCTIONS) <= 5300
 
 
 def test_preference_clause_has_its_own_tighter_budget():
