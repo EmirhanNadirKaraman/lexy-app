@@ -94,6 +94,16 @@ def _orch(repo, tmp_path, execution, review_round=0):
     orch._policy = PolicyEngine(PolicyConfig())
     orch._git = GitGateway(repo, orch._policy)
     orch._worker_repos = _FakeWorkerRepos(tmp_path / "workers")
+    # No loop-owned observed checkout (esc-02): this hand-built orchestrator
+    # observes the primary checkout, which is the pre-esc-02 behaviour and what
+    # every re-base assertion below is about. Set EXPLICITLY rather than left to
+    # `__new__`'s missing attribute, because `_rebase_execution_if_stale` now
+    # re-synchronises the clone before rebuilding a worker from it — a fixture
+    # that leaves the field absent tests an object production never builds.
+    # `test_observed_checkout.py` owns the with-a-clone half of this path.
+    orch._observed = None
+    orch._observed_git = None
+    orch._observed_synced_sha = ""
     # Reconciliation asks this before retiring anything — a record an
     # undrained auto-merge retry still reads must not be archived out from
     # under it. Empty here; the pin tests below put a deferral in it.

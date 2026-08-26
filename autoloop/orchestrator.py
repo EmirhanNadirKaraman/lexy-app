@@ -416,7 +416,12 @@ from .packet import (
 )
 from .policy import PolicyEngine, Verdict, retired_decision_verdict
 from .publisher import Publisher, redact_url
-from .worker_env import verify_worker_isolation, worker_env, worker_repo_is_reusable
+from .worker_env import (
+    ObservedCheckout,
+    verify_worker_isolation,
+    worker_env,
+    worker_repo_is_reusable,
+)
 from .prompts import (
     TEMPLATES,
     build_prompt,
@@ -1236,6 +1241,7 @@ class Orchestrator:
         provider_factory=None,
         sleep=time.sleep,
         self_upgrade_enabled: bool = False,
+        observed_checkout: ObservedCheckout | None = None,
     ):
         self._config = config
         self._store = store
@@ -1368,6 +1374,38 @@ class Orchestrator:
         # therefore `origin` — with the main checkout. Gated like the rest:
         # `None` keeps the pre-M2 linked-worktree behaviour.
         self._worker_repos = worker_repos
+        #: The LOOP-OWNED clone the escape detector watches (esc-02,
+        #: 2026-08-26 — `worker_env.ObservedCheckout`). When set, THREE things
+        #: move onto it and nothing else does: the before/after snapshots in
+        #: `_execute_with_escape_detection`, the clean-baseline precondition in
+        #: `_prepare_write_capable_worker`, and the fetch source every worker
+        #: repository is seeded from. Merges, pushes, worktrees and every read
+        #: of "what is the branch head" stay on the primary checkout, which the
+        #: loop no longer watches at all.
+        #:
+        #: `None` — every hand-built Orchestrator in the suite, and any
+        #: embedder that predates this — observes the primary checkout exactly
+        #: as before. That is the pre-esc-02 behaviour, kept deliberately so
+        #: this change is opt-in at the wiring, and it is NOT a fallback: once
+        #: a checkout IS configured, a clone that cannot be established parks
+        #: the round rather than quietly reverting to watching the shared tree.
+        #: `cli._build_orchestrator` always wires one (the default location is
+        #: derived from the mandatory `workers_root`), so production is always
+        #: on the dedicated tree.
+        self._observed = observed_checkout
+        #: Built once, lazily, by `_observation_git` — a `GitGateway` rooted at
+        #: the clone. Cached because `enumerate_checkout_paths` runs twice per
+        #: round through it and re-deriving the scrubbed environment each time
+        #: would buy nothing.
+        self._observed_git: GitGateway | None = None
+        #: The commit `_synchronise_observed_checkout` last brought the clone
+        #: to, or "". Reset at the start of EVERY sync (including the one that
+        #: fails and the no-clone no-op), because a value that outlived its
+        #: dispatch would hand `_observed_base_sha` a commit the clone is no
+        #: longer at — the stale-read failure this field exists to avoid, one
+        #: round over. In memory deliberately: it describes this process's
+        #: current belief about a tree, not a durable fact about the loop.
+        self._observed_synced_sha = ""
         #: The publisher's remote-url snapshot at the moment it was last
         #: (re)provisioned (`publisher.read_publisher_url_snapshot`), passed
         #: in by the caller rather than re-read here on every dispatch — so a
@@ -6659,6 +6697,31 @@ class Orchestrator:
 
         execution = self._execution_store.load(task.id)
         resumed = execution is not None
+        # THE CONTROLLED BOUNDARY for the loop-owned observed checkout
+        # (esc-02). Everything below either reads that tree or seeds a worker
+        # repository from it, so it is brought to the primary checkout's
+        # current head HERE — before the first of them, and a long way before
+        # `_execute_with_escape_detection`'s "before" snapshot, so no write of
+        # the loop's own can land between the two snapshots. `task_base_sha`
+        # rides along as an extra required commit because the two recreation
+        # paths below (`_rebase_execution_if_stale`'s sibling branch, and
+        # `_prepare_write_capable_worker`'s quarantine-and-recreate) can ask
+        # for a commit older than the head. A clone that cannot be established
+        # parks; there is no branch here that carries on with a stale tree.
+        #
+        # NOT gated on `self._worker_repos`, and that is the fail-open this
+        # boundary would otherwise have. The snapshot and the clean-baseline
+        # gate follow `self._observed` (`_observation_git`), so gating the SYNC
+        # on a different field means the two can disagree: a deployment that
+        # wires a clone but uses the legacy `worktrees` mechanism would skip
+        # this and then snapshot a clone that is CLEAN BUT STALE — identical
+        # before/after, no violation reported, and nothing saying the tree was
+        # never brought to this round's commit. That is the alarm not firing
+        # rather than firing wrongly. A no-op returning True when no clone is
+        # wired, so every worktree-based deployment is unchanged.
+        extra_shas = (execution.task_base_sha,) if execution is not None else ()
+        if not self._synchronise_observed_checkout(task, *extra_shas):
+            return
         # The three-fact reuse decision (wrk-01) is made HERE, before the
         # stale-base reconciliation below ever runs — that path would
         # otherwise quarantine and rebuild a perfectly valid worker solely
@@ -6689,7 +6752,7 @@ class Orchestrator:
             # the audit, whose scope is bounded by `MarkdownPolicy` instead
             # (see the `is_audit` comment above) and keeps the pre-M1
             # accumulate-from-`changed_paths` behaviour, unchanged.
-            base_sha = self._git.head_sha()
+            base_sha = self._observed_base_sha()
             allowed_paths = (
                 ()
                 if is_audit
@@ -6703,7 +6766,9 @@ class Orchestrator:
             # increments it (see `worktask.TaskExecution.recut_count`).
             seeded_recuts = 0 if is_audit else int(task.recut_count or 0)
             if self._worker_repos is not None:
-                repo = self._worker_repos.create(task.id, self._git.repo_root, base_sha)
+                repo = self._worker_repos.create(
+                    task.id, self._worker_fetch_root(), base_sha
+                )
                 execution = TaskExecution(
                     task_id=task.id,
                     task_branch=repo.branch,
@@ -6778,7 +6843,7 @@ class Orchestrator:
             else:
                 self._worker_repos.create(
                     task.id,
-                    self._git.repo_root,
+                    self._worker_fetch_root(),
                     execution.task_base_sha,
                     branch=execution.task_branch,
                 )
@@ -7337,11 +7402,17 @@ class Orchestrator:
         in-flight commit for this exact worktree. Two independent
         fail-closed gates (Autoloop M1 finding #3, failed-round isolation):
 
-          * the PRIMARY checkout (index + working tree) must be clean —
+          * the OBSERVED checkout (index + working tree) must be clean —
             refused outright (loop_fatal: this is an environmental
             precondition that affects every task, not just this one) rather
             than trusted as a baseline for the escape detector's snapshot
-            (`_execute_with_escape_detection`);
+            (`_execute_with_escape_detection`). "Observed" is the loop-owned
+            clone since esc-02 and the primary checkout only where none is
+            wired; the gate follows the tree the snapshot is taken of, or it
+            would be asserting cleanliness of a tree nobody is watching while
+            parking the loop for an operator's uncommitted edit. The park
+            keeps its `primary_checkout_dirty` code — same condition, same
+            remedy shape, one tree over;
           * the WORKER repo must have no uncommitted residue. Any dispatch
             that reaches here without having committed (a crashed agent, a
             validation failure that returned `status="error"` before
@@ -7359,9 +7430,10 @@ class Orchestrator:
             committed yet). The fetch SOURCE differs accordingly:
             `candidate_sha` exists only inside the object database we just
             quarantined, so that recreation fetches from the quarantined
-            path, not the primary checkout; `task_base_sha` always exists in
-            the primary checkout, so that recreation fetches from there as
-            usual.
+            path, not the observed checkout; `task_base_sha` is one of the
+            commits `_synchronise_observed_checkout` was asked to keep present
+            and pinned in the observed clone, so that recreation fetches from
+            `_worker_fetch_root()` as usual.
 
         The ONE exemption from the second gate is
         `reused_recorded_worker=True` (wrk-01): the caller already decided,
@@ -7383,18 +7455,43 @@ class Orchestrator:
         (`_to_needs_user` was called); the caller must return immediately
         without dispatching the executor.
         """
-        if self._git.is_dirty():
+        # THE BASELINE, and it is the OBSERVED tree — the loop-owned clone
+        # since esc-02, the primary checkout only where none is wired. The
+        # gate's own justification is what moved it: a dirty tree "cannot be
+        # used as a trustworthy baseline for detecting whether the agent wrote
+        # outside its worker repository", and the tree that baseline is taken
+        # from is the one `_execute_with_escape_detection` snapshots. Asking
+        # this of the primary checkout after the snapshots moved would have
+        # kept parking the loop for an operator's uncommitted edit while
+        # proving nothing about the tree actually being watched.
+        #
+        # RE-ASSERTED here, not merely at the sync, because the two are
+        # separated by worker creation, isolation verification and the
+        # quarantine branch below. And re-asserted with the SAME breadth the
+        # sync used when a clone is wired — `ObservedCheckout.residue`, which
+        # covers ignored paths — rather than with `is_dirty()`, which is
+        # `git status` and blind to them. A `.ruff_cache/` appearing in this
+        # interval would otherwise be folded into the "before" snapshot and
+        # then be invisible for the rest of the round: the alarm not firing
+        # and nothing saying so. `is_dirty()` remains the answer for a
+        # deployment with no clone, where it is exactly the pre-esc-02 check.
+        observed = self._observation_git()
+        if self._observed is not None:
+            dirt = self._observed.residue()
+        else:
+            dirt = observed.dirty_files()
+        if dirt:
             self._to_needs_user(
-                f"task {task.id}: the primary checkout is not clean (staged "
-                "or unstaged changes present) — refusing to start a "
-                "write-capable agent. A dirty primary checkout cannot be "
-                "used as a trustworthy baseline for detecting whether the "
-                "agent wrote outside its worker repository, and this "
-                "affects every task, not just this one.",
+                f"task {task.id}: the observed checkout ({observed.repo_root}) "
+                "is not clean — refusing to start a write-capable agent. A "
+                "dirty observed checkout cannot be used as a trustworthy "
+                "baseline for detecting whether the agent wrote outside its "
+                "worker repository, and this affects every task, not just this "
+                "one.",
                 kind="loop_fatal",
                 code="primary_checkout_dirty",
                 task_id=task.id,
-                detail=f"dirty={self._git.dirty_files()}",
+                detail=f"observed={observed.repo_root} dirty={sorted(dirt)[:20]}",
             )
             return None
 
@@ -7424,7 +7521,11 @@ class Orchestrator:
                 fetch_source = quarantined_at
             else:
                 resume_sha = execution.task_base_sha
-                fetch_source = self._git.repo_root
+                # The OBSERVED tree since esc-02 (`_worker_fetch_root`), which
+                # `_synchronise_observed_checkout` already proved holds this
+                # exact commit — `_dispatch_task` passes `task_base_sha` to it
+                # as an extra required sha for precisely this branch.
+                fetch_source = self._worker_fetch_root()
             repo = self._worker_repos.create(task.id, fetch_source, resume_sha)
             worktree_git = GitGateway(repo.path, self._policy, env=worker_env())
             violations = verify_worker_isolation(worktree_git)
@@ -7465,13 +7566,132 @@ class Orchestrator:
             return None
         return worktree_git
 
+    # ---- the observed checkout (esc-02) -------------------------------------
+    #
+    # Three questions, three methods, one answer each. Read them together with
+    # `worker_env.ObservedCheckout`, which holds the whole synchronisation
+    # contract and every fail-safe branch of it.
+
+    def _observation_git(self) -> GitGateway:
+        """The gateway rooted at the tree this loop OBSERVES.
+
+        The loop-owned clone when one is wired, and the primary checkout when
+        none is — which is the pre-esc-02 behaviour and the only reason this is
+        a method rather than a field. There is no third answer, and in
+        particular no "the clone is broken, watch the primary instead": that
+        decision belongs to `_synchronise_observed_checkout`, which parks.
+        """
+        if self._observed is None:
+            return self._git
+        if self._observed_git is None:
+            self._observed_git = self._observed.gateway(self._policy)
+        return self._observed_git
+
+    def _worker_fetch_root(self) -> Path:
+        """Where a worker repository's content is fetched FROM.
+
+        The observed clone once one is wired, and this is load-bearing rather
+        than tidy. A worker repo records its fetch source in `.git/FETCH_HEAD`,
+        so it is the one absolute path to a non-worker tree that an agent
+        inside a worker can read off disk. Pointing it at the clone means the
+        tree an agent can most easily find its way back to is the tree the
+        detector is watching — without which "a genuine escape is still
+        reported" would be a hope about paths nobody handed out rather than a
+        property of the arrangement.
+
+        Only ever consulted AFTER `_synchronise_observed_checkout` has
+        succeeded for this round, which is what guarantees the commit being
+        fetched is actually in the clone's object database.
+        """
+        return self._observed.path if self._observed is not None else self._git.repo_root
+
+    def _observed_base_sha(self) -> str:
+        """The commit a NEW execution record should record as its base.
+
+        The sha `_synchronise_observed_checkout` actually brought the clone to
+        this round, when there is one, and `self._git.head_sha()` otherwise
+        (every deployment with no clone wired, exactly as before).
+
+        The two differ only if the primary checkout's head MOVED between the
+        sync and here — an operator committing mid-dispatch. Re-reading it
+        there would record a base the observed clone does not hold and cannot
+        seed a worker from, which turns a benign race into a git failure. The
+        round's base is the commit the loop actually observed.
+        """
+        if self._observed is not None and self._observed_synced_sha:
+            return self._observed_synced_sha
+        return self._git.head_sha()
+
+    def _synchronise_observed_checkout(self, task: Task, *shas: str) -> bool:
+        """Bring the loop-owned clone to the primary checkout's current head
+        (plus any extra `shas` a resumed round still needs present), at the
+        controlled boundary BEFORE anything in this round reads or writes it.
+
+        True when the clone may be observed. False when this already parked —
+        `loop_fatal`, because a clone the loop cannot establish is an
+        environmental failure that affects every task, and because the
+        alternative reading of every branch inside `ObservedCheckout.
+        synchronize` is "observe a stale or foreign tree", which is worse than
+        the park this whole task exists to remove: every later task builds on
+        what this round read.
+
+        A no-op returning True when no clone is wired. That is the pre-esc-02
+        deployment, which observes the primary checkout and has nothing to
+        synchronise — not a failure to fall back from.
+        """
+        # Cleared FIRST, unconditionally: a value left over from an earlier
+        # dispatch would let `_observed_base_sha` hand this round a commit the
+        # clone is no longer at.
+        self._observed_synced_sha = ""
+        if self._observed is None:
+            return True
+        head = ""
+        try:
+            head = self._git.head_sha()
+        except (GitError, OSError) as exc:
+            violations = [
+                "the primary checkout's head could not be read, so there is no "
+                f"commit to synchronise the observed checkout to: {exc}"
+            ]
+        else:
+            violations = self._observed.synchronize(self._git.repo_root, [head, *shas])
+        if not violations:
+            self._observed_synced_sha = head
+            return True
+        self._to_needs_user(
+            f"task {task.id}: the loop-owned observed checkout at "
+            f"{self._observed.path} could not be established — "
+            + "; ".join(violations)
+            + ". This is LOOP-FATAL: that clone is the ONLY tree the escape "
+            "detector watches, so continuing would mean running a "
+            "write-capable agent with no escape detection at all. Nothing was "
+            "executed and nothing in it was reset.",
+            kind="loop_fatal",
+            code="observed_checkout_unusable",
+            task_id=task.id,
+            detail="; ".join(violations),
+        )
+        return False
+
     def _execute_with_escape_detection(
         self, directive: Directive, task: Task
     ) -> ExecutionOutcome | None:
         """Wraps a write-capable executor call with the Autoloop M1 escape
-        DETECTOR — a deterministic filesystem snapshot of the PRIMARY
+        DETECTOR — a deterministic filesystem snapshot of the OBSERVED
         checkout taken immediately before and immediately after the call,
-        nothing wider. See `escape_detector.py`'s module docstring for the
+        nothing wider.
+
+        "Observed" is the loop-owned clone since esc-02 (2026-08-26), and the
+        primary checkout only for a deployment that wires none — see
+        `_observation_git`, `_synchronise_observed_checkout` and
+        `worker_env.ObservedCheckout`. The change is not to WHAT is watched
+        (tracked + untracked + ignored, unchanged and deliberately not
+        narrowed) but to WHOSE tree it is: the primary checkout is shared with
+        the operator, whose editor, `ruff` run and own Claude Code session
+        produced two loop-fatal parks on 2026-08-26 that no agent caused. A
+        write the detector cannot attribute is not evidence about an agent.
+
+        See `escape_detector.py`'s module docstring for the
         full threat model (detection, not prevention) and for why bracketing
         exactly this call — rather than the whole task dispatch — is what
         makes an explicit exclusion list for Autoloop's own volatile files
@@ -7505,16 +7725,19 @@ class Orchestrator:
         # exemption at all. See `TaskStore.ensure_mutex_file`.
         self._task_store.ensure_mutex_file()
         exempt = self._operator_priority_exemption()
-        paths_before = escape_detector.enumerate_checkout_paths(self._git)
-        before = escape_detector.snapshot_checkout(self._git.repo_root, paths_before)
+        # THE observed tree, resolved once for both snapshots so the two sides
+        # can never describe different repositories.
+        observed = self._observation_git()
+        paths_before = escape_detector.enumerate_checkout_paths(observed)
+        before = escape_detector.snapshot_checkout(observed.repo_root, paths_before)
         outcome = self._executor.execute(directive, task)
         # Re-enumerate rather than re-snapshotting the SAME path list: a
         # brand-new file the agent created would not appear in
         # `paths_before` at all, so "created outside the worker repo" could
         # never be detected without a fresh enumeration here too.
-        paths_after = escape_detector.enumerate_checkout_paths(self._git)
+        paths_after = escape_detector.enumerate_checkout_paths(observed)
         after = escape_detector.snapshot_checkout(
-            self._git.repo_root, sorted(set(paths_before) | set(paths_after))
+            observed.repo_root, sorted(set(paths_before) | set(paths_after))
         )
         violations = escape_detector.diff_snapshots(before, after, exempt=exempt)
         if not violations:
@@ -7530,7 +7753,8 @@ class Orchestrator:
         if violations:
             self._to_needs_user(
                 f"task {task.id}: the write-capable agent changed the "
-                "PRIMARY checkout outside its worker repository — "
+                f"OBSERVED checkout ({observed.repo_root}) outside its worker "
+                "repository — "
                 + "; ".join(violations)
                 + ". This is LOOP-FATAL: the isolation mechanism itself may "
                 "be compromised. Nothing was committed. This is DETECTION, "
@@ -7586,10 +7810,23 @@ class Orchestrator:
             return None
         try:
             relative = str(
-                Path(store.path).resolve().relative_to(Path(self._git.repo_root).resolve())
+                Path(store.path)
+                .resolve()
+                .relative_to(Path(self._observation_git().repo_root).resolve())
             )
         except (ValueError, OSError):
-            return None  # task file outside the checkout: not snapshotted
+            # Task file outside the OBSERVED checkout: not snapshotted, so a
+            # change to it is not this detector's business. Since esc-02 that
+            # is the ordinary case rather than the exception — the observed
+            # tree is a loop-owned clone and `state_dir` has lived beside
+            # `workers_root` since port-01 — which means the exemption below
+            # simply never has to fire for a current deployment. Kept, and kept
+            # resolved against the observed root rather than the primary one,
+            # because the question it answers is "is this path inside the tree
+            # being diffed"; asking it of a different tree would be how an
+            # exemption starts silencing a path in a repository it was never
+            # reasoned about.
+            return None
         try:
             baseline, watermark = store.capture_priority_window()
         except (OSError, StateError):
@@ -13174,7 +13411,21 @@ class Orchestrator:
                 # Absolute, resolved: the policy layer refuses a relative
                 # fetch source outright, and `GitGateway` does not resolve
                 # `repo_root` for itself.
-                str(Path(self._git.repo_root).resolve()),
+                #
+                # THE OBSERVED CLONE since esc-02, for the same reason worker
+                # CREATION fetches from it (`_worker_fetch_root`): this fetch
+                # writes the source's absolute path into the worker's
+                # `.git/FETCH_HEAD`, so leaving it pointed at the primary
+                # checkout would hand every carried-forward task a signpost to
+                # the one tree nothing watches — while `escape_detector`'s
+                # docstring claims categorically that the only such path names
+                # a watched tree. The caller re-synchronises to exactly this
+                # `head` first, which is what guarantees the commit is present
+                # AND pinned as a ref (git's `upload-pack` refuses an
+                # unadvertised sha). Identical to the pre-esc-02 behaviour for
+                # a deployment with no clone: `_worker_fetch_root()` is
+                # `self._git.repo_root` there.
+                str(Path(self._worker_fetch_root()).resolve()),
                 head,
                 merge_message,
                 resolve_conflicts=self._note_conflict_resolver(
@@ -13294,6 +13545,18 @@ class Orchestrator:
         if execution.review_round > 0 and self._reconcile_published_execution(execution, task):
             return None
         if execution.review_round > 0:
+            # Same re-synchronisation the re-base branch below does, and for the
+            # same reason: `head` was read at the top of this method, AFTER the
+            # caller's own boundary sync, so an operator committing in between
+            # would leave the clone without it — and the carry-forward now
+            # fetches `head` FROM the clone. A no-op in the ordinary case (the
+            # commit is already there and already pinned) and a loop-fatal park
+            # when the clone cannot be brought to it, which is the "already
+            # parked, return None" contract this method already has. Placed
+            # AFTER the published-candidate reconcile above, which touches no
+            # worker repository and so needs no clone at all.
+            if not self._synchronise_observed_checkout(task, head):
+                return None
             refusal = self._carry_reviewed_candidate_past(execution, task, head)
             if not refusal:
                 return execution
@@ -13340,7 +13603,15 @@ class Orchestrator:
             )
         except (GitError, OSError):
             quarantined = None      # nothing on disk yet; recreation is enough
-        repo = self._worker_repos.create(task.id, self._git.repo_root, head)
+        # `head` was read at the top of this method, AFTER the caller's own
+        # synchronisation — so an operator committing in between would leave
+        # the observed clone without it, and the fetch below would fail. Re-sync
+        # to exactly that commit, which is a no-op in the ordinary case and a
+        # park (returning None, the "already parked" contract this method
+        # already has) when the clone cannot be brought to it.
+        if not self._synchronise_observed_checkout(task, head):
+            return None
+        repo = self._worker_repos.create(task.id, self._worker_fetch_root(), head)
         execution.task_base_sha = head
         execution.task_branch = repo.branch
         execution.worktree_path = str(repo.path)

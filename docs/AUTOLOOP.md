@@ -2821,6 +2821,110 @@ accounting is `docs/SECURITY.md` S25's 2026-08-25 amendment; the regressions are
 
 ---
 
+## 4e-bis. The observed checkout is the loop's own (esc-02, 2026-08-26)
+
+**The rule in one line:** the tree the escape detector snapshots is a clone the
+loop owns, and nothing else writes to it. Your checkout is not watched.
+
+### Why this exists
+
+§4e's detector snapshots the checkout around every write-capable agent call and
+enumerates tracked **and** untracked **and** ignored paths. That breadth is
+correct and is not negotiable — `.gitignore` is writable by the very agent being
+watched, so an ignored-path exemption would sell unlimited invisible writes for
+one line of config. But the tree it watched was the same one the operator works
+in, and a write there is one the loop can see and cannot attribute. Two
+loop-fatal `checkout_escape_detected` parks on 2026-08-26 were exactly that:
+fourteen files under `.ruff_cache/0.14.1/` from a `ruff` run, and an untracked
+`.claude/rules/evidence-first.md` from an interactive Claude Code session.
+Neither was an isolation failure; the mechanism was working on both occasions.
+
+So the **tree** moved and the **scope** did not. This is port-01's argument one
+level up: port-01 moved everything the loop WRITES out of the observed checkout
+because loop state written inside it mid-round is indistinguishable from an
+agent writing where it may not. The thing port-01 could not move is the checkout
+itself, which the operator also writes to.
+
+### Where it lives, and what may not be inside it
+
+Default `<workers_root>/../observed-checkout` — beside `workers_root`, like the
+inbox, the PAUSE flag, the heartbeat and the mutation ledger. Override with
+`[paths].observed_checkout`, absolute only.
+
+`worker_env.validate_observed_checkout` refuses it nested beneath the primary
+checkout, that checkout's `.git` (pointer file resolved), the state dir,
+`workers_root`, or either publisher path — **and** refuses one that CONTAINS any
+of those, which would put every loop write back inside the snapshot and rebuild
+port-01's bug on the new tree. Refused at `cli._build_orchestrator`, before any
+orchestrator capable of a real dispatch exists. `doctor` does not run this check
+yet; that gap is recorded in `docs/SECURITY.md` S41.
+
+### What runs there: nothing
+
+It holds one checked-out commit and is read. Nothing commits, validates, merges,
+pushes or runs an agent in it. Merges, pushes, worktrees and every "what is the
+branch head" read still happen in the primary checkout.
+
+The one thing that does point at it is the **worker fetch source**: every
+`WorkerRepoManager.create` seeds from the clone rather than from your checkout
+(`orchestrator._worker_fetch_root`). That is load-bearing rather than tidy. A
+worker's cwd is its own repository, and the one absolute path to a non-worker
+tree that a worker carries on disk is the fetch source git records in
+`.git/FETCH_HEAD`. Pointing it at the clone means an agent that goes looking for
+"the repo" finds a watched tree.
+
+There are **two** such sites, not one, and both go through `_worker_fetch_root`
+— a fix applied to only the first would leave the sentence above false for every
+task that has ever been carried forward. The second is
+`_carry_reviewed_candidate_past`: when a reviewed candidate outlives a moved
+branch head, the new head is fetched INTO the existing worker and merged there.
+That path re-synchronises the clone to exactly that commit first, so the object
+is present AND pinned as a ref; a clone that cannot be brought to it parks
+`observed_checkout_unusable` rather than quietly falling back to your checkout.
+
+### Synchronisation, and what each failure does
+
+One controlled boundary per round, at the top of `_dispatch_task_postcommit` —
+before the first read of the clone, and a long way before the "before" snapshot,
+so no write of the loop's own can land between the two snapshots.
+
+| Clone state | Answer |
+|---|---|
+| missing (or an empty directory) | created — `git init`, fetch, checkout |
+| behind | fetched and checked out; `HEAD` is READ BACK and compared, never predicted |
+| ahead / diverged | REFUSED, nothing reset — it holds a commit your checkout does not |
+| dirty, including ignored residue | REFUSED, checked **before** anything is fetched |
+| present but not a git repository | REFUSED, nothing deleted |
+| any git failure, unreadable status | REFUSED — "I could not look" is never "there is nothing there" |
+
+Every refusal parks `loop_fatal` under `observed_checkout_unusable` and the
+write-capable agent never starts, because starting it would mean running with no
+escape detection at all. Nothing is reset, repaired or removed: residue in that
+tree IS the evidence, including residue an escape left in an earlier round, and
+a sync that checked out over it would destroy the only record of it.
+
+Commits the round may still need — a resumed round's recorded `task_base_sha`,
+older than the head — are pinned as refs under
+`refs/autoloop/observed-pin/<sha>`. Git's `upload-pack` refuses a request for an
+object no ref advertises, so "present in the object database" would not have
+been enough to seed a worker from.
+
+### What this does NOT close
+
+A write into the OPERATOR's checkout is now invisible to this mechanism. That is
+the trade, taken deliberately: a report about that tree was never evidence about
+an agent, because it could not be attributed. It is bounded by the fetch source
+above. Widening the snapshot back onto a shared tree is not the remedy — it is
+the defect. The next real step is the OS-level sandbox `docs/SECURITY.md` S24
+already tracks, which bounds where a write can land rather than reporting where
+one did.
+
+Two operator-facing symptoms and their remedies are in `docs/COMMON_ERRORS.md`
+§8; the security accounting is S41; the regressions are
+`autoloop/tests/test_observed_checkout.py`.
+
+---
+
 ## 4f. Operator-changeset review (publishing a hand-authored commit)
 
 `changeset_review.py`, 2026-07-31. Everything above this section reviews and

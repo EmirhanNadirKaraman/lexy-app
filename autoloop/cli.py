@@ -186,7 +186,13 @@ from .state import (
 from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from .transcript import TranscriptLogger, build_profile, read_records, render_profile
 from .validation_env import load_validation_env
-from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
+from .worker_env import (
+    ObservedCheckout,
+    WorkerRepoManager,
+    validate_observed_checkout,
+    validate_workers_root,
+    verify_worker_isolation,
+)
 from .worktask import (
     IntentStore,
     RecordedRevertAuthority,
@@ -586,6 +592,27 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
             "paths.workers_root is not safe to use: " + "; ".join(workers_root_violations)
         )
     worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+    # esc-02: the tree the escape detector watches is a LOOP-OWNED clone, not
+    # the checkout the operator also works in. Validated here, at the one place
+    # that builds an Orchestrator capable of dispatching a real write-capable
+    # round, and refused rather than degraded — a clone nested inside the
+    # primary checkout, the state dir or `workers_root` (or one CONTAINING any
+    # of them) would put back exactly the shared-tree confusion it exists to
+    # end. `doctor` does not run this check yet; that gap is recorded in
+    # docs/SECURITY.md.
+    observed_violations = validate_observed_checkout(
+        config.observed_checkout, git.repo_root, config.state_dir, config.workers_root
+    )
+    if observed_violations:
+        raise ConfigError(
+            "paths.observed_checkout is not safe to use: "
+            + "; ".join(observed_violations)
+        )
+    observed_checkout = (
+        ObservedCheckout(config.observed_checkout)
+        if config.observed_checkout is not None
+        else None
+    )
     # The validation-environment boundary. Loaded ONCE, here, and handed only
     # to the two post-writer validation sites (the ImplementExecutor's own run
     # and the orchestrator's post-commit re-run). A bad file refuses the run
@@ -646,6 +673,11 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         # `smoke-browser`'s own — sees the pending record and must ignore it
         # rather than fail on an upgrade it cannot perform; see the constructor.
         self_upgrade_enabled=True,
+        # esc-02: the loop-owned tree the escape detector watches, and the
+        # source every worker repository is seeded from. Always wired here —
+        # its default location is derived from the mandatory `workers_root` —
+        # so production is never on the pre-esc-02 shared-tree path.
+        observed_checkout=observed_checkout,
     )
 
 
@@ -2863,17 +2895,90 @@ def _precondition_checkout_clean(config) -> str:
     place, so an operator's answer text alone cannot clear a checkout that
     is still genuinely dirty.
 
+    ON THE SAME TREE THE ORCHESTRATOR ASKED ABOUT, which since esc-02 is the
+    loop-owned observed checkout rather than the operator's own. A recheck
+    aimed at a different tree than the park is the exact failure this function
+    was written to fix, one tree over: it would clear the blocker the moment
+    the operator's checkout happened to be clean, while the tree the loop
+    refuses to use as a baseline stayed dirty. `Path.cwd()` remains the answer
+    for a deployment that configures no observed checkout, which is what the
+    orchestrator watches there.
+
     Deliberately NOT reused for `checkout_escape_detected` (an earlier
     version of this fix did, and that was wrong — see
     `_precondition_checkout_escape_detected` below for why `is_dirty()` is
     not a sufficient recheck for a detected escape)."""
     from .git_gateway import GitGateway
     from .policy import PolicyEngine
+    from .worker_env import ObservedCheckout
+
+    observed = getattr(config, "observed_checkout", None)
+    if observed is not None:
+        clone = ObservedCheckout(observed)
+        if not clone.path.exists():
+            # Absent is not clean: the loop rebuilds it at the next round's
+            # controlled boundary, and until it has, there is nothing here to
+            # assert about. Reporting the absence is the honest answer, and it
+            # keeps the blocker open rather than clearing it on a directory
+            # nobody has looked at.
+            return (
+                f"the observed checkout {clone.path} does not exist yet — the "
+                "loop recreates it at the start of the next round; re-run this "
+                "check afterwards, or archive the blocker if you have already "
+                "inspected the tree"
+            )
+        residue = clone.residue()
+        if residue:
+            return (
+                f"the observed checkout {clone.path} still holds content the "
+                "loop did not put there: " + ", ".join(sorted(residue)[:20])
+            )
+        return ""
 
     git = GitGateway(Path.cwd(), PolicyEngine(config.policy))
     if git.is_dirty():
         return "the primary checkout still has staged or unstaged changes: " + ", ".join(
             git.dirty_files()
+        )
+    return ""
+
+
+def _precondition_observed_checkout(config) -> str:
+    """Recheck for `observed_checkout_unusable` (esc-02).
+
+    The park says the loop-owned clone could not be established — missing and
+    uncreatable, present but not a repository, dirty, or holding a commit the
+    primary checkout does not. None of those is fixed by answer text, and all
+    of them are cheap to re-ask, so this asks the SAME object the orchestrator
+    asked (`ObservedCheckout.residue` / `is_repo`) rather than a second reading
+    of the same idea.
+
+    It deliberately does NOT re-run `synchronize`: that WRITES (it fetches and
+    checks out), and a precondition is a question. The round's own controlled
+    boundary is where the clone gets rebuilt.
+    """
+    from .worker_env import ObservedCheckout
+
+    observed = getattr(config, "observed_checkout", None)
+    if observed is None:
+        return (
+            "this deployment configures no observed checkout, so the condition "
+            "this blocker names cannot be rechecked here — inspect the loop's "
+            "configuration before answering"
+        )
+    clone = ObservedCheckout(observed)
+    if not clone.path.exists():
+        return ""       # nothing there to be wrong; the loop will recreate it
+    if not clone.path.is_dir() or not clone.is_repo():
+        return (
+            f"{clone.path} exists and is not a git repository — remove it (the "
+            "loop rebuilds the clone) before resolving this"
+        )
+    residue = clone.residue()
+    if residue:
+        return (
+            f"the observed checkout {clone.path} still holds content the loop "
+            "did not put there: " + ", ".join(sorted(residue)[:20])
         )
     return ""
 
@@ -2949,6 +3054,11 @@ _RESOLUTION_PRECONDITIONS = {
     "push_refused_protected": _precondition_protected,
     "primary_checkout_dirty": _precondition_checkout_clean,
     "checkout_escape_detected": _precondition_checkout_escape_detected,
+    # esc-02: the loop-owned observed checkout could not be established. Every
+    # branch behind that park is environmental (a missing/unreadable directory,
+    # residue in a tree only the loop writes to, a commit the primary checkout
+    # does not have), so answer text must not clear it either.
+    "observed_checkout_unusable": _precondition_observed_checkout,
 }
 
 

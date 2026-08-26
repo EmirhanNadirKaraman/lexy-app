@@ -2196,6 +2196,12 @@ def test_security_and_environment_codes_all_have_a_precondition():
         "push_refused_protected",
         "primary_checkout_dirty",
         "checkout_escape_detected",
+        # esc-02 (2026-08-26): the loop-owned observed checkout could not be
+        # established. Every branch behind it is environmental — a missing or
+        # unreadable directory, residue in a tree only the loop writes to, a
+        # commit the primary checkout does not have — so it belongs here for
+        # exactly the reason the two above it do.
+        "observed_checkout_unusable",
         # Operator-changeset review (`changeset_review.py`,
         # `Orchestrator._dispatch_changeset_push`, 2026-07-31): "no publisher
         # configured" is an environmental fact, not something an operator's
