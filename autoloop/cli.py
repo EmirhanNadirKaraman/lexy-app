@@ -93,7 +93,7 @@ from .errors import (
 )
 from .executor import ExecutionOutcome, NullExecutor, TaskExecutor
 from .git_gateway import GitGateway
-from .implement_executor import ImplementExecutor, implement_agent_runner
+from .implement_executor import AbortLedger, ImplementExecutor, implement_agent_runner
 from .inbox import (
     KIND_URGENT,
     MAX_WORK_SUGGESTIONS,
@@ -136,6 +136,7 @@ from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
 from . import merge_sweep
 from .orchestrator import (
+    ABORT_REFUSED,
     ABORT_STOP_KIND,
     ABORTED,
     MAX_REPEATED_STOPS,
@@ -160,6 +161,7 @@ from .publisher import (
 )
 from .stall import StallPolicy
 from .state import (
+    PACKET_OUTSTANDING_PHASES,
     TERMINAL_PHASES,
     LoopState,
     Phase,
@@ -167,6 +169,7 @@ from .state import (
     StopRepetitionStore,
     abort_flag_file,
     abort_requested,
+    packet_outstanding_reason,
     stop_repetition_file,
     utcnow_iso,
 )
@@ -444,6 +447,13 @@ def _build_executor(
     # to destroy — the flag stops the loop at the top of the next step instead,
     # which costs one re-run of a report.
     abort_file = abort_flag_file(config)
+    # ONE ledger for both halves, for the same reason there is one `abort_file`:
+    # the executor is what classifies a round, and it cannot reach inside a
+    # runner the factory below built. A second ledger would faithfully remember
+    # the kill in the object nobody asks. It is the round's memory of having
+    # ALREADY acted on the flag, which is what survives `resume` deleting the
+    # file mid-kill — see `implement_executor.AbortLedger`.
+    abort_ledger = AbortLedger()
     audit_runner = ClaudeCliRunner(
         repo_root=git.repo_root,
         command=config.audit.agent_command,
@@ -514,6 +524,11 @@ def _build_executor(
             # standalone binding above deliberately gets neither this nor
             # `policy`: it is rooted at the main checkout and is never reached.
             abort_file=abort_file,
+            # The SAME object the executor below holds. A kill inside this
+            # runner's process group is recorded there, and that record is what
+            # keeps the round classified as an abort even if the flag is cleared
+            # before the executor re-reads it.
+            abort_ledger=abort_ledger,
         ),
         # And once more on the executor itself, for the OTHER process group an
         # abort has to reach: the validation subprocess. The agent runs the
@@ -522,6 +537,11 @@ def _build_executor(
         # `pytest -n 4` running against a worker repository nobody owns — see
         # `implement_executor.abort_aware_command_runner`.
         abort_file=abort_file,
+        # And the shared ledger once more, on the side that READS it: both the
+        # authoritative and the advisory validation runs record into it, and
+        # `_run_implementation` asks it (not the flag alone) when it decides
+        # whether this round was aborted.
+        abort_ledger=abort_ledger,
         # The cleanup exception's only authority (scope-04). Absent — nothing
         # passes one — the executor grants no cleanup at all, so this wiring is
         # what turns the capability on for a real run and for nothing else.
@@ -1185,6 +1205,13 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
     # does not describe: an aborted round ends `stopped` too, and the operator
     # who pressed the button is owed the account of what it cost.
     _report_abort(orchestrator.state)
+    # The other half of that account: an abort whose KILL was refused killed
+    # nothing, so `_report_abort` above is correctly silent about it — and a
+    # silent refusal is exactly what the revision of abort-01 exists to remove.
+    # Keyed on the RETURN VALUE rather than on the state, because a refusal
+    # deliberately writes no state at all.
+    if outcome == ABORT_REFUSED:
+        _report_abort_refused(orchestrator.state)
     print(f"\nLoop ended: {outcome}")
     return 2 if outcome in (Phase.NEEDS_USER.value, Phase.FAILED.value) else 0
 
@@ -1331,6 +1358,19 @@ def _run_continuous(
                 # select a new task on top of a session that is still mid-round.
                 _report_abort(orchestrator.state)
                 print("aborted — `resume` clears the flag and continues")
+                return 0
+            if outcome == ABORT_REFUSED:
+                # Same ending, different account. Nothing was killed and the
+                # session is exactly where it was — but this loop still has to
+                # return rather than fall through to the boundary handling
+                # below, which would select a new task on top of a session that
+                # is mid-packet, and it must not print the abort report, which
+                # describes a round that was interrupted.
+                _report_abort_refused(orchestrator.state)
+                print(
+                    "stopped without killing anything — `resume` clears the "
+                    "flag and continues"
+                )
                 return 0
             if outcome == SELF_UPGRADE:
                 # Normally does not return: the process is replaced here, with
@@ -1540,8 +1580,14 @@ def _report_abort(state: LoopState) -> None:
     record = state.aborted_round or {}
     task_id = record.get("task_id") or "(unknown)"
     print(f"\nABORTED by the operator, mid-round on {task_id}")
+    # "stopped", not "killed", since the abort-01 revision: THREE things can end
+    # a round here — the agent's process group, the validation subprocess group,
+    # or a flag that landed before either was spawned — and this line is printed
+    # for all of them. Which one actually happened is named by `discarded_work`
+    # below, from `implement_executor.AbortLedger`, so a fixed claim of a kill
+    # here would contradict the measured account three lines down.
     print(
-        "  killed       the implementation agent and every process in its group "
+        "  stopped      the round in flight "
         f"(at phase {record.get('aborted_at_phase') or 'executing'}); nothing was "
         "committed and the main checkout was never written"
     )
@@ -1576,6 +1622,33 @@ def _report_abort(state: LoopState) -> None:
             "summary. Read the worker repo directly.)"
         )
     print("  next         `resume` clears the flag and starts working again")
+
+
+def _report_abort_refused(state: LoopState) -> None:
+    """Print what an abort did NOT do, and why, for the operator watching.
+
+    The counterpart to `_report_abort`, and the reason `Orchestrator.run` has a
+    return value of its own for this: before abort-01's revision the loop
+    returned `ABORTED` from these phases too, so an operator who asked for a kill
+    got a boundary stop and nothing anywhere distinguished the two. A refusal
+    nobody is told about is the guard quietly switching itself off.
+
+    Says the three things that differ from an abort that landed: nothing was
+    killed, nothing was discarded (so there is no partial-work line to print —
+    there is no partial work), and the phase the loop is sitting in is intact.
+    """
+    print("\nABORT REFUSED — a review packet is outstanding")
+    print(f"  phase        {state.phase}: {packet_outstanding_reason(state)}")
+    print(
+        "  killed       nothing. Killing a step here would strand a push a "
+        "reviewer may already have approved, so the loop stopped between steps "
+        "instead — which is what `pause` means"
+    )
+    print(
+        "  intact       the phase, the pending request and the reviewer's "
+        "packet; no round was interrupted and no budget was touched"
+    )
+    print("  next         `resume` clears the flag and continues from this phase")
 
 
 def _is_fault_stop(state: LoopState) -> bool:
@@ -3514,26 +3587,23 @@ SHELVE_STOP_KIND = "shelved"
 
 #: The phases in which the loop OWES A REVIEW PACKET whose acceptance it cannot
 #: yet prove, and in which `shelve` therefore refuses outright — whatever task
-#: the packet is about. `delivering` is mid-deposit of a chunked payload,
-#: `submitting` has a request created and possibly sent, the two
-#: `submission_*` phases are a send whose acceptance is unknown or disproved,
-#: and `awaiting` has a reviewer holding one. Exiting at any of them strands a
-#: packet nobody can classify afterwards.
+#: the packet is about. Exiting at any of them strands a packet nobody can
+#: classify afterwards.
+#:
+#: DEFINED IN `state.py` since abort-01 (2026-08-26) and imported here, because a
+#: second verb now asks the same question: `Orchestrator.run` refuses the `abort`
+#: KILL at exactly these phases, for exactly this reason. Re-exported through
+#: this module's namespace so `cli.PACKET_OUTSTANDING_PHASES` keeps resolving for
+#: every existing reader.
 #:
 #: The same set `orchestrator._at_round_boundary` refuses a preemption at,
 #: arrived at from the other side: that predicate names the one SAFE phase
 #: (`ready`, no pending request) and this names the unsafe ones, so the
 #: `pending_request` half is checked separately here for the same reason it is
 #: there — a request outlives its own phase.
-PACKET_OUTSTANDING_PHASES = frozenset(
-    {
-        Phase.DELIVERING,
-        Phase.SUBMITTING,
-        Phase.SUBMISSION_UNCONFIRMED,
-        Phase.SUBMISSION_REJECTED,
-        Phase.AWAITING,
-    }
-)
+#:
+#: (The name is bound by the `from .state import …` at the top of this module;
+#: there is deliberately no assignment here, so there is exactly one definition.)
 
 
 def _session_names_task(state: LoopState, task_id: str) -> bool:
@@ -5514,18 +5584,28 @@ def _cmd_abort(args: argparse.Namespace) -> int:
       process group, so `pytest -n 4` started through the agent's advisory
       validation dies with it rather than being left to write into a worker
       repository nobody owns;
-    * NOT a review packet. In `submitting`/`awaiting` there is no step of this
-      kind running at all: the loop simply stops between steps, exactly as
-      `pause` does, leaving the pending request and its phase intact for the
-      resume. Nothing an approval could authorize is ever discarded.
+    * NOT a review packet. Where one is outstanding — `submitting`, `awaiting`
+      and their neighbours — the KILL IS REFUSED, in so many words: the loop
+      returns `ABORT_REFUSED` having killed nothing, and the pending request and
+      its phase are intact for the resume. Nothing an approval could authorize
+      is ever discarded.
 
     WHAT IT COSTS the task: nothing. No attempt is spent, no fault is counted,
     no ceiling advances, its worker repository keeps the uncommitted work, and
     the task goes back to the queue so the next dispatch RESUMES that round.
 
-    Lock-free and write-only, exactly like `pause`: it touches one flag file
-    outside the checkout and never the state, the registry or a worker, so it is
-    safe to run against a live loop — which is the only time it makes sense.
+    Lock-free, and it WRITES exactly one flag file outside the checkout — never
+    the state, the registry or a worker — so it is safe to run against a live
+    loop, which is the only time it makes sense. It READS the saved session, and
+    only to warn (see `_abort_phase_warning`).
+
+    **The phase is read to WARN, never to refuse the command.** A refusal here
+    would be decided from a snapshot of `state.json`, and the operator who most
+    needs this verb is the one whose loop entered `executing` and started a
+    four-hour agent call one second after that file was written. Refusing to arm
+    on a stale read would drop exactly that request, silently, which is the
+    failure this whole verb exists to remove. So the flag is always armed and the
+    warning says what will happen if the loop is still where the file says it is.
     """
     config = load_config(args.config)
     path = abort_flag_file(config)
@@ -5538,8 +5618,52 @@ def _cmd_abort(args: argparse.Namespace) -> int:
         "attempt or fault is charged"
     )
     print(f"flag: {path}")
+    for line in _abort_phase_warning(config):
+        print(line)
     print("`resume` clears it and continues; `pause` is the stop-at-a-boundary verb")
     return 0
+
+
+def _abort_phase_warning(config: AutoloopConfig) -> list[str]:
+    """What to tell the operator about the phase their abort just landed in.
+
+    Empty for the ordinary case — the loop is somewhere a kill is performed, so
+    the sentences already printed are the whole truth.
+
+    THREE outcomes, and the third is why this is a function rather than an
+    `if`: a state file that cannot be read must NOT be reported as a refusal.
+    `packet_outstanding_reason(None)` refuses (fail-closed, correctly, for the
+    loop's own guard), but the loop reads its own in-memory state and may be
+    killing an agent perfectly happily while this process cannot open
+    `state.json`. Printing "the kill will be refused" there would be this
+    command inventing a fact about a loop it cannot see.
+
+    Never raises: `_load_state` can refuse on configured-URL drift, and an abort
+    that died on a stale `[browser]` section rather than stopping the loop would
+    be the worst possible moment for that check to matter.
+    """
+    try:
+        state = StateStore(config.state_file).load()
+    except Exception:
+        state = None
+    if state is None:
+        return [
+            "note: the saved session could not be read, so what phase the loop "
+            "is in is unknown here — the flag is armed either way and the loop "
+            "decides for itself"
+        ]
+    reason = packet_outstanding_reason(state)
+    if not reason:
+        return []
+    return [
+        f"WARNING: the kill will be REFUSED where the loop is now — {reason}.",
+        "         Killing a step there would strand a push a reviewer may "
+        "already have approved, so nothing is killed: the loop stops between "
+        "steps and says it refused. `pause` is the verb that means exactly "
+        "that.",
+        "         You still get the stop, and `resume` clears the flag and "
+        "continues from that same phase with the packet intact.",
+    ]
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:

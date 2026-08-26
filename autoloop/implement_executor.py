@@ -380,6 +380,91 @@ def abort_flag_set(abort_file: Path | None) -> bool:
     return abort_file is not None and Path(abort_file).exists()
 
 
+class AbortLedger:
+    """THIS round's own positive record that an abort has already ACTED here.
+
+    **The race it closes** (abort-01 revision, 2026-08-26). The flag is a FILE,
+    and `resume` — or an operator's own second command, or a wrapper script —
+    deletes it. The sequence that costs a task an attempt is:
+
+        flag appears -> the agent's process group is killed -> flag is cleared
+        -> `_run_implementation` re-reads the flag, sees nothing, and reports
+        the killed agent's own `not ok` as an ordinary failure
+
+    …which charges the attempt, names a `fault_kind`, and eventually parks the
+    task on `attempt_count_ceiling` blaming a wall the operator's own button
+    built. Re-reading a file that a third party may delete is not a record of
+    what this process DID; this is. Once something in this round has been killed
+    or refused BECAUSE of the flag, the round stays aborted whatever happens to
+    the file afterwards.
+
+    **Sticky, deliberately, and in both directions.** Every abort-aware site asks
+    `abort_in_effect(flag, ledger)` rather than the flag alone, so a flag cleared
+    mid-kill cannot leave half a round torn down and the other half running: the
+    advisory validation thread keeps refusing commands, the agent handle keeps
+    killing, and `_run_implementation` keeps classifying. That also bounds
+    `AdvisoryRendezvous.stop()`'s join, which is the specific way the 39-minute
+    wait would otherwise be rebuilt under a new name.
+
+    **Reset per round, unconditionally** (`_run_implementation`). `cli.
+    _build_executor` constructs ONE of these for the process and shares it with
+    the agent-runner factory, so a ledger that remembered a kill forever would
+    classify the NEXT, perfectly healthy round as aborted — refunding an attempt
+    nobody spent and shelving a task that was working. That direction is the
+    dangerous one, and `test_operator_abort.py` pins it.
+
+    **Locked**, because the two writers are genuinely concurrent: the agent
+    handle is polled on the round's own thread while the advisory validation runs
+    on `AdvisoryRendezvous`'s watcher thread. First writer wins, so the reason
+    names what happened FIRST rather than last.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._reason = ""
+
+    def reset(self) -> None:
+        with self._lock:
+            self._reason = ""
+
+    def record(self, reason: str) -> None:
+        """Note that this round killed or refused something because of the flag.
+
+        `reason` is a full CLAUSE, not a noun — `_aborted_outcome` renders it
+        into the operator's sentence verbatim, so what the round reports is what
+        actually happened rather than one fixed guess about it.
+        """
+        with self._lock:
+            if not self._reason:
+                self._reason = reason
+
+    @property
+    def killed(self) -> bool:
+        with self._lock:
+            return bool(self._reason)
+
+    @property
+    def reason(self) -> str:
+        with self._lock:
+            return self._reason
+
+
+def abort_in_effect(abort_file: Path | None, ledger: AbortLedger | None) -> bool:
+    """Is this round being aborted — either right now, or already?
+
+    THE flag question every abort-aware site asks, and it is two questions
+    because the flag alone answers only one of them. The file says an operator is
+    asking NOW; the ledger says this round has already acted on that ask and
+    cannot un-act it. Either is sufficient, and the ledger is what survives the
+    file being deleted (see `AbortLedger`).
+
+    Fail-open on an unreadable flag path exactly as `abort_flag_set` is, and for
+    the reason recorded there; the ledger is in-memory and cannot fail to be
+    read.
+    """
+    return abort_flag_set(abort_file) or (ledger is not None and ledger.killed)
+
+
 def _kill_group(handle, *, grace_seconds: float, sleep=time.sleep) -> int:
     """SIGTERM the process GROUP, wait out a bounded grace, then SIGKILL it.
 
@@ -431,14 +516,16 @@ class AbortableProcessHandle:
     returncode and returns `COMPLETED`; it does not learn that this was a kill,
     and must not — a `stall.StallReport` says "nothing changed for N seconds, so
     this agent was wedged", which would be a false statement about a healthy
-    agent an operator stopped. What the round was aborted is established by the
-    flag itself, read again by `_run_implementation` and once more by
+    agent an operator stopped. What the round was aborted is established
+    elsewhere: by the `AbortLedger` this handle writes its kill into, read by
+    `_run_implementation`, and by the flag, read once more by
     `orchestrator._dispatch_task_postcommit`.
 
     **`aborted` is a positive record, not an inference.** It says THIS handle
     killed THIS process because of the flag, which is different from "the flag is
     set now" — the latter is also true for an agent that finished normally one
-    tick earlier.
+    tick earlier. The same record is written into the round-wide `AbortLedger`,
+    which is what carries it past the flag being deleted; see that class.
     """
 
     def __init__(
@@ -446,11 +533,13 @@ class AbortableProcessHandle:
         handle,
         abort_file: Path | None,
         *,
+        ledger: AbortLedger | None = None,
         grace_seconds: float = ABORT_TERMINATE_GRACE_SECONDS,
         sleep=time.sleep,
     ):
         self._handle = handle
         self._abort_file = abort_file
+        self._ledger = ledger
         self._grace_seconds = grace_seconds
         self._sleep = sleep
         self.aborted = False
@@ -461,9 +550,16 @@ class AbortableProcessHandle:
             # FIRST, and the order is the same one `stall.supervise` documents: a
             # process that finished on its own is never posthumously "killed".
             return returncode
-        if self.aborted or not abort_flag_set(self._abort_file):
+        if self.aborted or not abort_in_effect(self._abort_file, self._ledger):
             return None
         self.aborted = True
+        # BEFORE the kill, not after: `_kill_group` waits out a grace period, and
+        # a flag cleared during it would otherwise leave the round with a dead
+        # agent and no record of why it died.
+        if self._ledger is not None:
+            self._ledger.record(
+                "the implementation agent and every process it spawned were killed"
+            )
         return _kill_group(
             self._handle, grace_seconds=self._grace_seconds, sleep=self._sleep
         )
@@ -475,7 +571,13 @@ class AbortableProcessHandle:
         self._handle.kill()
 
 
-def abort_aware_spawn(abort_file: Path | None, spawn=None, *, sleep=time.sleep):
+def abort_aware_spawn(
+    abort_file: Path | None,
+    spawn=None,
+    *,
+    ledger: AbortLedger | None = None,
+    sleep=time.sleep,
+):
     """`stall.spawn_supervised`, wrapped so the operator can kill what it spawns.
 
     Returns a spawn callable with the signature `ClaudeCliRunner` expects, so it
@@ -483,6 +585,10 @@ def abort_aware_spawn(abort_file: Path | None, spawn=None, *, sleep=time.sleep):
     through any change to `stall.py`. With no `abort_file` it returns the
     underlying spawn UNCHANGED — one fewer object in the ordinary path, and the
     honest representation of "no abort capability is wired here".
+
+    `ledger` is the round-wide `AbortLedger` a kill is recorded in, or `None` for
+    a construction that keeps no such record. Gated on `abort_file` alone, not on
+    the ledger: a ledger with no flag path to watch has nothing to record.
     """
     inner = spawn or spawn_supervised
     if abort_file is None:
@@ -492,6 +598,7 @@ def abort_aware_spawn(abort_file: Path | None, spawn=None, *, sleep=time.sleep):
         return AbortableProcessHandle(
             inner(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr),
             abort_file,
+            ledger=ledger,
             sleep=sleep,
         )
 
@@ -507,6 +614,7 @@ def killable_run(
     timeout: float | None = None,
     env=None,
     abort_file: Path | None = None,
+    ledger: AbortLedger | None = None,
     poll_seconds: float = ABORT_POLL_SECONDS,
     grace_seconds: float = ABORT_TERMINATE_GRACE_SECONDS,
     sleep=time.sleep,
@@ -527,8 +635,12 @@ def killable_run(
       .run`'s own timeout path kills only the one it started, leaving four
       workers writing into a worker repository nobody owns. Every kill here is
       `os.killpg` through `stall.ProcessGroupHandle`.
-    * it watches `abort_file` while it waits, and kills the group when the flag
-      appears. That is what stops an abort from having to wait out a suite.
+    * it watches `abort_file` — and the round's `ledger`, so a flag cleared
+      mid-abort cannot re-arm a suite this round has already stopped — while it
+      waits, and kills the group when either says so. That is what stops an abort
+      from having to wait out a suite. Only THAT branch records into the ledger:
+      the timeout below kills the same way for a different reason, and a suite
+      that ran too long is the round's own failure, not the operator's stop.
     * output goes to temporary FILES rather than pipes. A pipe nobody drains
       fills its OS buffer and blocks the child forever, and this function cannot
       drain one while it is polling — the same reason `stall.spawn_supervised`
@@ -556,7 +668,16 @@ def killable_run(
             returncode = proc.poll()
             if returncode is not None:
                 break
-            if abort_flag_set(abort_file):
+            if abort_in_effect(abort_file, ledger):
+                # Recorded BEFORE the kill, and only on THIS branch: the timeout
+                # branch below kills the same way for a different reason, and a
+                # suite that ran too long is the round's own problem rather than
+                # the operator's stop.
+                if ledger is not None:
+                    ledger.record(
+                        "the validation subprocess and every process it spawned "
+                        "were killed"
+                    )
                 returncode = _kill_group(
                     handle, grace_seconds=grace_seconds, sleep=sleep
                 )
@@ -581,7 +702,9 @@ def killable_run(
     return subprocess.CompletedProcess(list(argv), returncode, stdout, stderr)
 
 
-def abort_aware_command_runner(command_runner, abort_file: Path | None):
+def abort_aware_command_runner(
+    command_runner, abort_file: Path | None, ledger: AbortLedger | None = None
+):
     """The `command_runner` a round validates with, made abortable.
 
     Two layers, and the outer one is what makes a LIST of commands abortable
@@ -603,10 +726,21 @@ def abort_aware_command_runner(command_runner, abort_file: Path | None):
     """
     if abort_file is None:
         return command_runner or subprocess.run
-    inner = command_runner or functools.partial(killable_run, abort_file=abort_file)
+    inner = command_runner or functools.partial(
+        killable_run, abort_file=abort_file, ledger=ledger
+    )
 
     def _run(argv, **kwargs):
-        if abort_flag_set(abort_file):
+        if abort_in_effect(abort_file, ledger):
+            # A refusal is not a kill, and the ledger says so in those words: the
+            # round's report is rendered from this clause verbatim, and "the
+            # agent was killed" about a round whose agent had already returned
+            # would be the executor overstating what it did.
+            if ledger is not None:
+                ledger.record(
+                    "the round's remaining validation commands were refused "
+                    "before launching"
+                )
             return subprocess.CompletedProcess(
                 list(argv), ABORT_RETURNCODE, "", _ABORT_NOT_STARTED
             )
@@ -626,6 +760,7 @@ def implement_agent_runner(
     clock=None,
     sleep=None,
     abort_file: Path | None = None,
+    abort_ledger: AbortLedger | None = None,
 ) -> ClaudeCliRunner:
     """The ONE place a write-capable `ClaudeCliRunner` is constructed.
 
@@ -660,6 +795,12 @@ def implement_agent_runner(
     is the honest bound and it matches production, where `cli._build_executor`
     passes both to the per-task factory and neither to the standalone binding
     (which is never reached).
+
+    **`abort_ledger` is the SAME object `cli._build_executor` hands the
+    executor**, which is what makes a kill here visible to the round that has to
+    classify it — the executor cannot reach into a runner this factory built, and
+    a second ledger would remember the kill where nobody reads it. See
+    `AbortLedger` for the race that record closes.
     """
     probe = None
     if policy is not None:
@@ -678,7 +819,7 @@ def implement_agent_runner(
         disallowed_tools=IMPLEMENT_DISALLOWED_TOOLS,
         progress_probe=probe,
         stall_policy=stall_policy,
-        spawn=abort_aware_spawn(abort_file, spawn),
+        spawn=abort_aware_spawn(abort_file, spawn, ledger=abort_ledger),
         **kwargs,
     )
 
@@ -2651,6 +2792,7 @@ class ImplementExecutor:
         revert_authority=None,
         advisory_max_calls: int = ADVISORY_VALIDATION_MAX_CALLS,
         abort_file: Path | None = None,
+        abort_ledger: AbortLedger | None = None,
     ):
         """`git` / `agent_runner` are the STANDALONE bindings — used verbatim
         whenever `worker_repo_root_for` is not supplied (every direct
@@ -2684,6 +2826,14 @@ class ImplementExecutor:
         # `cli._build_executor` binds it to `state.abort_flag_file(config)`, the
         # single decision about where that flag lives.
         self._abort_file = abort_file
+        # THE ROUND'S OWN record of an abort having already acted, shared with
+        # the agent runner the factory builds (`cli._build_executor` passes one
+        # object to both) so a kill in either process group is visible to the one
+        # place that classifies the round. Constructed here when nothing was
+        # passed rather than left `None`, so every read below is unconditional:
+        # an unwired executor simply owns a ledger nothing ever writes to, which
+        # reads False forever and is byte-for-byte the old behaviour.
+        self._abort_ledger = abort_ledger if abort_ledger is not None else AbortLedger()
         # WRAPPED, not merely stored, and it is the only line that makes an abort
         # survive a live validation run: BOTH the round's authoritative run and
         # the agent's mid-round advisory runs (`_advisory_for`) go through this
@@ -2692,7 +2842,9 @@ class ImplementExecutor:
         # repository nobody owns, and the round's own `finally` would then wait
         # up to `ADVISORY_STOP_JOIN_SECONDS` for that thread — see
         # `abort_aware_command_runner`.
-        self._command_runner = abort_aware_command_runner(command_runner, abort_file)
+        self._command_runner = abort_aware_command_runner(
+            command_runner, abort_file, self._abort_ledger
+        )
         self._worker_repo_root_for = worker_repo_root_for
         self._policy = policy
         self._agent_runner_factory = agent_runner_factory
@@ -3134,13 +3286,23 @@ class ImplementExecutor:
         `fault_kind` is deliberately EMPTY — an abort is neither the task's
         failure nor the environment's, and naming a fault here would spend the
         fault budget this is required not to spend.
+
+        **What it says was killed is read from the ledger, not assumed.** Three
+        different things can end a round here — the agent's process group, the
+        validation subprocess group, or a list of commands refused before it
+        launched — and the round that was stopped BEFORE it spawned anything
+        killed nothing at all. `AbortLedger.reason` is the clause whichever site
+        acted wrote for itself; the fallback covers the flag-only case honestly
+        rather than claiming a kill nobody performed.
         """
         changed, partial = self._partial_work(git)
+        acted = self._abort_ledger.reason or (
+            "the round was stopped before it could finish"
+        )
         summary = (
-            f"task '{task.id}': the round was ABORTED by the operator — the "
-            "implementation agent and every process it spawned were killed, "
-            "nothing was committed, and the task goes back to the queue with "
-            "this work intact."
+            f"task '{task.id}': the round was ABORTED by the operator — "
+            f"{acted}, nothing was committed, and the task goes back to the "
+            "queue with this work intact."
             + _partial_work_note(changed, partial)
             + " Validation did not run."
             + note
@@ -3160,6 +3322,13 @@ class ImplementExecutor:
         git: GitGateway,
         agent_runner: AgentRunner,
     ) -> ExecutionOutcome:
+        # FIRST, and unconditionally. The ledger is per ROUND while the executor
+        # (and in production the object itself) is per PROCESS, so a kill this
+        # method recorded an hour ago must not classify the round starting now.
+        # That is the dangerous direction — it would refund an attempt nobody
+        # spent and shelve a task that was working — and it is pinned by
+        # `test_operator_abort.py`, not merely intended here.
+        self._abort_ledger.reset()
         if abort_flag_set(self._abort_file):
             # BEFORE anything is spawned. The orchestrator's own check at the top
             # of each step normally catches this first, so reaching here means
@@ -3210,7 +3379,16 @@ class ImplementExecutor:
             # record. `stop()` sweeps even when `start()` never ran, which is
             # also what clears residue left by a round that was killed.
             rendezvous.stop()
-        if abort_flag_set(self._abort_file):
+        if abort_in_effect(self._abort_file, self._abort_ledger):
+            # THE LEDGER, not only the flag, and that is the whole of the fix for
+            # the abort-then-resume race (abort-01 revision, 2026-08-26): the
+            # flag is a file, `resume` deletes it, and a flag cleared between the
+            # kill and this line would have this round report its killed agent's
+            # `not ok` as an ordinary failure — charging the attempt, naming a
+            # fault, and building an `attempt_count_ceiling` out of the
+            # operator's own button. `AbortLedger` is what this process DID, so
+            # nothing a third party does to the file can un-say it.
+            #
             # BEFORE `result.ok`, because the killed agent's own failure is a
             # CONSEQUENCE of the abort and reporting it as the cause would tell a
             # reviewer that a healthy agent had wedged. Before the cleanup,

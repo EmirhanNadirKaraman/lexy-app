@@ -411,6 +411,7 @@ from .state import (
     StateStore,
     StopRepetitionStore,
     abort_requested,
+    packet_outstanding_reason,
     postcommit_binding_from_record,
     stop_repetition_file,
     utcnow_iso,
@@ -813,6 +814,27 @@ SELF_UPGRADE = "self_upgrade"
 #: process the same way (exit 0, nothing parked, nothing to answer) and every
 #: caller handles them identically today.
 ABORTED = "aborted"
+
+#: `run()`'s outcome when an operator's `abort` was observed in a phase where
+#: the KILL is refused — a review packet is outstanding (`state.
+#: packet_outstanding_reason`), and killing a step there strands a push a
+#: reviewer may already have approved.
+#:
+#: ITS OWN VALUE RATHER THAN `ABORTED`, and that distinction is the whole point
+#: of it (abort-01 revision, 2026-08-26). Returning `ABORTED` from those phases
+#: was a silent degrade to `pause` semantics: the operator asked for a kill, got
+#: a boundary stop, and nothing anywhere said the two differed. Nothing was
+#: killed on that path then and nothing is killed on this one now — what changed
+#: is that the loop, the transcript, the heartbeat and the operator's terminal
+#: all SAY the kill was refused, and name `pause` as the verb that means what
+#: actually happened.
+#:
+#: The loop still STOPS, which is deliberate and is not the thing being refused:
+#: stopping between steps is safe in exactly these phases (the phase, the pending
+#: request and the packet are all left intact for the resume), and a branch that
+#: neither killed nor stopped would drop the operator's request on the floor —
+#: the claim is that the loop can be stopped within seconds at ANY point.
+ABORT_REFUSED = "abort_refused"
 
 #: `LoopState.stop_kind` for a session whose in-flight round an operator killed
 #: with `abort` (`_abort_round`). Its own value rather than `"contract"`,
@@ -1293,10 +1315,7 @@ class Orchestrator:
             # means and does exactly as much: stop, here, having killed nothing.
             # Nothing is in flight AT this point by construction — the previous
             # step returned — so the phase is left alone and the session resumes
-            # from it with its packet and its directive intact. That is what
-            # makes this safe in `submitting` and `awaiting`, where a review
-            # packet is outstanding: the loop stops between steps exactly as
-            # `pause` already could, and no step is killed.
+            # from it with its packet and its directive intact.
             #
             # THE KILL is a different mechanism at a different moment. It happens
             # INSIDE `_step_executing`, in the process group the executor
@@ -1304,12 +1323,42 @@ class Orchestrator:
             # `_abort_round`. So the in-flight agent dies within seconds while a
             # reviewer's outstanding packet is never touched.
             #
+            # AND WHERE A PACKET IS OUTSTANDING THE KILL IS REFUSED, IN SO MANY
+            # WORDS (abort-01 revision, 2026-08-26). This branch used to return
+            # `ABORTED` from every phase, which in `submitting`/`awaiting` was a
+            # silent degrade to `pause` semantics — the operator asked to kill
+            # the step in flight and got a boundary stop, with nothing anywhere
+            # saying the two had differed. `ABORT_REFUSED` is the same stop said
+            # out loud: nothing is killed (nothing killable is running there),
+            # the phase and the pending request survive, and the transcript, the
+            # heartbeat and `cli` all name `pause` as the verb that means what
+            # just happened. `state.packet_outstanding_reason` is the shared
+            # predicate — the same one `cli._shelve_session_refusal` refuses a
+            # shelve on, fail-closed on a phase this build does not recognise.
+            #
             # AFTER the terminal check, so a parked loop reports what it is
             # parked on rather than an abort nobody can act on, and BEFORE the
             # self-upgrade and preemption boundaries below: replacing the process
             # or starting somebody else's task is not what an operator who asked
             # the loop to stop is asking for.
             if abort_requested(self._config):
+                refusal = packet_outstanding_reason(self.state)
+                if refusal:
+                    self._log(
+                        "abort_refused",
+                        data={"phase": phase.value, "reason": refusal},
+                    )
+                    heartbeat.publish(
+                        self._config,
+                        self.state,
+                        heartbeat.PAUSED,
+                        detail=(
+                            "abort REFUSED here — " + refusal + "; nothing was "
+                            "killed and the loop stopped between steps instead. "
+                            "`resume` continues from this phase"
+                        ),
+                    )
+                    return ABORT_REFUSED
                 self._log("abort_observed", data={"phase": phase.value})
                 heartbeat.publish(
                     self._config,
@@ -6074,10 +6123,16 @@ class Orchestrator:
         state.outbox_attachment = None
         state.phase = Phase.STOPPED.value
         state.stop_kind = ABORT_STOP_KIND
+        # WHAT was killed is deliberately not asserted here, since the abort-01
+        # revision: three things can end a round (the agent's group, the
+        # validation group, or a flag that landed before either was spawned) and
+        # `outcome.summary` — appended below, rendered from
+        # `implement_executor.AbortLedger` — names whichever it was. A fixed
+        # claim of a kill in this sentence would contradict the measured one
+        # sitting immediately after it in the same string.
         state.stop_reason = (
-            f"the operator aborted the round in flight on {task.id}: the "
-            "implementation agent and its whole process group were killed, "
-            "nothing was committed, no attempt or fault was charged"
+            f"the operator aborted the round in flight on {task.id}: nothing was "
+            "committed and no attempt or fault was charged"
             + (" and the task is back in the queue" if returned else "")
             + f". {outcome.summary}"
         )

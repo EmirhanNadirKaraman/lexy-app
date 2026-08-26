@@ -19,8 +19,16 @@ sentence hoping so:
   * `pause` is unchanged — it still means "stop at the next boundary", which is
     the right default for an unattended job;
   * in the phases that owe a review packet (`submitting`, `awaiting` and their
-    neighbours) nothing is killed: the loop stops BETWEEN steps exactly as
-    `pause` already could, and the pending request and its phase survive;
+    neighbours) the KILL IS REFUSED and says so — `ABORT_REFUSED`, not
+    `ABORTED`. Nothing is killed, the loop stops between steps exactly as
+    `pause` already could, and the pending request and its phase survive. The
+    distinct return value is the point: returning `ABORTED` from there was a
+    silent degrade to pause semantics, and a refusal nobody is told about is a
+    guard that has switched itself off;
+  * an abort already ACTED ON stays acted on: the flag is a file and `resume`
+    deletes it, so the round's classification is carried by a positive
+    per-round record (`AbortLedger`) of what this process killed, never by a
+    second read of a file a third party can remove;
   * a round that already committed a candidate finishes and is honoured at the
     next boundary — the kill is bounded by the commit, which is what makes
     "mainline is untouched" structural rather than argued.
@@ -52,25 +60,34 @@ from autoloop.git_gateway import GitGateway
 from autoloop.implement_executor import (
     ABORT_RETURNCODE,
     AbortableProcessHandle,
+    AbortLedger,
     ImplementExecutor,
     abort_aware_command_runner,
     abort_aware_spawn,
     abort_flag_set,
+    abort_in_effect,
     implement_agent_runner,
     killable_run,
 )
 from autoloop.manifest import ManifestStore
-from autoloop.orchestrator import ABORT_STOP_KIND, ABORTED, Orchestrator
+from autoloop.orchestrator import (
+    ABORT_REFUSED,
+    ABORT_STOP_KIND,
+    ABORTED,
+    Orchestrator,
+)
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.stall import COMPLETED, StallPolicy, spawn_supervised, supervise
 from autoloop.state import (
     EXECUTION_ABORTED,
+    PACKET_OUTSTANDING_PHASES,
     LoopState,
     PendingRequest,
     Phase,
     StateStore,
     abort_flag_file,
     abort_requested,
+    packet_outstanding_reason,
 )
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from autoloop.transcript import TranscriptLogger
@@ -579,7 +596,7 @@ def _green():
 
 
 def executor_with(worker_repo, agent, abort_file, *, validation=(("ruff", "check", "."),),
-                  command_runner=None):
+                  command_runner=None, ledger=None):
     policy = PolicyEngine(PolicyConfig())
     return ImplementExecutor(
         git=GitGateway(worker_repo, policy),
@@ -590,6 +607,10 @@ def executor_with(worker_repo, agent, abort_file, *, validation=(("ruff", "check
         policy=policy,
         agent_runner_factory=lambda root: agent,
         abort_file=abort_file,
+        # The object `cli._build_executor` shares between the executor and the
+        # runner factory. Passed explicitly here so a test can write into it
+        # exactly where a real `AbortableProcessHandle` would.
+        abort_ledger=ledger,
     )
 
 
@@ -772,6 +793,234 @@ def test_the_production_runner_wiring_actually_carries_the_flag(tmp_path):
 
 
 # =============================================================================
+# 3b. THE ABORT-THEN-RESUME RACE: a flag is a file, and `resume` deletes it
+# =============================================================================
+#
+# THE SEQUENCE THAT COSTS A TASK AN ATTEMPT, and the one the executor's report
+# named: flag appears -> the agent's process group is killed -> the flag is
+# cleared (`resume`, a second operator command, a wrapper script) -> the round
+# re-reads the flag, sees nothing, and reports the killed agent's own `not ok`
+# as an ordinary failure. That charges the attempt, names a `fault_kind`, and
+# builds an `attempt_count_ceiling` out of the operator's own button — which is
+# the one thing the task's constraints forbid outright.
+#
+# The fix is a POSITIVE per-round record of what this process DID, never a
+# second read of a file a third party can remove.
+
+
+def test_the_ledger_records_the_kill_rather_than_inferring_it_from_the_flag(tmp_path):
+    abort_file = tmp_path / "ABORT"
+    abort_file.touch()
+    ledger = AbortLedger()
+    inner = FakeProcess()
+    handle = AbortableProcessHandle(
+        inner, abort_file, ledger=ledger, grace_seconds=1.0, sleep=lambda _: None
+    )
+
+    assert ledger.killed is False, "nothing has been killed yet"
+    handle.poll()
+
+    assert ledger.killed is True
+    assert "implementation agent" in ledger.reason
+    # AND IT SURVIVES THE FILE. This is the whole property: the record is about
+    # what this process did, so deleting the operator's flag cannot un-say it.
+    abort_file.unlink()
+    assert ledger.killed is True
+    assert abort_in_effect(abort_file, ledger) is True
+    assert abort_in_effect(abort_file, None) is False, "the flag alone has forgotten"
+
+
+def test_a_flag_cleared_before_the_round_re_reads_it_is_still_an_abort(tmp_path):
+    """THE REGRESSION. The agent is killed, the operator's `resume` removes the
+    flag, and the round is classified AFTER that. Without the ledger this is a
+    `status="error"` round carrying `fault_kind` — a charged failure — and the
+    reviewer is told a healthy agent wedged."""
+    worker = real_repo(tmp_path, "worker")
+    abort_file = tmp_path / "ABORT"
+    ledger = AbortLedger()
+
+    def aborted_then_resumed():
+        # The whole sequence, in order, WHILE THE AGENT RUNS — which is the only
+        # time it can happen. A flag armed before the round starts is caught by
+        # the pre-spawn check instead and no agent is paid for at all.
+        abort_file.touch()  # the operator arms it
+        # what `AbortableProcessHandle.poll` does on the next 5s tick:
+        ledger.record("the implementation agent and every process it spawned were killed")
+        abort_file.unlink()  # `resume`, before the round classifies itself
+
+    agent = WritingAgent(
+        worker, {"A.py": "x\n" * 12}, before_returning=aborted_then_resumed, ok=False
+    )
+    executor = executor_with(worker, agent, abort_file, ledger=ledger)
+
+    outcome = executor.execute(implement(), a_task())
+
+    assert outcome.status == EXECUTION_ABORTED, (
+        "a cleared flag turned the operator's abort back into a charged failure"
+    )
+    assert outcome.fault_kind == "", "an abort spends neither budget"
+    assert "implementation agent failed" not in outcome.summary
+    assert "1 file(s) changed" in outcome.summary, "the partial work is still measured"
+    assert abort_file.exists() is False, "the test's own premise"
+
+
+def test_a_healthy_round_after_an_aborted_one_is_not_classified_as_aborted(tmp_path):
+    """THE DANGEROUS DIRECTION, and the reason the reset is unconditional.
+
+    `cli._build_executor` builds ONE ledger for the process and shares it with
+    the runner factory, so a ledger that remembered a kill forever would refund
+    an attempt nobody spent and shelve a task that was working — silently, and
+    for every round after the first abort. `_run_implementation` resets it at
+    the top, before it reads anything.
+    """
+    worker = real_repo(tmp_path, "worker")
+    abort_file = tmp_path / "ABORT"
+    ledger = AbortLedger()
+    ran = []
+
+    def aborted_on_the_first_round_only():
+        # `runs` is incremented before this fires, so this is round 1 alone —
+        # round 2 is an ordinary healthy round sharing the same ledger, which is
+        # exactly the production shape. The flag is armed and cleared INSIDE the
+        # round, because that is the only window in which the race exists.
+        if agent.runs == 1:
+            abort_file.touch()
+            ledger.record("the implementation agent and every process it spawned were killed")
+            abort_file.unlink()
+
+    agent = WritingAgent(
+        worker, {"A.py": "x\n"}, before_returning=aborted_on_the_first_round_only
+    )
+    executor = executor_with(
+        worker,
+        agent,
+        abort_file,
+        ledger=ledger,
+        command_runner=lambda argv, **kw: ran.append(tuple(argv)) or _green(),
+    )
+    assert executor.execute(implement(), a_task()).status == EXECUTION_ABORTED
+
+    second = executor.execute(implement(), a_task())
+
+    assert second.status == "ok", (
+        "the second round inherited the first round's kill: " + second.summary
+    )
+    assert ran, "the second round must really have validated"
+    assert ledger.killed is False, "the ledger was not reset for the new round"
+
+
+def test_the_report_says_what_was_actually_killed_rather_than_one_fixed_guess(tmp_path):
+    """An overstatement is a fail-open of its own: the reviewer reads the summary
+    before the diff, and "the agent was killed" about a round whose agent had
+    already returned is the executor claiming an action it never took. Three
+    things can end a round here and the ledger carries whichever happened."""
+    worker = real_repo(tmp_path, "worker")
+    abort_file = tmp_path / "ABORT"
+
+    # (a) nothing was killed — the flag landed after the agent returned.
+    flag_only = executor_with(
+        worker, WritingAgent(worker, {}, before_returning=abort_file.touch), abort_file
+    ).execute(implement(), a_task())
+    assert "stopped before it could finish" in flag_only.summary
+    assert "killed" not in flag_only.summary, flag_only.summary
+
+    # (b) the validation group was killed, and the sentence names THAT.
+    abort_file.unlink()
+    ledger = AbortLedger()
+    validation_killed = executor_with(
+        worker,
+        WritingAgent(
+            worker,
+            {},
+            before_returning=lambda: ledger.record(
+                "the validation subprocess and every process it spawned were killed"
+            ),
+        ),
+        abort_file,
+        ledger=ledger,
+    ).execute(implement(), a_task())
+    assert "validation subprocess" in validation_killed.summary
+
+
+def test_the_ledger_keeps_refusing_commands_after_the_flag_is_cleared(tmp_path):
+    """The sticky half, and it is not decoration: `AdvisoryRendezvous.stop()`
+    joins the validation thread for up to `ADVISORY_STOP_JOIN_SECONDS` (11 min).
+    If a flag cleared mid-abort let the remaining commands launch again, the
+    round's own `finally` would wait out a suite — the 39-minute wait rebuilt
+    under a new name, in the exact code path this verb exists to remove."""
+    abort_file = tmp_path / "ABORT"
+    ledger = AbortLedger()
+    launched = []
+    runner = abort_aware_command_runner(
+        lambda argv, **kw: launched.append(tuple(argv)) or _green(), abort_file, ledger
+    )
+
+    abort_file.touch()
+    first = runner(["pytest"], cwd=tmp_path)
+    abort_file.unlink()
+    second = runner(["ruff", "check", "."], cwd=tmp_path)
+
+    assert first.returncode == ABORT_RETURNCODE
+    assert second.returncode == ABORT_RETURNCODE, "a cleared flag re-armed the suite"
+    assert launched == [], "no command may launch once the round is being aborted"
+    assert "refused before launching" in ledger.reason, (
+        "a refusal is not a kill and the record must not claim one"
+    )
+
+
+def test_the_killable_runner_records_its_own_kill_but_not_a_timeout(tmp_path):
+    """Both real subprocesses, because the distinction is the point: a suite the
+    OPERATOR stopped must classify the round as aborted, and a suite that simply
+    ran too long is the round's own failure and must keep costing it an
+    attempt."""
+    abort_file = tmp_path / "ABORT"
+    aborted, timed_out = AbortLedger(), AbortLedger()
+
+    abort_file.touch()
+    proc = killable_run(
+        [sys.executable, "-c", f"import time; time.sleep({LINGER_SECONDS})"],
+        cwd=tmp_path,
+        text=True,
+        abort_file=abort_file,
+        ledger=aborted,
+        poll_seconds=0.05,
+        grace_seconds=2.0,
+    )
+    assert proc.returncode != 0
+    assert "validation subprocess" in aborted.reason
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        killable_run(
+            [sys.executable, "-c", f"import time; time.sleep({LINGER_SECONDS})"],
+            cwd=tmp_path,
+            text=True,
+            ledger=timed_out,
+            timeout=0.5,
+            poll_seconds=0.05,
+            grace_seconds=2.0,
+        )
+    assert timed_out.killed is False, (
+        "a timeout recorded itself as an operator abort, so the round it failed "
+        "would have been refunded instead of charged"
+    )
+
+
+def test_an_unwired_executor_owns_a_ledger_nothing_ever_writes_to(tmp_path):
+    """The fail-closed default said precisely: an executor with no flag path has
+    no abort capability, so its ledger stays empty forever and every read of it
+    is the behaviour that predates this feature."""
+    worker = real_repo(tmp_path, "worker")
+    executor = executor_with(
+        worker,
+        WritingAgent(worker, {"A.py": "x\n"}),
+        None,
+        command_runner=lambda argv, **kw: _green(),
+    )
+    assert executor.execute(implement(), a_task()).status == "ok"
+    assert executor._abort_ledger.killed is False
+
+
+# =============================================================================
 # 4. THE ROUND: budgets, the queue, the worker, and mainline
 # =============================================================================
 
@@ -855,15 +1104,24 @@ def build(tmp_path, executor_factory, task_id="t1"):
     return orch, execution_store, repo_root, config
 
 
-def aborting_round(abort_file, *, rel="A.py", body="x\n" * 30, status=EXECUTION_ABORTED):
+def aborting_round(
+    abort_file, *, rel="A.py", body="x\n" * 30, status=EXECUTION_ABORTED, arm=True
+):
     """A round that writes real work into its worker repo and is then aborted —
     the shape `implement_executor` produces when the operator presses the
-    button mid-agent."""
+    button mid-agent.
+
+    `arm=False` is the abort-then-resume race at the dispatch level: the round
+    was killed and classified, and by the time the orchestrator looks the flag
+    has been cleared. The executor's `EXECUTION_ABORTED` is then the ONLY signal
+    left, and it has to be enough.
+    """
 
     def _round(worktree: Path):
         worktree.mkdir(parents=True, exist_ok=True)
         (worktree / rel).write_text(body, encoding="utf-8")
-        abort_file.touch()
+        if arm:
+            abort_file.touch()
         return ExecutionOutcome(
             status=status,
             summary=(
@@ -1077,6 +1335,33 @@ def test_the_flag_alone_aborts_a_round_whose_outcome_never_said_so(tmp_path):
     assert run_git(repo_root, "rev-parse", "HEAD").strip() == head_before
 
 
+def test_the_executors_signal_alone_aborts_a_round_whose_flag_is_already_gone(tmp_path):
+    """The same two-signal rule read the other way, and the dispatch-level half
+    of the abort-then-resume race: the flag was never armed by the time this
+    round was classified — `resume` cleared it while the kill was landing — so
+    `EXECUTION_ABORTED` is the only thing left saying what happened. Charging
+    the attempt here is what would eventually park the task on
+    `attempt_count_ceiling` for the operator's own button."""
+    abort_file = tmp_path / "ABORT"
+    orch, execution_store, repo_root, config = build(
+        tmp_path,
+        lambda wr, rr: ScriptedExecutor(wr, [aborting_round(abort_file, arm=False)]),
+    )
+    head_before = run_git(repo_root, "rev-parse", "HEAD").strip()
+
+    orch._dispatch_executor(implement())
+
+    assert abort_requested(config) is False, "the test's own premise"
+    execution = execution_store.load("t1")
+    assert execution.attempt_count == 0, "an operator's abort spent an attempt"
+    assert execution.fault_attempt_count == 0
+    assert execution.attempt_ledger == ()
+    assert execution.candidate_sha == "", "an aborted round commits nothing"
+    assert orch.state.stop_kind == ABORT_STOP_KIND
+    assert orch._registry.get("t1").status == "pending", "resumable, not consumed"
+    assert run_git(repo_root, "rev-parse", "HEAD").strip() == head_before
+
+
 def test_the_next_dispatch_resumes_the_aborted_round(tmp_path):
     """The claim's last word: resumable. The second dispatch reuses the SAME
     worker repository — the partial file is still there and is committed with
@@ -1229,36 +1514,112 @@ def loop_at(tmp_path, phase, *, pending=None):
     return orch, config
 
 
-def test_an_abort_never_kills_a_step_while_a_review_packet_is_outstanding(tmp_path):
+def arm(config) -> Path:
+    flag = abort_flag_file(config)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+    return flag
+
+
+def test_an_abort_is_refused_in_so_many_words_while_a_packet_is_outstanding(tmp_path):
     """NEVER ABORT IN `submitting` OR `awaiting`. A review packet is outstanding
     there and killing the step strands an approved push.
 
-    What happens instead is exactly what `pause` does: the loop returns BETWEEN
-    steps, having killed nothing, with the phase and the pending request intact
-    for the resume. `_step_awaiting` is never entered — the stub client would
-    raise if it were.
+    THE REVISION (abort-01, 2026-08-26): this used to return `ABORTED`, which is
+    what an abort that KILLED something returns — so the operator asked for a
+    kill, got `pause`'s boundary stop, and nothing anywhere said the two had
+    differed. A refusal nobody is told about is a guard that has switched itself
+    off. `ABORT_REFUSED` is its own value precisely so no caller can confuse
+    them, and the transcript records the refusal with its reason.
+
+    What is NOT refused is the stop itself: the loop returns between steps,
+    having killed nothing, with the phase and the pending request intact for the
+    resume. `_step_awaiting` is never entered — the stub client would raise if it
+    were, which is what makes "nothing ran" evidence rather than assertion.
     """
     pending = PendingRequest(request_id="alr-1", payload="the packet", submitted=True)
     orch, config = loop_at(tmp_path, Phase.AWAITING, pending=pending)
-    abort_flag_file(config).parent.mkdir(parents=True, exist_ok=True)
-    abort_flag_file(config).touch()
+    arm(config)
 
-    assert orch.run() == ABORTED
+    assert orch.run() == ABORT_REFUSED
+    assert ABORT_REFUSED != ABORTED, "a refusal that returns the abort value says nothing"
 
     assert orch.state.phase == Phase.AWAITING.value, "the phase must survive"
     assert orch.state.pending_request.request_id == "alr-1", "the packet must survive"
     assert orch.state.stop_kind != ABORT_STOP_KIND, "no round was killed, so none is recorded"
     assert orch.state.aborted_round is None
+    records = [
+        line for line in config.transcript_file.read_text(encoding="utf-8").splitlines()
+        if "abort_refused" in line
+    ]
+    assert records, "the refusal must be recorded, not merely performed"
+    assert "awaiting" in records[0]
 
 
-@pytest.mark.parametrize("phase", [Phase.READY, Phase.SUBMITTING, Phase.EXECUTING])
-def test_the_loop_stops_between_steps_from_any_live_phase(tmp_path, phase):
+@pytest.mark.parametrize("phase", sorted(PACKET_OUTSTANDING_PHASES, key=lambda p: p.value))
+def test_every_packet_phase_refuses_the_kill_rather_than_reporting_an_abort(
+    tmp_path, phase
+):
+    """The whole set, not the two the constraint happened to name. `delivering`
+    is mid-deposit of a chunked payload and the two `submission_*` phases are
+    sends whose acceptance is unknown or disproved — each strands something a
+    later reconciliation cannot classify, which is why they are one set shared
+    with `cli._shelve_session_refusal` rather than a list per verb."""
     orch, config = loop_at(tmp_path, phase)
-    abort_flag_file(config).parent.mkdir(parents=True, exist_ok=True)
-    abort_flag_file(config).touch()
+    arm(config)
+
+    assert orch.run() == ABORT_REFUSED
+    assert orch.state.phase == phase.value
+    assert orch.state.aborted_round is None
+
+
+def test_a_request_that_outlived_its_phase_refuses_the_kill_too(tmp_path):
+    """Guard 1's second half, and not a hypothetical: a request OUTLIVES its own
+    phase, which is why `cli._shelve_session_refusal` checks it separately. A
+    session sitting in `ready` while a reviewer still holds a request is a
+    session that can strand one, whatever its phase says."""
+    pending = PendingRequest(request_id="alr-9", payload="the packet", submitted=True)
+    orch, config = loop_at(tmp_path, Phase.READY, pending=pending)
+    arm(config)
+
+    assert orch.run() == ABORT_REFUSED
+    assert orch.state.pending_request.request_id == "alr-9"
+
+
+@pytest.mark.parametrize("phase", [Phase.READY, Phase.EXECUTING])
+def test_the_loop_stops_between_steps_from_any_live_phase(tmp_path, phase):
+    """The other side of the refusal: where NO packet is outstanding the abort is
+    an abort. `executing` is the phase the whole verb exists for, and it can
+    never be refused by the pending-request half of the guard —
+    `_step_awaiting` clears `pending_request` in the same save that moves the
+    phase to `executing`."""
+    orch, config = loop_at(tmp_path, phase)
+    arm(config)
 
     assert orch.run() == ABORTED
     assert orch.state.phase == phase.value
+
+
+@pytest.mark.parametrize(
+    "state,expected",
+    [
+        (None, "no readable session"),
+        (object(), "unrecognised phase"),
+    ],
+)
+def test_the_packet_predicate_refuses_what_it_cannot_read(state, expected):
+    """FAIL-CLOSED, and into the harmless direction: an unreadable session and a
+    phase this build does not know both refuse the KILL rather than answering
+    "no packet outstanding" and performing one. Answering the other way is the
+    fail-open this file exists to grade — the guard silently passing when what it
+    needs is absent."""
+    assert expected in packet_outstanding_reason(state)
+
+
+def test_the_packet_predicate_is_silent_where_a_kill_is_safe():
+    state = LoopState.new(URL)
+    state.phase = Phase.EXECUTING.value
+    assert packet_outstanding_reason(state) == ""
 
 
 def test_a_parked_loop_reports_its_park_rather_than_the_abort(tmp_path):
@@ -1341,6 +1702,83 @@ def test_abort_writes_the_flag_and_says_what_it_costs(cli_config, capsys):
     printed = capsys.readouterr().out
     assert "killed within seconds" in printed
     assert "no attempt or fault is charged" in printed
+
+
+def save_session(config, phase, *, pending=None) -> None:
+    state = LoopState.new(URL)
+    state.phase = phase.value
+    state.pending_request = pending
+    StateStore(config.state_file).save(state)
+
+
+def test_abort_warns_when_the_phase_it_lands_in_will_refuse_the_kill(cli_config, capsys):
+    """The operator is told BEFORE they go looking for a dead agent that will
+    not be there. Still armed, though — see the next test for why refusing to
+    arm on a snapshot would be the worse failure."""
+    config = cli.load_config(cli_config)
+    save_session(config, Phase.AWAITING)
+
+    assert cli._cmd_abort(argparse.Namespace(config=cli_config)) == 0
+
+    printed = capsys.readouterr().out
+    assert "will be REFUSED" in printed
+    assert "review packet is outstanding" in printed
+    assert "`pause` is the verb" in printed
+    assert abort_requested(config) is True, "the warning is not a refusal to arm"
+
+
+def test_abort_arms_the_flag_anyway_because_the_phase_it_read_is_a_snapshot(
+    cli_config, capsys
+):
+    """WHY the warning is not a refusal. The operator who most needs this verb is
+    the one whose loop entered `executing` and started a four-hour agent call one
+    second after `state.json` was written. Deciding from that file would drop
+    exactly that request — silently — which is the failure the verb exists to
+    remove."""
+    config = cli.load_config(cli_config)
+    save_session(config, Phase.EXECUTING)
+
+    cli._cmd_abort(argparse.Namespace(config=cli_config))
+
+    printed = capsys.readouterr().out
+    assert abort_requested(config) is True
+    assert "REFUSED" not in printed, "a kill is performed here; nothing is refused"
+
+
+def test_abort_never_reports_a_refusal_it_cannot_actually_read(cli_config, capsys):
+    """FAIL-CLOSED IN THE PREDICATE, honest in the report, and the two are not the
+    same thing. `packet_outstanding_reason(None)` refuses — correctly, for the
+    loop's own guard — but this process may simply be unable to open a state file
+    that a perfectly healthy loop is holding in memory and killing an agent from.
+    Printing "the kill will be refused" there would be this command inventing a
+    fact about a loop it cannot see."""
+    config = cli.load_config(cli_config)
+    assert not config.state_file.exists(), "the fixture ships no session"
+
+    cli._cmd_abort(argparse.Namespace(config=cli_config))
+
+    printed = capsys.readouterr().out
+    assert "REFUSED" not in printed
+    assert "could not be read" in printed and "unknown" in printed
+    assert abort_requested(config) is True
+
+
+def test_the_operator_report_for_a_refusal_says_nothing_was_killed(capsys):
+    """The counterpart to `_report_abort`, and the reason the loop has a return
+    value of its own: an operator who asked for a kill and got a boundary stop
+    has to be told which one they got."""
+    state = LoopState.new(URL)
+    state.phase = Phase.AWAITING.value
+
+    cli._report_abort_refused(state)
+
+    printed = capsys.readouterr().out
+    assert "ABORT REFUSED" in printed
+    assert "killed       nothing" in printed
+    assert "packet" in printed
+    assert cli._is_abort_stop(state) is False, (
+        "a refusal writes no stop_kind, so the abort report must stay silent"
+    )
 
 
 def test_abort_does_not_set_the_pause_flag_and_pause_does_not_set_this_one(cli_config):

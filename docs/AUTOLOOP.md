@@ -107,8 +107,11 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
 `O_CREAT|O_EXCL`; records pid, hostname, start time, run id, state dir).
 `status` / `tasks` / `doctor` / `pause` / `abort` stay available while locked —
 `abort` for the same reason `pause` is, and it is the whole point of it: it
-writes one flag file outside the checkout and touches no state, no registry and
-no worker, so it is usable against the live loop it exists to stop (§4f-septies).
+WRITES one flag file outside the checkout and nothing else — no state, no
+registry, no worker — so it is usable against the live loop it exists to stop
+(§4f-septies). It does READ the saved session, to warn when the phase recorded
+there will refuse the kill; that read never decides anything and never blocks
+the flag being armed.
 `smoke-browser` held it too until brw-16 (2026-08-25) retired the command; it
 now takes no lock at all, which is asserted rather than assumed — a retired
 command that still locked would block a live run in order to print a sentence.
@@ -1345,6 +1348,7 @@ What each way of stopping costs:
 |---|---|---|---|
 | `pause` | released | consistent | none — finishes the current phase first |
 | `abort` | released | consistent | the agent in flight and its whole process group are killed; the work stays uncommitted in the worker repo, the task goes back to the queue, and no attempt or fault is charged (§4f-septies) |
+| `abort` where a packet is outstanding | released | consistent | none — the KILL is refused and said so (`ABORT_REFUSED`); the loop stops between steps with the phase, the pending request and the packet intact (§4f-septies) |
 | Ctrl-C / SIGTERM / SIGHUP | released | consistent | the current step |
 | SIGKILL / power cut | left behind, `unlock` clears it | consistent | the current step |
 
@@ -3712,13 +3716,39 @@ which is the only moment it means anything.
 * **Between steps** (`Orchestrator.run`, after the terminal-phase check): the
   loop returns `ABORTED` having killed nothing, exactly as `pause` does. The
   phase, the pending request and the reviewer's outstanding packet all survive
-  for the resume. This is what satisfies **never abort in `submitting` or
-  `awaiting`** — no step of that kind is ever killed. It sits after the terminal
-  check so a parked loop still reports its park, and before the self-upgrade and
-  preemption boundaries, because replacing the process or starting somebody
-  else's task is not what an operator asking the loop to stop is asking for.
+  for the resume. It sits after the terminal check so a parked loop still
+  reports its park, and before the self-upgrade and preemption boundaries,
+  because replacing the process or starting somebody else's task is not what an
+  operator asking the loop to stop is asking for.
 * **Inside the executing step**, in the process groups the executor spawned.
   This is the kill.
+
+**WHERE A PACKET IS OUTSTANDING THE KILL IS REFUSED, IN SO MANY WORDS.** This is
+what satisfies **never abort in `submitting` or `awaiting`**, and since the
+abort-01 revision (2026-08-26) it is said rather than merely done. `Orchestrator
+.run` asks `state.packet_outstanding_reason` — the SAME predicate
+`cli._shelve_session_refusal` refuses a shelve on, over the same
+`state.PACKET_OUTSTANDING_PHASES` — and returns `ABORT_REFUSED` instead of
+`ABORTED`:
+
+* nothing is killed (nothing killable is running in those phases at all), the
+  phase and the pending request survive, and no round is interrupted;
+* the loop still STOPS between steps, because the operator asked it to and doing
+  so there is safe. What is refused is the KILL, not the stop; a branch that
+  neither killed nor stopped would drop the request on the floor and break the
+  claim that the loop can be stopped within seconds at any point;
+* it is REPORTED — `abort_refused` in the transcript with its reason, a
+  heartbeat detail, and `cli._report_abort_refused` in the terminal, which names
+  `pause` as the verb that means what actually happened. Returning `ABORTED`
+  there (what this did before the revision) was a silent degrade to `pause`
+  semantics: the operator asked for a kill, got a boundary stop, and nothing
+  anywhere distinguished the two;
+* `packet_outstanding_reason` is FAIL-CLOSED — an unreadable session or a phase
+  this build does not recognise refuses the kill rather than performing one;
+* `python -m autoloop abort` WARNS when the saved phase says the kill will be
+  refused, and still arms the flag. Refusing to arm would decide from a snapshot
+  of `state.json`, and the operator who most needs the verb is the one whose loop
+  entered `executing` one second after that file was written.
 
 **THE KILL IS OF A PROCESS GROUP, in BOTH groups a round has.** Nothing in
 `stall.py` changed; the agent path goes in through `ClaudeCliRunner(spawn=...)`,
@@ -3767,12 +3797,45 @@ the executor returns and BEFORE the commit:
   from the worker repo's own `git status` / `git diff HEAD`, never from the
   agent's account of itself). It reaches `state.aborted_round`, the
   `round_aborted` transcript entry, `stop_reason` and the operator's terminal.
+  Since the abort-01 revision it also names WHICH of the three things was
+  stopped — the agent's group, the validation group, or nothing at all because
+  the flag landed before either was spawned. `stop_reason` and
+  `cli._report_abort`'s own first line no longer assert a kill of their own, for
+  the reason a fixed claim beside a measured one is always the wrong half: they
+  say the round was STOPPED in flight and leave the rest to the measurement.
 
 **TWO INDEPENDENT SIGNALS, either sufficient.** The flag is the operator's own
 artefact; `state.EXECUTION_ABORTED` is the executor's report of having read it
 and killed the agent. A flag cleared between the two reads still ends the round
 as an abort rather than as a charged failure — the fail-closed direction for
 "no attempt spent".
+
+**AND THE EXECUTOR'S OWN SIGNAL IS A POSITIVE RECORD, NOT A SECOND READ OF THE
+FILE** (abort-01 revision, 2026-08-26). The flag is a FILE and `resume` deletes
+it, so this sequence used to charge the task an attempt:
+
+    flag appears → the agent's process group is killed → the flag is cleared →
+    `_run_implementation` re-reads the flag, sees nothing, and reports the
+    killed agent's own `not ok` as an ordinary failure
+
+…naming a `fault_kind`, spending the budget, and eventually parking the task on
+`attempt_count_ceiling` for the operator's own button. `implement_executor.
+AbortLedger` is the fix: one object per process, shared by `cli._build_executor`
+between the executor and the agent-runner factory, into which every abort-aware
+site records what it actually did — the agent's group killed, the validation
+group killed, or remaining commands refused before launching. Every site then
+asks `abort_in_effect(flag, ledger)` rather than the flag alone, so:
+
+* a round that killed something stays aborted whatever happens to the file;
+* the abort is STICKY within a round, which also bounds `AdvisoryRendezvous.
+  stop()`'s join — a cleared flag cannot re-arm a suite the round's `finally`
+  would then wait out, which is the 39-minute wait rebuilt under a new name;
+* the reported sentence names WHICH of the three happened, and a round the flag
+  merely stopped before it spawned anything says so rather than claiming a kill;
+* the ledger is RESET at the top of every `_run_implementation`. That is the
+  dangerous direction — a remembered kill would classify the next healthy round
+  as aborted, refunding an attempt nobody spent and shelving a working task —
+  and `test_operator_abort.py` pins it rather than trusting the comment.
 
 **WHERE THE KILL STOPS, stated rather than implied.** It bounds the agent call
 and the executor's own validation, which is nearly all of a round's wall clock.

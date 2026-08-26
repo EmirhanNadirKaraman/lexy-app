@@ -202,6 +202,30 @@ class Phase(str, Enum):
 
 TERMINAL_PHASES = frozenset({Phase.NEEDS_USER, Phase.STOPPED, Phase.FAILED})
 
+#: The phases in which the loop OWES A REVIEW PACKET whose acceptance it cannot
+#: yet prove. `delivering` is mid-deposit of a chunked payload, `submitting` has
+#: a request created and possibly sent, the two `submission_*` phases are a send
+#: whose acceptance is unknown or disproved, and `awaiting` has a reviewer
+#: holding one. Whatever the packet is about, anything that ends or interrupts
+#: the session at one of these strands a packet nobody can classify afterwards.
+#:
+#: TWO VERBS READ THIS, which is why it lives here rather than in either of
+#: them. `cli._shelve_session_refusal` refuses a shelve outright at any of them
+#: (shelve-01), and `Orchestrator.run` refuses the `abort` KILL at any of them
+#: (abort-01) — see `packet_outstanding_reason`, further down this module, which
+#: is the shared predicate the second one asks. Two copies of this set would
+#: agree on the day they were written and disagree the first time a phase was
+#: added.
+PACKET_OUTSTANDING_PHASES = frozenset(
+    {
+        Phase.DELIVERING,
+        Phase.SUBMITTING,
+        Phase.SUBMISSION_UNCONFIRMED,
+        Phase.SUBMISSION_REJECTED,
+        Phase.AWAITING,
+    }
+)
+
 
 @dataclass
 class PostcommitBinding:
@@ -975,6 +999,57 @@ def abort_requested(config) -> bool:
     strictly worse: an unreadable path would kill every agent the loop ran.
     """
     return abort_flag_file(config).exists()
+
+
+def packet_outstanding_reason(state) -> str:
+    """Why this session owes a review packet, or `""` when it demonstrably does
+    not.
+
+    THE ONE QUESTION `abort` has to ask before it kills anything: a packet
+    outstanding means a reviewer may already be holding — or may already have
+    accepted — a request this round produced, and killing a step there strands an
+    approved push. So the kill is REFUSED at any phase in
+    `PACKET_OUTSTANDING_PHASES`, and refused for the same reason
+    `cli._shelve_session_refusal` refuses a shelve at them.
+
+    **The pending request is checked separately from the phase**, because a
+    request OUTLIVES its own phase: `Orchestrator._step_awaiting` clears
+    `pending_request` in the same save that moves the phase to `executing`
+    (`orchestrator.py`), so a session carrying one in any other phase is a
+    session whose request has not been resolved yet. That second check costs
+    nothing in the phase this verb exists for — `executing` has no pending
+    request by construction, which is precisely why an abort mid-agent is never
+    refused.
+
+    **Unrecognised phase REFUSES, fail-closed**, exactly as the shelve guard
+    does: whether a packet is outstanding is the one thing that cannot be decided
+    about a phase this build does not know, and answering "no packet" by default
+    would be the guard silently switching itself off — into a KILL, here.
+    `state=None` refuses for the same reason: no session to read means no
+    evidence, not a licence.
+
+    Duck-typed on `phase` / `pending_request` like everything else in this
+    module, and it never raises: a caller reaching for a field that is not there
+    gets a refusal, not an `AttributeError` out of the middle of a stop request.
+    """
+    if state is None:
+        return "there is no readable session, so whether one owes a packet cannot be decided"
+    try:
+        phase = Phase(getattr(state, "phase", ""))
+    except (ValueError, TypeError):
+        return (
+            f"the session is in an unrecognised phase {getattr(state, 'phase', None)!r}, "
+            "so whether it owes a review packet cannot be decided"
+        )
+    if phase in PACKET_OUTSTANDING_PHASES:
+        return f"a review packet is outstanding (phase {phase.value})"
+    pending = getattr(state, "pending_request", None)
+    if pending is not None:
+        return (
+            f"request {getattr(pending, 'request_id', '?')} is still pending in "
+            f"phase {phase.value} — a request outlives its own phase"
+        )
+    return ""
 
 
 #: Filename of the repeated-stop ledger under `AutoloopConfig.state_dir`.
