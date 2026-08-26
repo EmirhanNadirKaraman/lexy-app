@@ -1960,6 +1960,14 @@ class TaskRegistry:
         cannot quietly un-complete finished work or launder a quarantine
         (`blocked` still goes through `unblock`, which is what the blocker
         record is tied to).
+
+        **Unchanged by release-02, deliberately.** A `blocked` task can hold the
+        same hazard — an unpublished candidate in a worker repo nobody will ever
+        finish — and it now has its own verb rather than a relaxation of this
+        one: `discard` below, whose extra work is exactly the part this method
+        must not do silently (close the blocker record, with a reason, before
+        the task is queued again). Two verbs, two refusal messages, one status
+        move shared through `_return_to_pending`.
         """
         return self._return_to_pending(
             task_id,
@@ -2136,6 +2144,105 @@ class TaskRegistry:
         moved.recut_count += 1
         return moved
 
+    def discard_obstacle(self, task_id: str) -> TaskGraphError | None:
+        """Why `discard` would refuse `task_id`, or `None` when it would move it.
+
+        The ASKABLE form of the refusal, split out for the reason
+        `unblock_obstacle` and `recut_obstacle` are: `cli._cmd_discard` performs
+        something destructive (it retires an execution) and has to know it may
+        BEFORE it moves anything, and a caller that learned the answer by
+        attempting the move would already have quarantined a worker repo by the
+        time it found out it should not have.
+
+        Raises `task_unknown` for an id that is not in the graph rather than
+        answering `None`, the same fail-closed reading `recut_obstacle` takes: a
+        caller must not be able to ask about a typo and read the silence as
+        "eligible".
+        """
+        task = self.get(task_id)
+        if task.status == "blocked" and task.hold_origin == HOLD_ORIGIN_OPERATOR:
+            # Ahead of the status test below, because that test ACCEPTS
+            # `blocked`: without this arm an operator hold would be releasable by
+            # naming it here, which is exactly the laundering
+            # `blocker_derived_blocked` and `recut_obstacle` already refuse. It
+            # is also vacuous in its own terms — a hold placed through the inbox
+            # has NO blocker record at all, so "close the blocker with a recorded
+            # reason" would have nothing to close.
+            return TaskGraphError(
+                "task_operator_hold",
+                f"task '{task_id}' is held by the operator "
+                f"({task.blocked_reason or 'no reason recorded'}) — `discard` "
+                "never releases an operator hold; only the operator does, "
+                "through the inbox",
+            )
+        if task.status != "blocked":
+            return TaskGraphError(
+                "task_not_blocked",
+                f"task '{task_id}' has status {task.status!r}, and `discard` "
+                "only retires the execution of a QUARANTINED task — `release` "
+                "is the verb for a round stranded in progress, and finished "
+                "work is not un-finished by any of them",
+            )
+        return None
+
+    def discard(self, task_id: str) -> Task:
+        """Return a QUARANTINED task to pending so its execution can be
+        discarded. The registry half of `cli._cmd_discard`.
+
+        The fourth member of the `release` / `shelve` / `recut` family, sharing
+        their one status assignment (`_return_to_pending`) for the reason they
+        share it with each other: there is exactly one way to be pending, and a
+        fourth copy of that line is a bug in whichever one drifts. What differs
+        is what the CALLER does — here, retire both halves of the execution
+        (`worktask.retire_execution`) and close the blocker that quarantined the
+        task, with a recorded reason.
+
+        **Blocked-only, and that is the whole of what it adds.** `release`
+        covers `in_progress` + discard and is deliberately untouched; `answer`
+        covers `blocked` + keep and is deliberately untouched; `shelve` covers
+        `in_progress` + keep. The remaining combination — a task parked
+        `task_fatal` while holding a round nobody wants — had no verb at all, and
+        the only route was an operator moving a worker repo and an execution
+        record by hand with the loop stopped (observed on dash-12, 2026-08-20).
+        Accepting `in_progress` here as well would rebuild `release` under a
+        second name.
+
+        Reads the STORED status rather than `state_of`, like `shelve` and
+        `recut`: `state_of` maps every `blocked` row to BLOCKED_BY_OPERATOR
+        regardless of provenance, so it cannot tell a loop quarantine from an
+        operator hold — the one distinction this verb turns on. `hold_origin` is
+        the field that can, and `discard_obstacle` above reads it.
+
+        **It never charges a recut.** `recut_count` bounds what the REVIEWER may
+        throw away (`MAX_TASK_RECUTS`), and an operator repairing a stuck queue
+        spending that budget would leave the reviewer with fewer cuts because a
+        human tidied up. This verb has its own account of itself — the closed
+        blocker's `archived_reason` and the transcript entry the CLI writes.
+
+        Terminal statuses are refused by `discard_obstacle` before
+        `_return_to_pending` is reached, so a completed, retired or
+        shipped-elsewhere task cannot be un-finished here.
+        """
+        obstacle = self.discard_obstacle(task_id)
+        if obstacle is not None:
+            raise obstacle
+        moved = self._return_to_pending(
+            task_id,
+            verb="discard",
+            remedy="retires the execution of a quarantined round",
+            by_stored_status=True,
+            also_accepts=("blocked",),
+        )
+        # Released is released, exactly as `unblock` and `recut` treat it: a
+        # pending task has no hold to have an origin, and a marker left behind
+        # would still be sitting on the row the next time the loop quarantines
+        # it. The CALLER reads `blocked_reason` BEFORE calling this, because the
+        # closed blocker's recorded reason is the only place that account
+        # survives afterwards.
+        moved.blocked_reason = ""
+        moved.hold_origin = ""
+        return moved
+
     def _return_to_pending(
         self,
         task_id: str,
@@ -2145,15 +2252,16 @@ class TaskRegistry:
         by_stored_status: bool = False,
         also_accepts: tuple[str, ...] = (),
     ) -> Task:
-        """The one status move behind `release`, `shelve` and `recut`, and the
-        one refusal. All three verbs mean "this round is over for now", and
-        there is exactly one way to be pending, so letting them keep three
-        copies of this assignment would be a bug in whichever one drifted.
+        """The one status move behind `release`, `shelve`, `recut` and
+        `discard`, and the one refusal. All four verbs mean "this round is over
+        for now", and there is exactly one way to be pending, so letting them
+        keep four copies of this assignment would be a bug in whichever one
+        drifted.
 
         Since ceil-01 it also drops a pending attempt-ceiling classification
-        request, for the same reason and with the same argument against three
+        request, for the same reason and with the same argument against four
         copies — see the comment on that line, which is where the reasoning
-        for each of the three verbs is written down.
+        for each of the verbs is written down.
 
         `by_stored_status` is the first documented difference between them —
         see `shelve`, which explains why it reads `task.status` directly and
@@ -2161,11 +2269,14 @@ class TaskRegistry:
         caller that does not think about it gets `release`'s stricter reading.
 
         `also_accepts` is the second, and it is only ever `("blocked",)`, only
-        ever from `recut` — see that method for why a quarantined task is
-        exactly the one a recut has to be able to reach, and for the operator-
-        hold refusal that runs BEFORE this and is not repeated here. Default
-        empty, so a caller that does not think about it accepts `in_progress`
-        alone. It is deliberately a status LIST rather than a boolean: the
+        ever from `recut` and `discard` — see those methods for why a
+        quarantined task is exactly the one each has to be able to reach, and
+        for the operator-hold refusal that runs BEFORE this and is not repeated
+        here. (`discard` narrows further on its own side: its obstacle test
+        refuses everything except `blocked`, so the `in_progress` this list
+        always carries is unreachable through it.) Default empty, so a caller
+        that does not think about it accepts `in_progress` alone. It is
+        deliberately a status LIST rather than a boolean: the
         refusal below prints what the verb does accept, and a caller that widens
         the set without widening the message produces a refusal that lies.
         """
@@ -2194,9 +2305,9 @@ class TaskRegistry:
             )
         task.status = "pending"
         # A pending task has no round to be at the ceiling OF, so it carries no
-        # unanswered classification request either (ceil-01). Cleared for all
-        # three verbs here, because all three end the round the request was
-        # asked about, and a marker left behind is a REFUND in the two that
+        # unanswered classification request either (ceil-01). Cleared for every
+        # verb here, because all of them end the round the request was
+        # asked about, and a marker left behind is a REFUND in the three that
         # archive the execution record: the next dispatch starts at attempt 0,
         # where an identical plan would park the task `ceiling_plan_unchanged`
         # and a differing one would spend its single extension on a budget
