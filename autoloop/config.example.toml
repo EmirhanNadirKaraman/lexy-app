@@ -431,6 +431,38 @@ test_selection = "reachable"
 # very next verdict can publish it. Where nothing can be re-presented because the
 # recorded candidate itself no longer resolves, the record is archived and the
 # task requeued through the same path as above, never re-dispatched blind.
+#
+# THE THIRD HALF (halt-01, 2026-08-26): an EXHAUSTED BUDGET OR CEILING sets its
+# own task aside. A budget means "stop churning on THIS task", not "stop
+# everything" — and six of these seven codes stop everything today.
+# attempt_count_ceiling, review_round_cap, parse_budget_exhausted,
+# plan_denial_budget_exhausted, policy_denial_budget_exhausted,
+# review_mismatch_budget_exhausted and git_failure_budget_exhausted each record
+# the reason exactly as now, quarantine the ONE task in flight, and let
+# `run --continuous` pick up the next ready task with no operator. Nothing is
+# retried for any of them: a counter that reached its limit is not a transient
+# fault, so every one carries a retry budget of ZERO and max_recovery_attempts
+# below cannot change that. attempt_count_ceiling composes with the reviewer
+# classification it already asks for — ask first, set aside only when that
+# answer does not resolve it — and it, like review_round_cap, already
+# quarantined its own task, so for those two nothing changes in either position
+# of this flag.
+#
+# THE SESSION CEILING IS NOT IN IT, on purpose. iteration_budget_exhausted
+# counts the RUN's iterations, so no task is at fault, and setting one aside
+# deletes the session file — the next iteration would start at iteration 0 with
+# a full budget, which makes policy.max_iterations unenforceable while blocking
+# the backlog one task at a time. It stops the loop, exactly as it does today,
+# and blockers.SESSION_CEILING_CODES refuses it the same way a hard halt is
+# refused rather than merely leaving it out of a list.
+#
+# WHAT IT COSTS, since "the loop keeps going" has a price here. A condition that
+# is really loop-wide rather than task-shaped — a git environment broken for
+# every worker, a reviewer refusing everything — walks the backlog setting each
+# task aside in turn, until nothing is ready and `run --continuous` exits 0
+# printing the open blockers. Bounded and visible, but more churn than the
+# single stop it replaces. Every question is still recorded, still listed by
+# `python -m autoloop blockers`, and still answerable.
 enabled = false
 
 # A CEILING on the per-code retry budgets in blockers.AUTONOMOUS_RECOVERIES,

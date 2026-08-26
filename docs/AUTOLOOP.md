@@ -7492,6 +7492,127 @@ on `review_feedback_unchanged` — a code that is not in
 remaining scope should still be re-checked against this diff before it is
 redispatched.
 
+### 9c-septies. A budget or a ceiling sets its OWN task aside (halt-01, 2026-08-26)
+
+**The same flag, the same interception point, a third family of codes.**
+`[autonomy] enabled = false` still governs everything below, still defaults off,
+and `orchestrator._to_needs_user` is still where almost all of it happens.
+§9c-quater automates a fault in the *transport*, §9c-quinquies a fault in a
+*record*; this one automates a **budget that ran out**. A budget means "stop
+churning on THIS task", not "stop everything" — and six of the seven codes below
+stop everything today.
+
+**The table.** `blockers.EXHAUSTED_BUDGET_RECOVERIES`. Every entry is
+`RECOVER_UNAVAILABLE` with `max_attempts = 0`, so `max_recovery_attempts` cannot
+affect any of them.
+
+| code | terminal today | what the flag changes |
+|---|---|---|
+| `attempt_count_ceiling` | `task_fatal` park | Nothing. The site already quarantines its own task; the entry is what holds the guarantee to the table rather than to that site's choice. Largest measured cause of blocked time — 12 parks, 32.0h, median 1.34h. |
+| `review_round_cap` | `task_fatal` park | Nothing, for the same reason. The cap is counted on the task's own execution record, so the exhaustion is task-shaped by construction. |
+| `parse_budget_exhausted` | `loop_fatal` park | Quarantines the round in flight instead of stopping. The session is discarded with it, so `state.parse_retries` starts at zero for the next task. |
+| `plan_denial_budget_exhausted` | `loop_fatal` park | Same. Often raised with no task in flight at all (a `plan` round), and there it parks exactly as today — see the scoping paragraph below. |
+| `policy_denial_budget_exhausted` | **fault STOP** (`_to_fault_stop`) | The one that needed new code. Becomes the set-aside park — and only when a set-aside is actually granted. |
+| `review_mismatch_budget_exhausted` | `loop_fatal` park | Quarantines the round in flight. Its site's reasoning is untouched: the question is still recorded, listed and answerable. |
+| `git_failure_budget_exhausted` | `loop_fatal` park | Same, and `cli._RESOLUTION_PRECONDITIONS` still gives an operator answering the record the browser recheck it always did. |
+
+**Why none of them retries, stated positively.** A budget of 0 here is not the
+"no recovery path exists" of `worker_environment_drift` — it is stronger. The
+counter really did reach its limit, so re-entering the phase would re-enter the
+exact condition the budget just refused; the only things that could change the
+answer are an operator raising a limit or a reviewer reshaping the task, neither
+of which the loop may do for itself. So the recovery path is exhausted the moment
+the fault is raised and the set-aside fires at once, which is the half that was
+missing.
+
+**THE SESSION CEILING IS NOT IN IT, and that is the correction auto-02's own
+text carried.** `iteration_budget_exhausted` is raised by `_step_ready` from
+`policy.check_iteration_budget(state.iteration + 1)`. Two things make it
+different in kind:
+
+* **there is no task at fault.** The count belongs to the RUN, so quarantining
+  whichever task happened to be in flight blames it for a limit it did not
+  spend; and
+* **skipping one would not help — it would do the opposite.** Setting a task
+  aside deletes the session file (`cli._handle_parked_task`), so the next
+  iteration builds a fresh `LoopState` with `iteration = 0` and a full budget.
+  Automating this code would make `policy.max_iterations` structurally
+  unenforceable *and* walk the backlog blocking every task on the way.
+
+That same session reset is exactly what makes the other seven work: each of them
+rides either a per-task record or a CONSECUTIVE counter (`parse_retries`,
+`policy_denials`, `consecutive_failures`) that the reset clears, so the next task
+starts from zero rather than inheriting the previous one's churn. The exclusion
+is `blockers.SESSION_CEILING_CODES`, refused by `autonomous_recovery` before the
+table is consulted — the same two-lock shape as `HARD_HALT_CODES`, and for the
+same reason: an omission from a list is indistinguishable from an oversight, and
+the next person to grow the table would add it.
+
+**`_to_fault_stop` gained exactly one gate, and it can only narrow.**
+`_autonomous_fault_set_aside` resolves the plan and the victim ITSELF, and hands
+over to `_to_needs_user` only on a non-`None` answer. Delegating unconditionally
+and letting the park decide would convert a REFUSED set-aside — no task in
+flight, a site naming a bystander, two round records that disagree — into a
+`loop_fatal` PARK, which holds the session open for an answer nobody can give.
+That is precisely the stall `_to_fault_stop` was created to remove (§9c's
+`ask_user` retirement), so a refusal here leaves the fault stop byte for byte as
+it is, records `autonomous_set_aside_refused` with the reason that decided it,
+and the run ends exactly as it does today. The hand-over itself is logged as
+`autonomous_fault_set_aside`, and the delegation happens before anything is
+written, so exactly one blocker record exists and it is the `task_fatal` one.
+
+**A fault stop may become a SET-ASIDE and nothing else.** The gate refuses any
+plan whose action is not `RECOVER_UNAVAILABLE`, which is what every code that
+can reach it carries. That costs nothing today and closes a class rather than a
+case: a future `RECOVER_BY_RESUBMITTING` entry would otherwise re-issue a
+request from a terminal that has declared itself unrecoverable, and a
+`RECOVER_BY_REBUILDING_AT_HEAD` one would rebuild a round this terminal has
+already given up on. Neither is a decision anybody made here, so both are
+refused until somebody makes it. `resume_phase=None` on the hand-over is the
+second, redundant lock on the same property.
+
+**One documented decision this overrides, stated rather than implied.**
+`policy_denial_budget_exhausted`'s site argues `loop_fatal` on the ground that "a
+reviewer that spent the denial budget is not a per-task condition". In practice
+the denials are overwhelmingly *about* one task — a missing decomposition, a
+quarantined id, a ceiling classification that was not given — so setting that
+task aside removes the thing the reviewer kept being refused about. Under
+autonomous mode that is the trade taken; with the flag off the site's reasoning
+stands untouched.
+
+**It composes with ceil-01 rather than replacing it.** A task at its attempt
+ceiling still asks the REVIEWER to classify it first, because the reviewer holds
+the candidate and the verdict history and can tell "one named remaining fix" from
+"this specification is wrong". Nothing here runs until that ask has happened and
+has failed to resolve anything: the interception is at `_to_needs_user` /
+`_to_fault_stop`, and `_handle_attempt_ceiling` reaches neither while an
+extension or a decomposition is still available. Ask first; set aside when the
+answer does not resolve it.
+
+**Scope the claim honestly: "sets ITS task aside" presumes there is one.**
+setaside-01's gate is unchanged and still decides the victim — the loop's ONE
+active task, with a park site's explicit id validated against it and a
+disagreement between the two round records resolving nothing. A
+`parse_budget_exhausted` or `plan_denial_budget_exhausted` raised during a plan
+or audit round with no task in flight therefore parks exactly as it does today.
+That is a real answer rather than a failure, and it is why every one of these
+paths can only ever set aside FEWER tasks than a naive reading would.
+
+**What it costs.** A condition that is genuinely loop-wide rather than
+task-shaped — a git environment broken for every worker, a reviewer refusing
+everything — walks the backlog setting each task aside in turn, until
+`run --continuous` finds nothing ready and exits 0 printing the open blockers
+(the exhaustion path in §9c). Bounded and visible, but more churn than the single
+stop it replaces, and the same trade §9c-quater already accepted for
+`worker_environment_drift`. Nothing becomes invisible: every question is recorded
+on its blocker, listed by `python -m autoloop blockers`, and answerable.
+
+**The five hard halts are unchanged and still unreachable**, refused before the
+table is consulted at all — including through the new `_to_fault_stop` door,
+which `test_budget_set_aside.py` asserts directly. That file also reads the eight
+real park sites out of `orchestrator.py` by AST, so the arguments its behavioural
+tests replay cannot drift away from the sites they stand in for.
+
 ### 9d. Retired: superseded work is not blocked work
 
 `blocked` used to carry a THIRD meaning, and it was the one that made the

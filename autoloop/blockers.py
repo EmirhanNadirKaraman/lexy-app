@@ -53,6 +53,15 @@ exactly what an operator does by hand today, which is why the median park on
 The two dicts are merged into `AUTONOMOUS_RECOVERIES`, which stays the ONE
 table `autonomous_recovery` reads, so the hard-halt refusal cannot be bypassed
 by looking a code up in the newer half directly.
+
+halt-01 (2026-08-26) adds the THIRD half, `EXHAUSTED_BUDGET_RECOVERIES`: seven
+codes whose fault is neither a transport fault nor a stale record but a BUDGET
+or CEILING that has run out. A budget means "stop churning on THIS task", not
+"stop everything", and six of the seven stop everything today. Their recovery
+path is empty by construction — the remedy is an operator raising a limit — so
+every entry is `RECOVER_UNAVAILABLE` with a budget of 0 and the set-aside fires
+on the first occurrence. `SESSION_CEILING_CODES` is the deliberate exclusion
+beside them, and is refused exactly like a hard halt.
 """
 
 from __future__ import annotations
@@ -145,6 +154,40 @@ HARD_HALT_CODES = frozenset({
     "primary_checkout_dirty",
     "approved_path_symlink_traversal",
     "prompt_integrity_mismatch",
+})
+
+#: The SESSION ceiling — a budget that belongs to the run, not to a task, and
+#: therefore the one exhaustion autonomous mode must NOT set a task aside for
+#: (halt-01, 2026-08-26).
+#:
+#: `iteration_budget_exhausted` is raised by `orchestrator._step_ready` from
+#: `policy.check_iteration_budget(state.iteration + 1)`. Two facts make it
+#: different in kind from every entry in `EXHAUSTED_BUDGET_RECOVERIES`:
+#:
+#:   * there is no task at fault. The count is the RUN's, so quarantining
+#:     whichever task happened to be in flight blames it for a limit it did not
+#:     spend; and
+#:   * skipping one would not help — it would do the opposite. Setting a task
+#:     aside deletes the session file (`cli._handle_parked_task`), so the next
+#:     iteration starts a fresh `LoopState` with `iteration = 0` and a full
+#:     budget. Automating this code would make `policy.max_iterations`
+#:     structurally unenforceable AND walk the backlog blocking every task on
+#:     the way. That is the exact reading auto-02's own text corrected, and the
+#:     reason this frozenset exists rather than the code merely being left out
+#:     of the table: an omission is indistinguishable from an oversight, and the
+#:     next person to grow the table would add it.
+#:
+#: The contrast is what makes the other seven safe: each of those rides either a
+#: per-task record (`attempt_count_ceiling`, `review_round_cap`) or a
+#: CONSECUTIVE counter the same session reset clears (`parse_retries`,
+#: `policy_denials`, `consecutive_failures`), so continuing genuinely continues.
+#:
+#: Enforced the same two ways `HARD_HALT_CODES` is: `autonomous_recovery`
+#: refuses a member before consulting the table, and a test asserts the two sets
+#: are disjoint — so adding this code to the table is a failing test rather than
+#: a silent automation.
+SESSION_CEILING_CODES = frozenset({
+    "iteration_budget_exhausted",
 })
 
 #: Re-enter the phase the park itself declares resumable (`resume_phase`) —
@@ -514,13 +557,171 @@ STALE_RECORD_RECOVERIES: dict[str, AutonomousRecovery] = {
 }
 
 
-#: THE table `autonomous_recovery` reads — halt-02's transport half and halt-03's
-#: stale-record half, merged. One lookup, one hard-halt refusal: a caller that
-#: consulted `STALE_RECORD_RECOVERIES` directly would bypass the refusal in
+# ---- halt-01's half: an EXHAUSTED BUDGET or CEILING, set aside --------------
+#
+# A budget or a ceiling means STOP CHURNING ON THIS TASK, not stop everything.
+# Six of the seven codes below stop everything today: four park `loop_fatal`
+# and one ends the run through `_to_fault_stop`, so one task's spent allowance
+# takes the whole roadmap down with it.
+#
+# Every entry is `RECOVER_UNAVAILABLE` with `max_attempts = 0`, and that is a
+# statement rather than a gap. These are not transport faults that might pass
+# and not stale records that can be rebuilt — the counter really did reach its
+# limit, and the only thing that could change the answer is an operator raising
+# the limit or rewriting the task. So there is nothing to retry, the recovery
+# path is exhausted the moment the fault is raised, and the set-aside — the half
+# that was missing — fires at once.
+#
+# TWO of the seven already classify `task_fatal` at their own park sites
+# (`attempt_count_ceiling`, `review_round_cap`), so their entries change no
+# behaviour in either flag position. They are here anyway, and deliberately: the
+# claim halt-01 makes is about all seven, an entry is what holds a code to this
+# table and to `orchestrator._autonomous_set_aside_task`'s active-task
+# validation, and a guarantee that happens to hold because two unrelated park
+# sites chose well is not a guarantee anybody is keeping.
+#
+# WHAT THE OTHERS BUY, stated precisely, because "the loop keeps going" is only
+# true if the next round starts from a clean count. Setting a task aside deletes
+# the session file (`cli._handle_parked_task`), so the next iteration builds a
+# fresh `LoopState`: `parse_retries`, `policy_denials` and
+# `consecutive_failures` all start at zero, and the next task is not charged for
+# the previous one's churn. That same session reset is exactly why
+# `iteration_budget_exhausted` is NOT here — see `SESSION_CEILING_CODES`.
+#
+# AND WHAT IT COSTS, stated rather than left to be discovered. A condition that
+# is genuinely loop-wide rather than task-shaped — a git environment that is
+# broken for every worker, a reviewer that refuses everything — walks the
+# backlog setting each task aside in turn, until `run --continuous` finds
+# nothing ready and exits 0 printing the open blockers (the exhaustion path in
+# `docs/AUTOLOOP.md` §9c). That is bounded and visible, but it is more churn
+# than the single stop it replaces, and it is the trade the flag turns on. It is
+# the same trade `worker_environment_drift` already carries.
+EXHAUSTED_BUDGET_RECOVERIES: dict[str, AutonomousRecovery] = {
+    entry.code: entry
+    for entry in (
+        AutonomousRecovery(
+            code="attempt_count_ceiling",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "MEASURED 2026-08-24 over 131 resolved blocker records: the "
+                "single largest cause of operator-blocked time (12 parks, "
+                "32.0h). ceil-01 already asks the REVIEWER to classify a task "
+                "at its ceiling, and this park is what is left when that ask is "
+                "unavailable or every remedy is spent — so there is nothing "
+                "further to retry and the two compose exactly as halt-01 states "
+                "them: ask first, set aside if the answer does not resolve it. "
+                "Its site already classifies `task_fatal`, so this entry changes "
+                "no behaviour; what it changes is that the guarantee is on "
+                "record and tested instead of incidental."
+            ),
+        ),
+        AutonomousRecovery(
+            code="review_round_cap",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "`policy.max_review_rounds` is counted on the TASK's execution "
+                "record, so the exhaustion is task-shaped by construction and no "
+                "other task is implicated. A further round is refused before it "
+                "is sent, which is the whole point of the cap, so there is no "
+                "recovery path to re-enter. Like `attempt_count_ceiling` its "
+                "site is already `task_fatal`; the entry is what holds it to "
+                "this table."
+            ),
+        ),
+        AutonomousRecovery(
+            code="parse_budget_exhausted",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "`state.parse_retries` counts CONSECUTIVE malformed replies, and "
+                "the park's own text names the remedy as `run --answer` — an "
+                "operator writing a message to the reviewer, which the loop must "
+                "not compose for itself. Re-parsing the same stored response "
+                "would fail identically, so the recovery path is empty rather "
+                "than merely unattractive. The set-aside is what helps: the "
+                "session is discarded with the task, so the counter starts at "
+                "zero for the next one."
+            ),
+        ),
+        AutonomousRecovery(
+            code="plan_denial_budget_exhausted",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "Repeated task-GRAPH rejections of a `plan` reply (a cycle, a "
+                "dependency on an id that does not exist, a duplicate). Nothing "
+                "in-process can produce a different plan, so no retry. NOTE the "
+                "shape this one is often raised in: a `plan` round frequently "
+                "has no task in flight at all, and there the set-aside resolves "
+                "nothing and the loop parks exactly as it does today — "
+                "`_autonomous_set_aside_task` returning `None` is a real answer, "
+                "not a failure."
+            ),
+        ),
+        AutonomousRecovery(
+            code="policy_denial_budget_exhausted",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "THE ONE MEMBER REACHED THROUGH `_to_fault_stop` RATHER THAN A "
+                "PARK, and the reason that helper had to learn about this table "
+                "at all. Its site argues `loop_fatal` because a reviewer that "
+                "spent the denial budget is not a per-task condition — but the "
+                "denials are overwhelmingly ABOUT one task (a missing "
+                "decomposition, a quarantined id, a ceiling classification that "
+                "was not given), so setting that task aside removes the thing "
+                "the reviewer kept being refused about. Under autonomous mode "
+                "the fault stop becomes the set-aside park, and ONLY when a "
+                "set-aside is actually granted: a refused one keeps the fault "
+                "stop, never a `loop_fatal` park holding the session open for an "
+                "answer nobody can give."
+            ),
+        ),
+        AutonomousRecovery(
+            code="review_mismatch_budget_exhausted",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "Approvals that keep arriving stamped for a tree that has since "
+                "moved. Its site deliberately PARKS rather than stopping, "
+                "because the repository moving under the loop has a human-side "
+                "explanation — and that reasoning is untouched here: the "
+                "question is still recorded, still listed by `blockers`, still "
+                "answerable. What changes is that one task is quarantined "
+                "instead of the whole roadmap. No retry, because the correction "
+                "round it would re-enter is the one that already ran out."
+            ),
+        ),
+        AutonomousRecovery(
+            code="git_failure_budget_exhausted",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "`state.consecutive_failures` past `max_consecutive_failures` "
+                "outside `ready`/`delivering` (those two have their own "
+                "retryable parks, `git_unavailable_in_*`). The budget exists "
+                "because retrying git already failed that many times, so a "
+                "further in-process retry is the thing the budget just refused. "
+                "Its `cli._RESOLUTION_PRECONDITIONS` entry is unchanged, so an "
+                "operator answering the record still gets the browser recheck "
+                "they always did."
+            ),
+        ),
+    )
+}
+
+
+#: THE table `autonomous_recovery` reads — halt-02's transport half, halt-03's
+#: stale-record half and halt-01's exhausted-budget half, merged. One lookup,
+#: one set of refusals: a caller that consulted `STALE_RECORD_RECOVERIES` or
+#: `EXHAUSTED_BUDGET_RECOVERIES` directly would bypass the refusals in
 #: `autonomous_recovery`, which is why nothing does.
 AUTONOMOUS_RECOVERIES: dict[str, AutonomousRecovery] = {
     **TRANSPORT_RECOVERIES,
     **STALE_RECORD_RECOVERIES,
+    **EXHAUSTED_BUDGET_RECOVERIES,
 }
 
 
@@ -529,12 +730,12 @@ def autonomous_recovery(code: str) -> AutonomousRecovery | None:
     the loop parks today".
 
     `None` is the answer for every code that is not in the table, for a hard
-    halt, and for an empty/unknown one — the fail-closed direction, and the
-    reason this is a function rather than a bare dict lookup at the call site:
-    the hard-halt refusal cannot be forgotten by a caller that only remembers
-    the dict.
+    halt, for the SESSION ceiling, and for an empty/unknown one — the
+    fail-closed direction, and the reason this is a function rather than a bare
+    dict lookup at the call site: neither refusal can be forgotten by a caller
+    that only remembers the dict.
     """
-    if code in HARD_HALT_CODES:
+    if code in HARD_HALT_CODES or code in SESSION_CEILING_CODES:
         return None
     return AUTONOMOUS_RECOVERIES.get(code)
 

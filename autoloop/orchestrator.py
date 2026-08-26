@@ -265,6 +265,32 @@ Autonomous recovery (halt-02, 2026-08-25):
   of which the loop may perform for itself. An empty recovery path is exhausted
   immediately, so the set-aside fires at once.
 
+An exhausted BUDGET or CEILING sets its own task aside (halt-01, 2026-08-26):
+
+* The same flag, and a third family in the same allowlist —
+  `blockers.EXHAUSTED_BUDGET_RECOVERIES`. A budget means "stop churning on THIS
+  task", not "stop everything", and six of its seven codes stop everything
+  today. All seven carry an empty recovery path (`RECOVER_UNAVAILABLE`, budget
+  0): a counter that reached its limit is not a transient fault, so the
+  set-aside is the whole remedy.
+* SIX of them park through `_to_needs_user` like every other member. The
+  seventh, `policy_denial_budget_exhausted`, ends the run through
+  `_to_fault_stop`, so that helper gained one gate —
+  `_autonomous_fault_set_aside` — which converts it to the set-aside park ONLY
+  when a set-aside is actually granted. A refused one keeps the fault stop:
+  turning it into a `loop_fatal` park would hold the session open for an answer
+  nobody can give, which is what that terminal exists to avoid.
+* `attempt_count_ceiling` and `review_round_cap` already classify `task_fatal`
+  at their own sites, so their entries change no behaviour in either flag
+  position; they are in the table so the guarantee is kept by the table rather
+  than by two park sites happening to agree with it.
+* THE SESSION CEILING IS DELIBERATELY EXCLUDED and refused like a hard halt
+  (`blockers.SESSION_CEILING_CODES`). `iteration_budget_exhausted` counts the
+  RUN's iterations, so no task is at fault — and setting one aside deletes the
+  session file, which would hand the next iteration a fresh `iteration = 0` and
+  make `policy.max_iterations` unenforceable while blocking the backlog one
+  task at a time.
+
 Repeated stops (stop-01, 2026-08-23):
 
 * A reviewer's `stop` is a VERDICT, not a failure, so no budget ever counted
@@ -313,6 +339,7 @@ from .blockers import (
     RECOVER_BY_REBUILDING_AT_HEAD,
     RECOVER_BY_RESUBMITTING,
     RECOVER_BY_RESUMING,
+    RECOVER_UNAVAILABLE,
     STALE_AUDIT_POINTER,
     STALE_EXECUTION_RECORD,
     STALE_PUSH_BINDING,
@@ -10324,6 +10351,16 @@ class Orchestrator:
         performed returns False and the loop parks with the question it always
         had, under the classification the SITE chose.
 
+        **halt-01 (2026-08-26) adds the third family, and adds no machinery.**
+        `blockers.EXHAUSTED_BUDGET_RECOVERIES` is seven exhausted budgets and
+        ceilings, every one of them `RECOVER_UNAVAILABLE` with a budget of 0 —
+        so they take the path halt-02's zero-budget codes already take: no
+        retry, straight to the set-aside, and the same fail-closed
+        fall-through when there is no task the loop is entitled to quarantine.
+        The only new code anywhere is `_autonomous_fault_set_aside`, which lets
+        the ONE of the seven that ends the run rather than parking
+        (`policy_denial_budget_exhausted`) arrive here at all.
+
         The set-aside stage is applied only to plans `_autonomy_requires_a_task`
         answers True for. A rebuild of a session-scoped record needs no victim
         to quarantine, so consulting the in-flight fallback for one would both
@@ -12012,6 +12049,77 @@ class Orchestrator:
                 data={"blocker_id": blocker_id, "error": f"{type(exc).__name__}: {exc}"},
             )
 
+    # ---- an exhausted budget sets its task aside (halt-01, 2026-08-26) ------
+
+    def _autonomous_fault_set_aside(
+        self, reason: str, *, code: str, task_id: str | None, detail: str
+    ) -> bool:
+        """Turn a FAULT STOP into the set-aside park, when — and only when —
+        autonomous mode is entitled to set a task aside for this fault. True
+        when it did and the caller must return without stopping.
+
+        The one code that reaches it today is
+        `policy_denial_budget_exhausted`: an exhausted budget that is
+        task-shaped in practice but ends the whole run, which is the shape
+        halt-01 exists to correct.
+
+        **The set-aside is resolved HERE rather than delegated**, and that is
+        the fail-open this method is written around. Handing every fault stop to
+        `_to_needs_user` and letting it decide would convert a REFUSED set-aside
+        — a session whose two round records disagree, a site naming a bystander,
+        a park with no task in flight — into a `loop_fatal` PARK, which holds
+        the session open for an answer nobody can give. That is the exact stall
+        `_to_fault_stop` was created to remove, so a refusal here has to leave
+        the fault stop untouched. Every gate therefore returns False:
+
+          * the flag off, no blocker store, an unrecognised code, a hard halt or
+            the session ceiling — `_autonomy_plan` answers `None`;
+          * a plan whose recovery path is not EMPTY. A fault stop may only ever
+            become a set-aside, never a retry: `RECOVER_UNAVAILABLE` is the one
+            action whose whole content is "step the task aside", which is what
+            every code that reaches here carries. A future `RECOVER_BY_
+            RESUBMITTING` entry would otherwise re-issue a request from a
+            terminal that declares itself unrecoverable, and a future
+            `RECOVER_BY_REBUILDING_AT_HEAD` one would rebuild a round this
+            terminal has already given up on — neither is a decision anybody
+            made here, so both are refused until somebody does make it;
+          * a plan that needs no task. REDUNDANT TODAY and kept deliberately, so
+            this method does not silently depend on how
+            `_autonomy_requires_a_task` happens to be written: it answers True
+            for every non-rebuild action, so the gate above already implies it.
+            If that helper ever keys on something else, the requirement stated
+            here — a set-aside needs a task to set aside — still holds;
+          * no active task, or one that is not the id this site named —
+            `_autonomous_set_aside_task` answers `None`, having already recorded
+            WHY in the transcript.
+
+        `_to_needs_user` re-derives the same plan and re-validates the same id
+        against the same unchanged state, so it resolves identically and no
+        second refusal is logged. It is called with `resume_phase=None` as a
+        second, redundant lock on the same thing the empty-path gate above
+        buys: a `None` phase is what `_resumable_phase` refuses.
+        """
+        plan = self._autonomy_plan(code)
+        if plan is None or plan.action != RECOVER_UNAVAILABLE:
+            return False
+        if not self._autonomy_requires_a_task(plan):
+            return False
+        set_aside = self._autonomous_set_aside_task(task_id)
+        if set_aside is None:
+            return False
+        self._log(
+            "autonomous_fault_set_aside",
+            data={"code": code, "task_id": set_aside, "named_task_id": task_id or ""},
+        )
+        self._to_needs_user(
+            reason,
+            kind="task_fatal",
+            code=code,
+            task_id=set_aside,
+            detail=detail,
+        )
+        return True
+
     def _to_fault_stop(
         self,
         reason: str,
@@ -12054,7 +12162,22 @@ class Orchestrator:
         `resume_phase` is cleared unconditionally: a fault stop is terminal,
         and leaving a resumable phase behind would advertise a `run --retry`
         that re-enters the phase that just failed.
+
+        **Autonomous mode reaches this terminal too, since halt-01 (2026-08-26),
+        and only in one direction.** `policy_denial_budget_exhausted` is an
+        exhausted TASK-SHAPED budget that ends the whole run, so with
+        `config.autonomy.enabled` it is handed to `_to_needs_user` as a
+        `task_fatal` set-aside of the ONE task in flight — and ONLY when
+        `_autonomous_fault_set_aside` has already established that such a task
+        exists and that this site's id is it. Everything else falls through to
+        the ordinary fault stop below, byte for byte. That asymmetry is
+        load-bearing: converting a REFUSED set-aside into a `loop_fatal` park
+        would hold the session open for an answer nobody can give, which is
+        precisely the stall this terminal was created to remove.
         """
+        if self._autonomous_fault_set_aside(reason, code=code, task_id=task_id,
+                                            detail=detail):
+            return
         state = self.state
         originating_phase = state.phase
         state.stop_reason = reason
