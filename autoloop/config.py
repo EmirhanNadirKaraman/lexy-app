@@ -390,7 +390,7 @@ class AuditConfig:
 class AutonomyConfig:
     """`[autonomy]` — how the loop behaves when a fault it already knows the
     remedy for would otherwise park it for a human (halt-02 / halt-03,
-    2026-08-25).
+    2026-08-25; halt-01, 2026-08-26).
 
     OFF BY DEFAULT, and the default is the compatibility contract: with this
     section absent — which is every existing config file, since the template is
@@ -400,8 +400,8 @@ class AutonomyConfig:
     here forecloses the current behaviour.
 
     What `enabled` switches on is described by `blockers.AUTONOMOUS_RECOVERIES`,
-    an ALLOWLIST with two halves and TWELVE codes in total, which cannot reach
-    `blockers.HARD_HALT_CODES` at all:
+    an ALLOWLIST with three parts and NINETEEN codes in total, which cannot
+    reach `blockers.HARD_HALT_CODES` or `blockers.SESSION_CEILING_CODES` at all:
 
     * `blockers.TRANSPORT_RECOVERIES` (halt-02) — six transport or environment
       faults, answered by re-entering the recovery path that already exists and
@@ -410,7 +410,20 @@ class AutonomyConfig:
       RECORD that no longer describes anything, answered by archiving that
       record, rebuilding at the current head and re-dispatching. The archival
       is recut-01's `release_task_to_pending`, refusals and cap included; no
-      second archival mechanism exists.
+      second archival mechanism exists;
+    * `blockers.EXHAUSTED_BUDGET_RECOVERIES` (halt-01) — seven BUDGETS and
+      CEILINGS that have run out, answered by setting the one task in flight
+      aside and continuing. There is nothing to retry for any of them, so each
+      carries a budget of 0 and `max_recovery_attempts` cannot affect them: a
+      counter that reached its limit is not a transient fault, and the only
+      thing that would change the answer is an operator raising the limit.
+
+    The SESSION ceiling is the deliberate exclusion, not an omission.
+    `iteration_budget_exhausted` counts the run's iterations rather than any
+    task's, and setting a task aside deletes the session file — so automating it
+    would hand the next iteration a fresh count and make `policy.max_iterations`
+    unenforceable. `blockers.SESSION_CEILING_CODES` refuses it the same way a
+    hard halt is refused.
     """
 
     #: The flag. False means "park exactly as today" at every site.

@@ -116,6 +116,7 @@ from autoloop import orchestrator as orchestrator_module
 from autoloop.changeset_review import build_changeset_binding, build_changeset_packet
 from autoloop.blockers import (
     AUTONOMOUS_RECOVERIES,
+    EXHAUSTED_BUDGET_RECOVERIES,
     HARD_HALT_CODES,
     NO_TASK,
     RECOVER_BY_REBUILDING_AT_HEAD,
@@ -859,14 +860,23 @@ def test_every_code_names_a_record_the_orchestrator_has_a_handler_for():
         assert entry.stale_record in handled, f"{code} names an unhandled record"
 
 
-def test_the_two_halves_of_the_table_are_disjoint_and_merge_into_the_one_lookup():
+def test_the_parts_of_the_table_are_disjoint_and_merge_into_the_one_lookup():
     """`autonomous_recovery` is the ONE lookup, and it is where the hard-halt
-    refusal lives. A caller that consulted either half directly would bypass
-    it, so the halves must not be reachable as a substitute for the merge."""
-    assert set(TRANSPORT_RECOVERIES).isdisjoint(set(STALE_RECORD_RECOVERIES))
-    assert set(AUTONOMOUS_RECOVERIES) == (
-        set(TRANSPORT_RECOVERIES) | set(STALE_RECORD_RECOVERIES)
-    )
+    refusal lives. A caller that consulted any part directly would bypass it, so
+    the parts must not be reachable as a substitute for the merge.
+
+    THREE parts since halt-01 (2026-08-26) added `EXHAUSTED_BUDGET_RECOVERIES`;
+    this test was written when there were two. The claim is unchanged — pairwise
+    disjoint, and the merge is exactly their union — and it is deliberately
+    stated over every part the module exposes rather than over a literal list of
+    two, so the NEXT part to be added fails here if it is not merged in."""
+    parts = (TRANSPORT_RECOVERIES, STALE_RECORD_RECOVERIES,
+             EXHAUSTED_BUDGET_RECOVERIES)
+    merged: set[str] = set()
+    for part in parts:
+        assert merged.isdisjoint(set(part)), "two parts claim the same code"
+        merged |= set(part)
+    assert set(AUTONOMOUS_RECOVERIES) == merged
     for code, entry in STALE_RECORD_RECOVERIES.items():
         assert autonomous_recovery(code) is entry
 
