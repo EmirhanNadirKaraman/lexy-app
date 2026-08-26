@@ -481,6 +481,79 @@ def default_state_dir(workers_root: Path) -> Path:
     return Path(workers_root).expanduser().parent / DEFAULT_STATE_DIR_NAME
 
 
+#: What the unconfigured `[paths].observed_checkout` is called, as a SIBLING of
+#: `workers_root` (esc-02, 2026-08-26) — the same placement, and for the same
+#: reason, as `default_state_dir` above.
+#:
+#: This one is the other half of port-01's argument. Port-01 moved everything
+#: the LOOP writes out of the observed tree, because a loop write inside it
+#: mid-round is indistinguishable from an agent writing where it may not. What
+#: it could not move is the tree itself, which the OPERATOR also writes to —
+#: their editor, their `ruff` run, their own Claude Code session dropping a
+#: project-rules file. Two loop-fatal `checkout_escape_detected` parks on
+#: 2026-08-26 were exactly that and nothing else. So the loop gets its own
+#: clone to observe, and the operator's checkout stops being watched at all.
+DEFAULT_OBSERVED_CHECKOUT_NAME = "observed-checkout"
+
+
+def default_observed_checkout(workers_root: Path) -> Path:
+    """Where the loop-owned OBSERVED checkout goes when
+    `[paths].observed_checkout` is unset.
+
+    Beside `workers_root`, exactly like `default_state_dir` — that path is
+    already required to be absolute and outside the primary checkout, its
+    `.git`, the state dir and the publisher paths
+    (`worker_env.validate_workers_root`), so a sibling inherits the same
+    guarantee without a second rule about where it may point.
+
+    NOT under `workers_root` itself: that directory's entries are addressed by
+    task id (`WorkerRepoManager.path_for`), so a fixed name there is one
+    `add-task --id observed-checkout` away from a collision.
+    """
+    return Path(workers_root).expanduser().parent / DEFAULT_OBSERVED_CHECKOUT_NAME
+
+
+def resolve_observed_checkout(configured, workers_root) -> Path:
+    """THE rule that turns `[paths]` into the loop-owned observed checkout.
+
+    Mirrors `resolve_state_dir`'s shape deliberately — absent means "derive it
+    beside `workers_root`", explicit is honoured with `~` expanded and must be
+    absolute — but with one difference that is the whole point: there is no
+    "honoured verbatim, relative allowed" branch. A relative observed checkout
+    would resolve against whatever cwd each caller happens to have, and the two
+    callers are the loop (cwd = the operator's checkout) and
+    `cli._precondition_checkout_clean` (cwd = wherever the operator typed
+    `resolve-blocker`). A tree those two disagree about is a tree the loop
+    would observe and the operator would never clean.
+    """
+    if configured is None:
+        root = workers_root_from(workers_root)
+        observed = default_observed_checkout(root)
+        if observed == root:
+            raise ConfigError(
+                f"paths.workers_root ends in {DEFAULT_OBSERVED_CHECKOUT_NAME!r} "
+                f"({root}), which collides with the observed checkout derived "
+                "beside it. Set [paths].observed_checkout explicitly, or point "
+                "workers_root at a differently named directory."
+            )
+        return observed
+    if not isinstance(configured, str) or not configured.strip():
+        raise ConfigError(
+            f"paths.observed_checkout must be a non-empty string path, got "
+            f"{configured!r} — delete the key entirely to use the default "
+            "beside paths.workers_root, which is what an absent value means"
+        )
+    observed = Path(configured).expanduser()
+    if not observed.is_absolute():
+        raise ConfigError(
+            "paths.observed_checkout must be an absolute path, got "
+            f"{configured!r} (after expanding '~') — it is resolved by the loop "
+            "and by `resolve-blocker`, which run from different working "
+            "directories"
+        )
+    return observed
+
+
 def workers_root_from(raw) -> Path:
     """`[paths].workers_root` as a validated absolute `Path`.
 
@@ -674,6 +747,20 @@ class AutoloopConfig:
     #: `emit_migration_notices`. Last field and defaulted, because the direct
     #: `AutoloopConfig(...)` constructions across the test suite predate it.
     migration_notices: tuple[str, ...] = ()
+    #: The LOOP-OWNED clone `escape_detector` observes around a write-capable
+    #: agent call (esc-02, 2026-08-26). `None` — every direct
+    #: `AutoloopConfig(...)` construction in the test suite, and any embedder
+    #: that predates this field — means "no dedicated observed checkout", and
+    #: `Orchestrator` then observes the primary checkout exactly as it did
+    #: before, unchanged. `load_config` always resolves a real one (the default
+    #: is derived from `workers_root`, which is mandatory), so every deployment
+    #: that goes through the CLI gets the dedicated tree.
+    #:
+    #: Appended AFTER `migration_notices` on purpose, despite that field's own
+    #: "last field" comment: adding a field anywhere earlier would shift the
+    #: positional meaning of every argument after it, and the fifty-odd
+    #: `AutoloopConfig(...)` sites in the suite are not all keyword-only.
+    observed_checkout: Path | None = None
 
     @property
     def state_file(self) -> Path:
@@ -1266,7 +1353,11 @@ def load_config(path: Path) -> AutoloopConfig:
     policy = PolicyConfig(**policy_data)
 
     paths_data = data.get("paths", {})
-    _check_keys("paths", paths_data, {"state_dir", "workers_root", "validation_env_file"})
+    _check_keys(
+        "paths",
+        paths_data,
+        {"state_dir", "workers_root", "validation_env_file", "observed_checkout"},
+    )
     # Read now, RESOLVED below `workers_root` — the default is derived from it
     # (port-01). Kept as the raw value so "absent" stays distinguishable from
     # every value an operator could actually have written.
@@ -1300,6 +1391,17 @@ def load_config(path: Path) -> AutoloopConfig:
     # UNSET means "beside workers_root", outside the checkout, absolute.
     state_dir = resolve_state_dir(state_dir_raw, workers_root)
     legacy_state_dir = legacy_state_dir_for(path) if state_dir_raw is None else None
+
+    # `observed_checkout` (esc-02, 2026-08-26) — the tree `escape_detector`
+    # watches around a write-capable agent call. Resolved here, after
+    # `workers_root`, because the default is derived beside it, exactly like
+    # `state_dir` above. "Nested beneath the primary checkout / its .git / the
+    # state dir / workers_root / the publisher paths" needs a repo root and is
+    # checked by `worker_env.validate_observed_checkout` at the one place that
+    # builds a real one for dispatch (`cli._build_orchestrator`).
+    observed_checkout = resolve_observed_checkout(
+        paths_data.get("observed_checkout"), workers_root
+    )
 
     # `validation_env_file` (the validation-environment boundary): OPTIONAL,
     # but absolute when present. Same split as `workers_root` above — "unset"
@@ -1451,4 +1553,5 @@ def load_config(path: Path) -> AutoloopConfig:
         autonomy=autonomy,
         repo=repo,
         migration_notices=migration_notices + conversation_notices + repo_notices,
+        observed_checkout=observed_checkout,
     )

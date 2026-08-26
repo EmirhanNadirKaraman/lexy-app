@@ -174,6 +174,12 @@ def _orch(repo, tmp_path, execution, review_round=1):
     orch._policy = PolicyEngine(PolicyConfig())
     orch._git = GitGateway(repo, orch._policy)
     orch._worker_repos = _FakeWorkerRepos(tmp_path / "workers")
+    # Same reason as `test_rebase_stale_base.py`'s fixture: no loop-owned
+    # observed checkout, so the carry-forward below fetches the head from the
+    # primary checkout exactly as it did before esc-02.
+    orch._observed = None
+    orch._observed_git = None
+    orch._observed_synced_sha = ""
     orch._merge_deferrals = MergeDeferralStore(tmp_path / "deferrals")
     orch._execution_store = TaskExecutionStore(tmp_path / "executions")
     orch._logged: list = []

@@ -1,12 +1,32 @@
-"""Filesystem escape DETECTOR for the primary checkout, bracketing a
+"""Filesystem escape DETECTOR for the OBSERVED checkout, bracketing a
 write-capable agent invocation.
+
+WHICH TREE IS "THE OBSERVED CHECKOUT" (esc-02, 2026-08-26). Nothing in this
+module names a repository: every function here takes the `GitGateway` or the
+root it is told to work on. The orchestrator decides, in `_observation_git`,
+and since esc-02 the answer is a LOOP-OWNED CLONE
+(`worker_env.ObservedCheckout`) rather than the primary checkout the operator
+also works in. The reason is attribution, not scope. The functions below
+enumerate tracked + untracked + IGNORED paths deliberately, and that must not
+be narrowed — `.gitignore` is writable by the very agent being watched, so
+exempting ignored paths would sell unlimited invisible writes for one line of
+config, and `.ruff_cache/` is ignored only because ruff writes a `.gitignore`
+containing `*` into it, which is a process manufacturing its own invisibility.
+But a tree the operator also writes to produces changes this module reports
+truthfully and CANNOT attribute: two loop-fatal `checkout_escape_detected`
+parks on 2026-08-26 were an operator's own `ruff` run and an operator's own
+Claude Code session dropping `.claude/rules/evidence-first.md`, with the
+isolation mechanism working perfectly on both occasions. So the tree moved and
+the scope did not. This is the same argument port-01 (2026-08-23) made when it
+moved the loop's writable STATE out of the observed tree, applied one level up
+to the tree itself.
 
 READ THIS BEFORE TRUSTING IT. This module is an ESCAPE DETECTOR, not an OS
 security sandbox. It does not stop a write-capable agent from touching
 anything on disk — nothing here has that power, because the agent runs as an
 ordinary subprocess with the same filesystem permissions as the orchestrator
 itself (see `docs/AUTOLOOP.md` and `docs/SECURITY.md` finding #1). What it
-DOES do: take a deterministic snapshot of the primary checkout immediately
+DOES do: take a deterministic snapshot of the observed checkout immediately
 before a write-capable agent runs, take a second one immediately after, and
 report — paths only, never contents — anything that changed. That is
 after-the-fact detection, checked BEFORE the resulting work is committed or
@@ -124,10 +144,26 @@ widen its own `approved_paths`, flip a status, or even just to change a
 priority without going through `TaskStore.apply_priority` — is still
 reported, loop-fatal, exactly as before. See `tasks.MutationLedger`.
 
+WHAT MOVING THE TREE DID *NOT* CLOSE, stated rather than left to be
+discovered: a write into the OPERATOR's checkout is now invisible to this
+module, because nothing snapshots it any more. That is the deliberate trade —
+the operator's tree is one no attribution is possible in, so a report about it
+was never evidence — and it is bounded by where an escaping agent can actually
+land. A worker repository's cwd is the worker repository, and the one absolute
+path to a non-worker tree that leaks into it is the fetch source recorded in
+`.git/FETCH_HEAD`, which since esc-02 names the loop-owned clone
+(`orchestrator._worker_fetch_root`) — at BOTH sites that write one, worker
+creation and the carry-forward merge that fetches a moved head into an existing
+worker, since either alone would leave the claim false for half the tasks that
+run. An agent that goes looking for "the repo"
+therefore finds a watched tree. An agent that already knows the operator's
+absolute path from somewhere else does not, and never did in any way this
+module could have proven — see docs/SECURITY.md.
+
 SCOPE: the checkout's WORKING TREE, not `.git/` internals. "Tracked,
 untracked and ignored" is exactly the three categories `git status`
 enumerates over the working tree; a write into `.git/hooks/`, `.git/config`,
-or `.git/refs/*` in the PRIMARY checkout (as opposed to the task's own
+or `.git/refs/*` in the OBSERVED checkout (as opposed to the task's own
 isolated worker repo, which already has its own dedicated defenses — see
 `worker_env.py`) is NOT covered by this module. That is a real, separate,
 more severe class of escape (a planted commit hook or rewritten remote would

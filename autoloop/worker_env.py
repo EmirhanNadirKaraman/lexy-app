@@ -57,6 +57,7 @@ remote (verified: this brings in the object without creating
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -272,6 +273,102 @@ def validate_workers_root(
     return violations
 
 
+def validate_observed_checkout(
+    observed: Path | None,
+    repo_root: Path,
+    state_dir: Path,
+    workers_root: Path | None,
+) -> list[str]:
+    """Human-readable violations in `observed` as the LOOP-OWNED tree the
+    escape detector watches (esc-02). Empty means it is safe to use.
+
+    `None` is NOT a violation here, and that is the one asymmetry with
+    `validate_workers_root` above: an unconfigured `workers_root` means task
+    work would land inside the checkout, which is finding #1, so it refuses.
+    An unconfigured observed checkout means the loop watches the primary
+    checkout exactly as it did before this existed — the pre-esc-02 behaviour,
+    which is safe but noisy, not unsafe. `load_config` always resolves one, so
+    the `None` branch is reachable only from a hand-built config.
+
+    Refuses:
+      * relative (the same argument `workers_root` makes: nothing here can
+        disambiguate a relative path across the different cwds the loop and
+        `resolve-blocker` run from);
+      * being the primary checkout itself, or nested beneath it, its `.git`
+        (pointer file resolved, like `validate_workers_root`), the state dir,
+        `workers_root`, or either publisher path — a clone inside any of those
+        is a clone something else already writes to, which is the entire
+        defect this exists to remove;
+      * CONTAINING any of those. This direction matters as much as the other:
+        an observed checkout with `workers_root` (or the state dir) inside it
+        would put every worker repo and every loop state write back inside the
+        snapshot, i.e. re-create port-01's bug on the new tree.
+    """
+    if observed is None:
+        return []
+    observed = Path(observed)
+    if not observed.is_absolute():
+        return [f"observed_checkout must be an absolute path, got {observed}"]
+
+    resolved = observed.resolve()
+    repo_resolved = Path(repo_root).resolve()
+    if resolved == repo_resolved:
+        return [
+            f"observed_checkout ({resolved}) IS the primary checkout — the "
+            "whole point of the dedicated tree is that nothing but the loop "
+            "writes to it"
+        ]
+
+    boundaries: list[tuple[str, Path]] = [
+        ("the primary checkout", repo_resolved),
+        ("the primary checkout's .git", repo_resolved / ".git"),
+        ("the state directory", Path(state_dir).resolve()),
+    ]
+    if workers_root is not None:
+        boundaries.append(("the workers root", Path(workers_root).resolve()))
+    try:
+        from .publisher import publisher_hooks_path, publisher_repo_path
+
+        boundaries.append(("the publisher repo", publisher_repo_path(state_dir)))
+        boundaries.append(("the publisher hooks dir", publisher_hooks_path(state_dir)))
+    except Exception:  # pragma: no cover - publisher.py always importable in practice
+        pass
+
+    git_pointer = repo_resolved / ".git"
+    if git_pointer.is_file():
+        try:
+            text = git_pointer.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            text = ""
+        if text.startswith("gitdir:"):
+            target = text[len("gitdir:"):].strip()
+            target_path = Path(target)
+            if not target_path.is_absolute():
+                target_path = repo_resolved / target_path
+            boundaries.append(
+                (
+                    "the checkout's real git directory (linked worktree gitdir)",
+                    target_path.resolve(),
+                )
+            )
+
+    violations = []
+    for label, boundary in boundaries:
+        if _is_nested(resolved, boundary):
+            violations.append(
+                f"observed_checkout ({resolved}) is nested beneath {label} "
+                f"({boundary}) — it must live entirely outside every one of these"
+            )
+        elif _is_nested(boundary, resolved):
+            violations.append(
+                f"{label} ({boundary}) is nested beneath observed_checkout "
+                f"({resolved}) — anything written there would land inside the "
+                "tree the escape detector snapshots, which is exactly the "
+                "confusion the dedicated checkout exists to remove"
+            )
+    return violations
+
+
 def worker_repo_is_reusable(path: Path, branch: str) -> bool:
     """True only when the worker at `path` can be resumed AS IS for a round
     recorded against `branch`: the directory exists, it is itself the top
@@ -463,6 +560,374 @@ class WorkerRepoManager:
         # repo, freeing the task id's hooks dir for the next `create()`.
         shutil.rmtree(self.hooks_dir_for(task_id), ignore_errors=True)
         return dest
+
+
+#: A commit id the observed checkout will accept as a synchronisation target.
+#: Literal 40-hex only, for `push_exact`'s reason one level down: a branch name
+#: or `HEAD` can move between the moment the loop reads it and the moment the
+#: clone checks it out, and the whole contract here is that the observed tree
+#: is at a commit the caller NAMED.
+_OBSERVED_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+#: The branch the observed checkout parks on. A named branch rather than a
+#: detached HEAD purely so `git status` in there reads like a repository an
+#: operator can reason about; nothing keys on the name, and `-B` resets it to
+#: whatever commit the loop asked for.
+OBSERVED_BRANCH = "autoloop/observed"
+
+#: Wall-clock bound on every git invocation `ObservedCheckout` makes. Generous
+#: on purpose — the one operation here that can legitimately take real time is
+#: the first fetch of a whole repository from a LOCAL path — while still being
+#: a bound. See `ObservedCheckout._git` for why an unbounded call would be the
+#: availability shape of a guard that never fires.
+OBSERVED_GIT_TIMEOUT_SECONDS = 900
+
+#: Where every commit the clone is asked to KEEP (as opposed to check out) is
+#: pinned as a ref. See `ObservedCheckout.synchronize` for why a ref rather than
+#: merely a reachable object: git refuses to serve an unadvertised sha.
+OBSERVED_PIN_PREFIX = "refs/autoloop/observed-pin/"
+
+
+class ObservedCheckout:
+    """The loop-OWNED clone of the primary checkout that `escape_detector`
+    watches around a write-capable agent call (esc-02, 2026-08-26).
+
+    WHY THIS EXISTS. The detector's scope is not the problem and must not be
+    narrowed: `enumerate_checkout_paths` unions tracked + untracked + IGNORED
+    deliberately, because `.gitignore` is writable by the very agent being
+    watched, so exempting ignored paths would sell unlimited invisible writes
+    for one line of config. The problem is that the tree it watched was
+    SHARED. An operator's editor, an operator's `ruff` run (which writes
+    `.ruff_cache/`, ignored because ruff drops a `.gitignore` containing `*`
+    into it — a process manufacturing its own invisibility), an operator's own
+    Claude Code session dropping `.claude/rules/*.md`: each is a write the
+    detector can see and cannot attribute, and each parked the loop
+    LOOP-FATAL. Both parks on 2026-08-26 were exactly that. So the loop gets a
+    tree nothing else writes to, and stops watching the operator's.
+
+    WHAT IT IS NOT. This is not a second place work happens. Nothing commits
+    here, nothing validates here, no agent is ever pointed at it. It holds one
+    checked-out commit and is read; the loop's merges, pushes and worktrees all
+    still happen in the primary checkout exactly as before. It IS, however, the
+    fetch source for worker repositories (`WorkerRepoManager.create`), which is
+    what makes the second half of esc-02's claim true rather than hopeful: the
+    one absolute path to a non-worker tree that leaks into a worker repo is the
+    fetch source recorded in `.git/FETCH_HEAD`, and after this it names this
+    clone. An agent that follows it lands somewhere watched.
+
+    SYNCHRONISATION IS THE HARD PART, and every answer is fail-safe — this
+    class never returns "fine" for a tree it could not establish:
+
+      * **missing** -> created (`git init` + fetch + checkout), exactly like a
+        worker repo. A creation that fails is a violation, never a fallback.
+      * **behind** -> the named commits are fetched from the primary checkout
+        and the target is checked out. HEAD is then READ BACK and compared;
+        it is never predicted from the command that was issued.
+      * **ahead / diverged** -> refused. A clone holding a commit the primary
+        checkout does not is a clone something else wrote to, and resetting it
+        would destroy the only evidence of that. Refusing is the answer; the
+        remedy an operator wants (look, then delete the directory and let the
+        loop rebuild it) is in the message.
+      * **dirty** -> refused, checked BEFORE anything is fetched or checked
+        out. Residue here means something wrote to a tree only the loop is
+        supposed to write to, which is the exact condition the detector
+        exists to notice — including residue an ESCAPE left behind in an
+        earlier round, which must not be silently cleaned away by the round
+        that comes next.
+      * **present but not a git repository** -> refused, and NOTHING is
+        deleted. `create`/`quarantine` never delete evidence either.
+      * **unreadable** (any git invocation failing, an OSError, a sha that is
+        not 40-hex) -> refused. A guard that cannot answer must not be read as
+        "no violation" — the same rule `diff_snapshots` applies to its exempt
+        predicate.
+
+    Every git invocation runs under `worker_env()` and by direct
+    `subprocess.run`, matching `WorkerRepoManager`: these are PARENT-PROCESS
+    provisioning steps, never directive-driven, so the policy whitelist (whose
+    job is gating what a MODEL-AUTHORED directive can reach) has nothing to say
+    about them. The read-only gateway `gateway()` hands back for snapshotting
+    IS policy-gated, because that one issues `ls-files` on the loop's behalf.
+    """
+
+    def __init__(self, path: Path, *, runner=None):
+        # RESOLVED for `WorkerRepoManager.__init__`'s reason: this path is used
+        # as a subprocess `cwd`, as a `git init` target from a different
+        # directory, and as a `git fetch` source spelled to another repo.
+        self.path = Path(path).resolve()
+        self._runner = runner or subprocess.run
+
+    # ---- primitives ---------------------------------------------------------
+
+    def _git(self, *args: str, cwd: Path | None = None):
+        """Run one git command in the clone. Returns the CompletedProcess, or
+        `None` when the process could not be started, could not be waited for,
+        or ran past `OBSERVED_GIT_TIMEOUT_SECONDS` — the caller turns every one
+        of those into a violation rather than into silence.
+
+        BOUNDED, unlike `GitGateway`, and deliberately: this runs on the
+        round's critical path before a write-capable agent starts, so a git
+        invocation that never returns would hang the LOOP rather than fail it.
+        A guard that can hang forever is a guard that never fires, which is the
+        same shape as one that silently passes.
+        """
+        try:
+            return self._runner(
+                ["git", *args],
+                cwd=str(cwd or self.path),
+                env=worker_env(),
+                capture_output=True,
+                text=True,
+                timeout=OBSERVED_GIT_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # `TimeoutExpired` is a `SubprocessError`, not an `OSError`.
+            return None
+
+    @staticmethod
+    def _failed(proc) -> str:
+        if proc is None:
+            return "git could not be executed"
+        if proc.returncode != 0:
+            return ((proc.stderr or proc.stdout) or "").strip() or f"rc={proc.returncode}"
+        return ""
+
+    def is_repo(self) -> bool:
+        """True only when `self.path` is itself the TOP LEVEL of a git
+        repository — compared back against the path, so a plain directory that
+        merely sits inside some other repository does not pass as one (same
+        probe, and the same reason, as `worker_repo_is_reusable`)."""
+        proc = self._git("rev-parse", "--show-toplevel")
+        if proc is None or proc.returncode != 0:
+            return False
+        try:
+            return Path(proc.stdout.strip()).resolve() == self.path
+        except OSError:  # pragma: no cover - resolve on a vanished path
+            return False
+
+    def head_sha(self) -> str:
+        """The clone's current HEAD, or "" when HEAD is unborn/unreadable."""
+        proc = self._git("rev-parse", "HEAD")
+        return proc.stdout.strip() if proc is not None and proc.returncode == 0 else ""
+
+    def residue(self) -> list[str]:
+        """Everything present in the clone that the loop did not check out
+        there: pending tracked changes, untracked files, AND ignored files.
+
+        Ignored files are included on purpose, and this is the same argument
+        the detector itself makes one level down. Nothing runs in this tree —
+        no validation, no agent, no import — so a `.ruff_cache/` or a
+        `__pycache__/` here is not noise, it is evidence that something ran
+        where nothing should. `git status` alone would never report them.
+
+        A git failure yields a violation of its own rather than an empty list:
+        "I could not look" must not read as "there is nothing there".
+        """
+        found: list[str] = []
+        status = self._git("status", "--porcelain", "-z", "-uall")
+        problem = self._failed(status)
+        if problem:
+            return [f"the observed checkout's status could not be read: {problem}"]
+        for record in (status.stdout or "").split("\0"):
+            if not record.strip():
+                continue
+            # `XY <path>`; a rename/copy emits the original path as its own
+            # follow-on record, which is reported here as one more entry rather
+            # than paired up. Every entry means the same thing — something is
+            # in this tree that the loop did not check out — and none of them
+            # is parsed further than being named.
+            found.append(f"pending change {record[3:] if len(record) > 3 else record}")
+        ignored = self._git("ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+        problem = self._failed(ignored)
+        if problem:
+            return [f"the observed checkout's ignored paths could not be read: {problem}"]
+        for rel in (ignored.stdout or "").split("\0"):
+            if rel.strip():
+                found.append(f"ignored file {rel}")
+        return found
+
+    def _has_commit(self, sha: str) -> bool:
+        proc = self._git("cat-file", "-e", f"{sha}^{{commit}}")
+        return proc is not None and proc.returncode == 0
+
+    def _is_ancestor(self, older: str, newer: str) -> bool | None:
+        """True/False, or `None` when git could not answer — which the caller
+        treats as a refusal, never as "yes"."""
+        proc = self._git("merge-base", "--is-ancestor", older, newer)
+        if proc is None:
+            return None
+        if proc.returncode == 0:
+            return True
+        if proc.returncode == 1:
+            return False
+        return None
+
+    # ---- the controlled boundary --------------------------------------------
+
+    def synchronize(self, source_repo_path: Path, shas) -> list[str]:
+        """Bring the clone to `shas[0]`, with every other entry of `shas`
+        merely PRESENT in its object database, fetching whatever is missing
+        from `source_repo_path` (the primary checkout). Returns human-readable
+        violations; empty means the clone is at exactly `shas[0]` with a clean
+        tree and may be observed.
+
+        The extra shas exist because a resumed round's worker is recreated
+        from its recorded `task_base_sha`, which may be an older commit than
+        the current head — and after this change that recreation fetches from
+        here, so "present in the object database" is a real requirement, not
+        bookkeeping. Only the FIRST is checked out; the rest are only fetched.
+
+        Call this strictly BEFORE the escape detector's "before" snapshot and
+        never between the two. A sync inside the window would make the loop's
+        own write to the observed tree indistinguishable from an agent's,
+        which is precisely the bug port-01 fixed one level down.
+        """
+        ordered: list[str] = []
+        for sha in shas:
+            sha = (sha or "").strip()
+            if sha and sha not in ordered:
+                ordered.append(sha)
+        if not ordered:
+            return [
+                "the observed checkout was asked to synchronise to no commit at "
+                "all — refusing rather than observing whatever it happens to hold"
+            ]
+        bad = [sha for sha in ordered if not _OBSERVED_SHA_RE.match(sha)]
+        if bad:
+            return [
+                "the observed checkout refuses a synchronisation target that is "
+                f"not a literal 40-hex commit id: {bad}"
+            ]
+        target = ordered[0]
+
+        try:
+            source = str(Path(source_repo_path).resolve())
+        except OSError as exc:
+            return [f"the primary checkout path could not be resolved: {exc}"]
+
+        existed = self.path.exists()
+        if existed and not self.path.is_dir():
+            return [
+                f"the observed checkout path {self.path} exists and is not a "
+                "directory — nothing here deletes it; move it aside by hand"
+            ]
+        if existed and self.path.is_dir():
+            # An EMPTY directory is treated as absent, and only an empty one.
+            # `mkdir -p` on the way to inspecting the tree is an ordinary
+            # accident, and refusing it would turn a harmless one into a park;
+            # a directory with anything at all in it is somebody's data and is
+            # refused below.
+            try:
+                existed = any(self.path.iterdir())
+            except OSError as exc:
+                return [
+                    f"the observed checkout path {self.path} could not be read: {exc}"
+                ]
+        if existed and not self.is_repo():
+            return [
+                f"the observed checkout path {self.path} exists but is not the "
+                "top level of a git repository. Nothing here deletes it: "
+                "inspect it, then remove it and the loop will rebuild the clone "
+                "on the next round."
+            ]
+
+        if existed:
+            # CLEANLINESS FIRST, before a single byte is fetched or checked
+            # out. Residue is evidence, and a checkout that overwrote it would
+            # have destroyed the only record that something wrote here.
+            dirt = self.residue()
+            if dirt:
+                return [
+                    f"the observed checkout {self.path} is not clean, so it is "
+                    "not a tree only the loop has written to: "
+                    + "; ".join(sorted(dirt)[:20])
+                    + ". Inspect it, then remove the directory and the loop will "
+                    "rebuild the clone."
+                ]
+        else:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return [f"the observed checkout's parent could not be created: {exc}"]
+            problem = self._failed(
+                self._git("init", "-q", str(self.path), cwd=self.path.parent)
+            )
+            if problem:
+                return [f"the observed checkout could not be created: {problem}"]
+
+        for sha in ordered:
+            if not self._has_commit(sha):
+                # `-c credential.helper=` for `WorkerRepoManager.create`'s
+                # reason: `fetch` is the one network-SHAPED operation here even
+                # though `source` is always a local filesystem path by
+                # construction.
+                problem = self._failed(
+                    self._git("-c", "credential.helper=", "fetch", "-q", source, sha)
+                )
+                if problem or not self._has_commit(sha):
+                    return [
+                        f"the observed checkout could not obtain {sha[:12]} from "
+                        f"the primary checkout: "
+                        f"{problem or 'the object is still absent'}"
+                    ]
+            # PINNED as a real ref, and this is not bookkeeping. A worker
+            # repository is seeded by `git fetch <observed> <sha>`, and git's
+            # `upload-pack` refuses a request for an object no ref advertises
+            # (`uploadpack.allowAnySHA1InWant` is off by default). The target
+            # gets a branch below; every OTHER commit a resumed round may ask
+            # for — a recorded `task_base_sha` older than the head — would
+            # otherwise be present in the object database and still unfetchable.
+            problem = self._failed(
+                self._git("update-ref", f"{OBSERVED_PIN_PREFIX}{sha}", sha)
+            )
+            if problem:
+                return [
+                    f"the observed checkout could not pin {sha[:12]} as a ref, so "
+                    f"a worker repository could not be seeded from it: {problem}"
+                ]
+
+        head = self.head_sha()
+        if head and head != target:
+            answer = self._is_ancestor(head, target)
+            if answer is not True:
+                return [
+                    f"the observed checkout is at {head[:12]}, which is not an "
+                    f"ancestor of {target[:12]}" + (
+                        "" if answer is False else " (and git could not say)"
+                    )
+                    + " — it holds work the primary checkout does not, so "
+                    "something other than the loop has written to it. Nothing "
+                    "here resets it: inspect it, then remove the directory and "
+                    "the loop will rebuild the clone."
+                ]
+
+        problem = self._failed(self._git("checkout", "-q", "-B", OBSERVED_BRANCH, target))
+        if problem:
+            return [f"the observed checkout could not check out {target[:12]}: {problem}"]
+
+        # READ BACK, never predicted — the discipline `commit_and_capture` and
+        # `push_exact` already apply to their own results.
+        landed = self.head_sha()
+        if landed != target:
+            return [
+                f"the observed checkout is at {landed[:12] or '(unborn)'} after "
+                f"being asked for {target[:12]} — refusing to observe a tree "
+                "that is not the commit this round is about"
+            ]
+        dirt = self.residue()
+        if dirt:
+            return [
+                "the observed checkout is not clean immediately after being "
+                "synchronised: " + "; ".join(sorted(dirt)[:20])
+            ]
+        return []
+
+    def gateway(self, policy: PolicyEngine, runner=None) -> GitGateway:
+        """A policy-gated, read-only-in-practice gateway rooted at the clone,
+        running under `worker_env()` for the reason `verify_worker_isolation`
+        spells out: a gateway with no explicit env resolves the CALLING
+        process's ambient system/global git config, so it would be inspecting
+        something other than this repository as configured."""
+        return GitGateway(self.path, policy, runner=runner, env=worker_env())
 
 
 def verify_worker_isolation(git: GitGateway, expected_hooks_dir: Path | None = None) -> list[str]:

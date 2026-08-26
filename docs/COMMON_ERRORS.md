@@ -1926,6 +1926,65 @@ what failed three times here.
 are all bytecode, then `reset --yes` (it keeps the task registry) and re-open
 any task the reset left `in_progress`.
 
+### `checkout_escape_detected` naming `.ruff_cache/` or `.claude/rules/` — your own tooling, not an agent
+
+**Symptom:** the loop parks `loop_fatal` mid-round naming files no agent wrote
+and everything about them says "operator". Two on 2026-08-26: fourteen files
+under `.ruff_cache/0.14.1/` written at 10:20:50Z (a `ruff` run without
+`--no-cache` in the checkout), and `.claude/rules/evidence-first.md` — untracked,
+a Claude Code project-rules file by name and location. As with the
+`__pycache__` entry above, `checkout_escape_detected` refuses every `answer`,
+so the round is lost.
+
+**Cause:** the detector snapshotted the PRIMARY checkout — the same working
+tree you edit in. It reported those writes truthfully and could not attribute
+them. Read the shape carefully before reaching for the obvious fix: `ruff`'s
+cache is ignored *only because ruff writes a `.gitignore` containing `*` into
+it*. A process manufacturing its own invisibility is exactly what must never
+become an exemption rule, and `.gitignore` is writable by the very agent being
+watched, so exempting ignored paths would sell unlimited invisible writes for
+one line of config.
+
+**Fix:** applied repo-side 2026-08-26 (esc-02) — the TREE moved, the scope did
+not. The detector now snapshots a loop-owned clone
+(`worker_env.ObservedCheckout`, by default `<workers_root>/../observed-checkout`,
+overridable with `[paths].observed_checkout`), synchronised from the primary
+checkout at one controlled boundary per round and written to by nothing else.
+Worker repositories are seeded from that clone too, so the fetch source a
+worker records on disk names a watched tree. Your checkout is no longer
+observed at all: edit in it, run `ruff` in it, point your own Claude Code
+session at it. Same reasoning as the `autoloop pause` entry above, in the other
+direction — there the operator's file moved out of the tree; here the tree
+moved out from under the operator.
+
+**If you hit it on an older build:** inspect the reported paths, confirm every
+one is your own tooling's, then `reset --yes` (it keeps the task registry),
+re-open any task left `in_progress`, and close the record with
+`archive-blocker <id> --reason "..."`.
+
+### `observed_checkout_unusable` — the loop refuses to start an agent
+
+**Symptom:** a round parks `loop_fatal` before the agent runs at all, saying the
+loop-owned observed checkout could not be established, and naming one of:
+not clean, not the top level of a git repository, not an ancestor of the
+target commit, or a git command that failed.
+
+**Cause:** the tree the escape detector watches must be one nothing but the loop
+writes to. Every one of those conditions means it is not, and starting a
+write-capable agent anyway would mean running with no escape detection.
+Nothing there is reset, repaired or deleted — the residue IS the evidence, and
+a sync that quietly checked out over it would destroy the only record that
+something wrote there. `not an ancestor` in particular means the clone holds a
+commit your checkout does not.
+
+**Fix:** look at the directory the park names. If what you find is your own —
+you cloned into it, or pointed a tool at it — remove the directory and the loop
+rebuilds it on the next round. If you cannot explain it, that is the finding:
+treat it as you would a detected escape and do not delete it before reading it.
+An empty directory there is fine and is treated as absent. A "does not exist
+yet" answer from `resolve-blocker` is not a failure either — the loop recreates
+the clone at the start of the next round.
+
 ### The loop runs forever without progressing — same `audit` decision, same park, every cycle
 **Symptom:** `run --continuous` is alive and healthy (no crash, no blocker you
 can act on), but the transcript repeats one cycle: `directive {"decision":
@@ -3445,3 +3504,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-26 | abort-01 | Test-authoring trap for any abort-aware validation test: arming the abort flag BEFORE `execute()` does not exercise the kill path. `abort_aware_command_runner`'s outer wrapper checks `abort_in_effect` ahead of each command and records "the round's remaining validation commands were refused before launching" — a different branch writing a different clause. To reach the KILL path the injected runner must itself arm the flag, record the ledger, clear the flag, then return `ABORT_RETURNCODE`. Assert the clause, or the test silently grades the wrong branch. |
 | 2026-08-26 | port-05 | §§6-15 (and scattered §1/§2 entries) document the loop harness, not this application. A banner at §6 now says so, and asks for new harness entries to be filed with the harness rather than here. Nothing was deleted: an operator running the loop against this repository still meets these symptoms, and excising ~2,400 lines here alongside the rest of the doc work would exceed the review packet cap. They move when `autoloop/` leaves the checkout. |
 | 2026-08-26 | port-05 | REVISION: `scripts/seed_validation_db.py:48` imports `autoloop.validation_env` — the only file outside `autoloop/` here that imports the package. `git rm -r autoloop/` turns it into an ImportError before the script reads an argument, and NEITHER validation command notices: ruff does not resolve imports, and nothing under `tests/` imports the script. Green tooling over a dead script is the trap. Lift the one function before the removal, not after — docs/TODO.md #46. |
+| 2026-08-26 | esc-02 | Two new §8 entries: `checkout_escape_detected` naming `.ruff_cache/` or `.claude/rules/` (your own tooling, fixed by moving the observed tree rather than by exempting a path — ruff's cache is ignored only because ruff writes its own `.gitignore` containing `*`, and a process manufacturing its own invisibility must never become an exemption rule), and the new `observed_checkout_unusable` park with what each of its four refusals means. |
+| 2026-08-26 | esc-02 | The remedy for the second one is "look before you delete". Nothing in the sync resets, repairs or removes anything the clone holds, because residue there IS the evidence — including residue a detected escape left in an earlier round. An empty directory is treated as absent and is not a refusal; `resolve-blocker` answering "does not exist yet" is not a failure either, since the loop rebuilds the clone at the next round's boundary. |
