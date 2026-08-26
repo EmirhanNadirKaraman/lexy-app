@@ -6483,6 +6483,107 @@ whole `execute()` rounds in which the stand-in agent uses NOTHING but Write and
 Read — including the red-fix-green loop, the cap, and the assertion that
 `changed_paths` carries no trace of the channel.
 
+### 7b-ter. A round that never ran the suite, and an ask nobody answered (advis-01, 2026-08-26)
+
+Two behaviours over the contract §7b-bis defines, both keyed on counters the
+executor owns. They ship as one change because they edit one code region: the
+`_advisory_*` block and the report-summary builder in
+`autoloop/implement_executor.py`.
+
+**The measurement.** Over the 147 rounds carrying an advisory line (the channel
+landed 2026-08-23 21:08Z; measured 2026-08-26), each round's self-validation
+outcome paired against the reviewer's NEXT decision:
+
+| last advisory run | n | `revise` |
+|---|---|---|
+| PASSED | 100 | 41.0% |
+| FAILED | 27 | 51.9% |
+| never asked | 18 | 77.8% |
+
+Splitting each bucket's refusals by theme shows the never-asked gap is **not** a
+general quality gap: `incomplete` is 14% there against 17% for PASSED —
+indistinguishable — while the validation theme is 93% against 17%. Rounds that
+skip the suite are refused for precisely what the suite would have caught. A
+competing explanation was tested and refuted: never-asked rounds change fewer
+files (median 2 against 8), so "small changes are refused for doing too little"
+was plausible, and the theme split rules it out.
+
+**Read the limits with the numbers.** n=14 refusals in the never-asked bucket, so
+ONE case moves that 93% by about seven points. The theming was a keyword pass,
+not the loop's own `reasons.py` classifier. The relationship is correlational.
+What makes it actionable is the specific signature, not the size of the gap.
+
+**Behaviour 1 — a zero-request report is handed back, once.**
+`_run_implementation` re-invokes the agent when `AdvisoryValidation.asked` is
+zero, under four conditions: the channel was offerable, the first invocation
+succeeded, the transport observed no request, and no abort is in effect.
+`ADVISORY_ZERO_CALL_RETURNS` (1) is the whole allowance.
+
+* **The bound is the hard part, not the hand-back.** A refusal that can loop is
+  strictly worse than the forward it replaces — it spends the round re-invoking
+  and produces nothing. The counter lives in `_run_implementation`, is
+  incremented BEFORE each re-invocation, and is never derived from anything the
+  agent wrote, so the loop ends after `max_returns` iterations whatever the
+  agent does. A negative allowance reads as zero, never as unbounded.
+* **Once the allowance is spent the round proceeds exactly as it did before.**
+  The report is forwarded, and `note()` records both the measured zero and the
+  hand-back that failed to change it.
+* **A hand-back can never make a round worse.** If the re-invoked agent fails,
+  the FIRST invocation's result is kept and the round still commits — turning a
+  reviewable round into an "implementation agent failed" would be this feature
+  causing the loss it exists to prevent. The failed invocation's text is not
+  carried.
+* **Every completed invocation's report reaches the reviewer** via
+  `_combined_report`, in order. A later report supersedes nothing:
+  `DELETE-FILE:`, `REMOVE-OUT-OF-SCOPE:`, `REVERT-OUT-OF-SCOPE:` and
+  `ASSUMPTION:` are all read out of that text, so keeping only the last would
+  silently drop an authorized deletion the first invocation made.
+* **The hand-back section says the work is ALREADY DONE.** A re-invocation is a
+  fresh `claude -p` carrying the whole original brief, and the obvious reading of
+  that brief is "implement this task" — an agent that obeys it appends a second
+  change note or re-adds a test. `_zero_call_return_instruction` therefore leads
+  with "do not redo the task", and states the runs LEFT rather than the cap the
+  brief above it renders. Echo-safe like every other section.
+
+**Behaviour 2 — an ask that never became an answer says so.** A request that
+reached `PENDING #n` and never became `RESULT #n` renders as UNANSWERED — "no
+answer landed" — distinct from a run that completed and FAILED.
+
+* **port-05 round 1 is the case.** The agent asked for run #2, never got it, and
+  the round reported run #1's `FAILED` as "its last run FAILED". The reviewer
+  refused it; the work was never shown to be defective. A full round was spent
+  on a reporting defect.
+* **Two counters, both the transport's own observation.**
+  `record_request_asked` fires when the watcher takes a request AND when
+  `stop()` finds one still sitting in the tree — that second half is the one
+  that matters, because the sweep is about to delete the only evidence the agent
+  asked. `record_answer_delivered` fires only when a `RESULT` really reaches the
+  result file; a `PENDING` marker is not an answer and a failed write is not one
+  either. `unanswered` is the gap.
+* **Both directions are guarded.** A request file in a rendezvous that never
+  watched is residue from a round that died, not an ask (`_started`), and the
+  broken-channel branch has already counted and ANSWERED its request, so the
+  file it could not remove is not a second ask (`_broken`).
+* **The completed run is still reported**, after the UNANSWERED sentence and
+  labelled as a verdict about the tree as it stood then. Suppressing it would be
+  the opposite error.
+* **`asked`, not `requests`, decides both.** The broken-channel branch answers
+  the agent without ever calling `run()`, so a hand-back keyed on `requests`
+  would re-invoke an agent that asked, was answered, and did nothing wrong.
+
+**Nothing about the posture moves.** No tool is added, `WRITE_ALLOWED_TOOLS` and
+`IMPLEMENT_DISALLOWED_TOOLS` are unchanged, `Bash` stays disallowed, no flag is
+added and nothing is spawned for the agent to talk to. The transport is still
+the file rendezvous, for the reason §7b-bis records.
+
+**The dependency on select-01 was real.** `ADVISORY_VALIDATION_MAX_CALLS` is 3
+and `ADVISORY_VALIDATION_TIMEOUT_SECONDS` is 600; while test selection resolved
+to the full suite on essentially every round, pressing agents to ask made the
+"never landed" failure mode MORE common, not less. Narrow selection first, then
+require the ask.
+
+Pinned by `autoloop/tests/test_agent_self_validation.py` section 10.
+
 ---
 
 ## 8. Setup

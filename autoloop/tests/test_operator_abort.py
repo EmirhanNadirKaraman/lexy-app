@@ -719,7 +719,12 @@ def test_an_executor_with_no_abort_file_behaves_exactly_as_before(tmp_path):
     ).execute(implement(), a_task())
 
     assert outcome.status == "ok", outcome.summary
-    assert agent.runs == 1
+    # TWO, not one, and not because of anything abort-related: `executor_with`
+    # configures validation, so the advisory channel is offered, and this agent
+    # never uses it — since advis-01 (2026-08-26) a report with zero advisory
+    # requests is handed back to the agent once before the round is forwarded.
+    # What this test is about is unchanged: the round ran to completion.
+    assert agent.runs == 2
     assert ran, "the round must have validated, not stopped early"
 
 

@@ -551,6 +551,45 @@ cost is already no higher than before your task, say so and let the executor's
 1800s run decide; check what merged since the last recorded passing advisory
 run before blaming your own diff.
 
+### The implement agent ran TWICE, and the packet carries two reports
+**Symptom:** `report_details` for one round holds two agent reports separated by
+`----- next agent invocation in the same round -----`, the worker repo shows two
+passes of edits, and the round summary says the executor "handed this round back
+to the agent 1 time(s)". Nothing failed and no retry was configured. Since
+advis-01 (2026-08-26).
+**Cause:** the round made ZERO advisory validation requests, so it was handed
+back rather than forwarded to the reviewer unchecked — measured 2026-08-26, a
+never-asked round drew `revise` 77.8% of the time against 41.0% for one whose
+last advisory run passed, and 93% of those refusals were on the validation
+theme. It is bounded at `implement_executor.ADVISORY_ZERO_CALL_RETURNS` (1) and
+happens at most once per round.
+**Fix:** nothing to fix — ask for the validation run in your FIRST invocation and
+this never fires. If you are the re-invoked agent, the section at the end of your
+prompt is the one that matters: the work is already on disk, so do not redo it,
+do not append a second change note, and do not re-add a test — every one of those
+lands twice and fails the round. Run the suite, fix what it reports, return. If
+you are reading a packet: both reports are the agent's own account, neither
+supersedes the other, and a `DELETE-FILE:` or `ASSUMPTION:` line in EITHER was
+honoured.
+
+### The round summary says "its last run FAILED" but nothing in the diff is broken
+**Symptom:** a candidate is refused for failing validation the agent supposedly
+saw, and re-reading the diff shows nothing wrong. The summary's advisory line
+named a FAILED run. Measured 2026-08-26 (port-05 round 1), which cost a full
+round.
+**Cause:** the agent asked for a LATER run whose answer never landed — it polled
+past the round's end, so `RESULT #2` was never written — and the summary reported
+run #1's stale verdict as the round's state. Fixed in advis-01: an ask that
+reached `PENDING #n` and never became `RESULT #n` now reads
+`Agent self-validation: UNANSWERED — … no answer landed before the round ended`,
+with any completed run reported after it and labelled as a verdict about an
+earlier tree.
+**Fix:** read UNANSWERED as "nothing was proved", not as a failure and not as a
+pass. If you see the OLD shape on a round predating advis-01, check the ordinals
+in the report rather than the verdict. As an agent: a full advisory run takes
+minutes and the channel caps one at 600s, so poll for your own `RESULT #n` before
+returning; returning mid-run is what produces this.
+
 ### Backend suite: hundreds of `asyncpg` errors, or one unreproducible failure
 **Symptom:** `python3 -m pytest -n auto` in `lexy-app/backend` reports something
 like `1260 errors` with tracebacks bottoming out in
@@ -3529,3 +3568,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-26 | esc-02 | Two new §8 entries: `checkout_escape_detected` naming `.ruff_cache/` or `.claude/rules/` (your own tooling, fixed by moving the observed tree rather than by exempting a path — ruff's cache is ignored only because ruff writes its own `.gitignore` containing `*`, and a process manufacturing its own invisibility must never become an exemption rule), and the new `observed_checkout_unusable` park with what each of its four refusals means. |
 | 2026-08-26 | esc-02 | The remedy for the second one is "look before you delete". Nothing in the sync resets, repairs or removes anything the clone holds, because residue there IS the evidence — including residue a detected escape left in an earlier round. An empty directory is treated as absent and is not a refusal; `resolve-blocker` answering "does not exist yet" is not a failure either, since the loop rebuilds the clone at the next round's boundary. |
 | 2026-08-26 | select-01 | New §2 entry: advisory validation says `autoloop/tests: TIMEOUT` while `ruff check .` PASSes and `tests/` reads `NOT RUN`. The cap is `implement_executor.ADVISORY_VALIDATION_TIMEOUT_SECONDS` = 600s, deliberately far below the 1800s `run_validation_commands` default the executor's own post-agent run uses, so it is neither a pass nor the round's verdict. Hit twice in this round over two different trees; the entry says to cut your own repo-wide test cost before spending another run rather than re-running unchanged. |
+| 2026-08-26 | advis-01 | Two new §2 entries. "The implement agent ran TWICE, and the packet carries two reports" is the NEW symptom this change introduces — a round that made zero advisory requests is handed back once — and the fix is addressed to the re-invoked agent: the work is already on disk, so a second change note or a re-added test lands twice and fails the round. Neither report supersedes the other, and a `DELETE-FILE:` or `ASSUMPTION:` line in either was honoured. |
+| 2026-08-26 | advis-01 | The second entry is the symptom that cost port-05 round 1: "the round summary says its last run FAILED but nothing in the diff is broken". The agent asked for a later run whose answer never landed, and the summary reported the earlier run's stale verdict as the round's state. It now reads UNANSWERED. Remedy for an agent: a full advisory run takes minutes and one run is capped at 600s, so poll for your own `RESULT #n` before returning — returning mid-run is what produces it. |
