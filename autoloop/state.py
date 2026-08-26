@@ -128,6 +128,14 @@ if TYPE_CHECKING:
 # before this existed (an unbound `push` is refused) rather than resolving a
 # binding out of a record nobody wrote.
 #
+# NOT bumped for the operator ABORT either (`LoopState.aborted_round`, plus the
+# new `"aborted"` value of the existing `stop_kind`). The field defaults to
+# `None`, which is exactly right for a state file written before it existed:
+# that session was never aborted, so there is nothing to backfill. `stop_kind`
+# gains no field at all, and every reader of it already gates on the POSITIVE
+# value it wants, so an old `""` keeps reading as unclassified rather than as
+# this — the same reasoning `preemption` records one paragraph up.
+#
 # NOT bumped for transport-aware fault recovery either
 # (`PendingRequest.replays_used`). Same reasoning as `start_timeouts` above: a
 # new field defaulting to 0, and 0 is the truth rather than a guess for a
@@ -193,6 +201,30 @@ class Phase(str, Enum):
 
 
 TERMINAL_PHASES = frozenset({Phase.NEEDS_USER, Phase.STOPPED, Phase.FAILED})
+
+#: The phases in which the loop OWES A REVIEW PACKET whose acceptance it cannot
+#: yet prove. `delivering` is mid-deposit of a chunked payload, `submitting` has
+#: a request created and possibly sent, the two `submission_*` phases are a send
+#: whose acceptance is unknown or disproved, and `awaiting` has a reviewer
+#: holding one. Whatever the packet is about, anything that ends or interrupts
+#: the session at one of these strands a packet nobody can classify afterwards.
+#:
+#: TWO VERBS READ THIS, which is why it lives here rather than in either of
+#: them. `cli._shelve_session_refusal` refuses a shelve outright at any of them
+#: (shelve-01), and `Orchestrator.run` refuses the `abort` KILL at any of them
+#: (abort-01) — see `packet_outstanding_reason`, further down this module, which
+#: is the shared predicate the second one asks. Two copies of this set would
+#: agree on the day they were written and disagree the first time a phase was
+#: added.
+PACKET_OUTSTANDING_PHASES = frozenset(
+    {
+        Phase.DELIVERING,
+        Phase.SUBMITTING,
+        Phase.SUBMISSION_UNCONFIRMED,
+        Phase.SUBMISSION_REJECTED,
+        Phase.AWAITING,
+    }
+)
 
 
 @dataclass
@@ -739,6 +771,15 @@ class LoopState:
     #:   next selection is meant to start a new session — so continuous mode
     #:   carries on rather than stopping. `stop_reason` names the urgent target
     #:   and `LoopState.preemption` records what was displaced.
+    #: * `"aborted"` — an operator ran `python -m autoloop abort` while a round
+    #:   was in flight (`orchestrator._abort_round`). Like `"contract"` and
+    #:   `"preempted"` and unlike `"fault"` this is a DELIBERATE ending: the
+    #:   agent in flight was killed, its task went back to the queue with its
+    #:   worker repository intact, and no budget was charged for it. Unlike
+    #:   `"preempted"` the loop does NOT carry on — the operator asked it to
+    #:   stop, and the abort flag stops the next iteration too until `resume`
+    #:   clears it. `stop_reason` says what the killed step had produced and
+    #:   `LoopState.aborted_round` records it in full.
     #: * `""` — unclassified: a state file written before this field existed,
     #:   or any phase other than `stopped`.
     #:
@@ -796,6 +837,28 @@ class LoopState:
     #: from this same dict — is the permanent record; this field is what
     #: `status` and the operator's terminal can still show in between.
     preemption: dict | None = None
+    #: What an operator's `abort` killed, or `None` for every session that was
+    #: never aborted.
+    #:
+    #: Written by `orchestrator._abort_round` in the same save that ends the
+    #: round, and it is the reason an abort is not a silent discard: it names the
+    #: task whose round was killed, the phase it was killed at, whether the task
+    #: went back to the queue, whether the attempt charge was refunded, and — the
+    #: part the operator actually needs — WHAT THE KILLED STEP HAD PRODUCED,
+    #: measured from the worker repo's own git state by
+    #: `implement_executor._partial_work` and never from anything the agent said
+    #: about itself. `stop_kind == "aborted"` is what says a `stopped` session
+    #: ended this way; this is what says what it cost.
+    #:
+    #: A plain dict, like `preemption` beside it and for the same three reasons:
+    #: it is a record to display and log, nothing branches on its fields, and a
+    #: dataclass would need its own loader in `from_dict`.
+    #:
+    #: DURABLE ONLY AS LONG AS THE SESSION, exactly like `preemption`: the next
+    #: selection replaces the whole `LoopState`, so the transcript's
+    #: `round_aborted` entry — written from this same dict — is the permanent
+    #: record, and this is what `status` can still show in between.
+    aborted_round: dict | None = None
     created_at: str = field(default_factory=utcnow_iso)
     updated_at: str = field(default_factory=utcnow_iso)
     schema_version: int = SCHEMA_VERSION
@@ -872,6 +935,121 @@ class StateStore:
         backup = self.path.with_name(f"{self.path.name}.bak-{stamp}")
         os.replace(self.path, backup)
         return backup
+
+
+#: Filename of the operator ABORT flag, beside `PAUSE` (see `abort_flag_file`).
+ABORT_FILENAME = "ABORT"
+
+#: The `executor.ExecutionOutcome.status` a round killed by `abort` carries.
+#:
+#: Here rather than in `executor.py` beside the dataclass, for one reason worth
+#: stating: it is the SECOND, independent signal that a round was aborted, and
+#: the two readers of the abort vocabulary — `implement_executor`, which writes
+#: it, and `orchestrator._dispatch_task_postcommit`, which acts on it — already
+#: import `abort_requested` from this module. One import, one spelling. The
+#: orchestrator treats either signal as sufficient, so a flag an operator
+#: cleared in the microsecond between the executor's read and the orchestrator's
+#: still ends the round as an abort rather than as a charged failure.
+EXECUTION_ABORTED = "aborted"
+
+
+def abort_flag_file(config) -> Path:
+    """Where an operator's `abort` request is written, or read from.
+
+    THE SAME DIRECTORY AS `PAUSE`, and for the same non-negotiable reason:
+    `AutoloopConfig.pause_file` moved outside the checkout because
+    `escape_detector` snapshots the checkout around every write-capable agent
+    call, so a flag written INSIDE it mid-round is reported as an escape and
+    parks the loop `loop_fatal` — the documented way to stop the loop broke it.
+    An abort flag is written at exactly that moment BY DEFINITION (its whole
+    purpose is to land while an agent is running), so it would hit that trap
+    every single time rather than occasionally.
+
+    Derived from the config rather than added to `AutoloopConfig` as a property,
+    which is what `stop_repetition_file` above does and for the same reason:
+    nothing has to be wired, and a path a construction site can forget to pass
+    is a path that silently resolves somewhere else. It reads the config by
+    DUCK TYPING (`workers_root`, `state_dir`) so this module keeps importing
+    nothing from `config.py`, exactly as `LoopState` does.
+
+    The `workers_root is None` fallback mirrors `pause_file`'s, so a config
+    without one (tests, embedders) still has a well-defined flag path instead of
+    raising.
+    """
+    workers_root = getattr(config, "workers_root", None)
+    if workers_root is not None:
+        return Path(workers_root).expanduser().parent / ABORT_FILENAME
+    return Path(config.state_dir) / ABORT_FILENAME
+
+
+def abort_requested(config) -> bool:
+    """Has an operator asked for the step in flight to be killed?
+
+    ONE reader for every caller — the CLI, the orchestrator's step loop, the
+    write-capable agent's process-group watchdog and the validation runner all
+    ask this, and a second copy of "does the flag exist" is how three of them
+    end up disagreeing about which directory it lives in.
+
+    A path that cannot be read answers False, i.e. "not requested". That is a
+    FAIL-OPEN and it is named here rather than hidden: it is byte-for-byte what
+    `cli.pause_requested` has always done (`Path.exists()` swallows the OSError
+    itself), the consequence is only that the loop keeps doing what it was
+    already doing, and an operator whose flag cannot be written has the same
+    remedy they always had — kill the process. Failing CLOSED here would be
+    strictly worse: an unreadable path would kill every agent the loop ran.
+    """
+    return abort_flag_file(config).exists()
+
+
+def packet_outstanding_reason(state) -> str:
+    """Why this session owes a review packet, or `""` when it demonstrably does
+    not.
+
+    THE ONE QUESTION `abort` has to ask before it kills anything: a packet
+    outstanding means a reviewer may already be holding — or may already have
+    accepted — a request this round produced, and killing a step there strands an
+    approved push. So the kill is REFUSED at any phase in
+    `PACKET_OUTSTANDING_PHASES`, and refused for the same reason
+    `cli._shelve_session_refusal` refuses a shelve at them.
+
+    **The pending request is checked separately from the phase**, because a
+    request OUTLIVES its own phase: `Orchestrator._step_awaiting` clears
+    `pending_request` in the same save that moves the phase to `executing`
+    (`orchestrator.py`), so a session carrying one in any other phase is a
+    session whose request has not been resolved yet. That second check costs
+    nothing in the phase this verb exists for — `executing` has no pending
+    request by construction, which is precisely why an abort mid-agent is never
+    refused.
+
+    **Unrecognised phase REFUSES, fail-closed**, exactly as the shelve guard
+    does: whether a packet is outstanding is the one thing that cannot be decided
+    about a phase this build does not know, and answering "no packet" by default
+    would be the guard silently switching itself off — into a KILL, here.
+    `state=None` refuses for the same reason: no session to read means no
+    evidence, not a licence.
+
+    Duck-typed on `phase` / `pending_request` like everything else in this
+    module, and it never raises: a caller reaching for a field that is not there
+    gets a refusal, not an `AttributeError` out of the middle of a stop request.
+    """
+    if state is None:
+        return "there is no readable session, so whether one owes a packet cannot be decided"
+    try:
+        phase = Phase(getattr(state, "phase", ""))
+    except (ValueError, TypeError):
+        return (
+            f"the session is in an unrecognised phase {getattr(state, 'phase', None)!r}, "
+            "so whether it owes a review packet cannot be decided"
+        )
+    if phase in PACKET_OUTSTANDING_PHASES:
+        return f"a review packet is outstanding (phase {phase.value})"
+    pending = getattr(state, "pending_request", None)
+    if pending is not None:
+        return (
+            f"request {getattr(pending, 'request_id', '?')} is still pending in "
+            f"phase {phase.value} — a request outlives its own phase"
+        )
+    return ""
 
 
 #: Filename of the repeated-stop ledger under `AutoloopConfig.state_dir`.

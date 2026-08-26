@@ -567,6 +567,69 @@ def attempt_outcome(reason: str) -> str:
     return reason.rsplit(_REASON_SEP, 1)[-1]
 
 
+def refund_attempt(execution: "TaskExecution") -> str:
+    """Un-charge the OPEN attempt at the end of the ledger and return the label
+    it was opened as, or `""` when there was nothing to refund.
+
+    THE FIFTH operation over `attempt_ledger`, and the only one that REMOVES an
+    entry — `orchestrator._open_attempt`'s docstring enumerates the other four
+    (`_reconcile_unfinished_attempts`, `_open_attempt`, `_finalise_attempt`,
+    `_note_round_fault`), every one of which either adds an entry or re-stamps
+    one. It exists for exactly one caller, `orchestrator._abort_round`, and for
+    one reason: an operator stopping the loop is not the task failing, so an
+    abort must leave the task's budgets exactly as it found them.
+
+    **Settling the entry as a fault would NOT be equivalent, and leaving it open
+    would be worse.** `_reconcile_unfinished_attempts` runs at the start of the
+    next dispatch and settles any OPEN entry as `ATTEMPT_FAULT,
+    "interrupted_mid_round"`, so an abort that merely walked away would become a
+    fault charge one dispatch later — "no fault counted" failing silently, a
+    round after the operator pressed the button, and eventually
+    `fault_attempt_ceiling` naming the operator's own interventions as the
+    environment failing the task.
+
+    **The invariant is preserved, not merely respected.**
+    `attempt_count + fault_attempt_count == len(attempt_ledger)` holds after
+    this: one entry is removed and exactly the counter it charged is
+    decremented. `pending_fault_code` is RESTORED for a redo, because
+    `_open_attempt` consumed it when it opened the entry — an abort that dropped
+    it would silently convert the next recovery dispatch into the task's own
+    attempt.
+
+    **Refuses rather than corrupts.** A last entry that is already settled, an
+    empty ledger, or a counter that is not positive (a hand-edited record; no
+    writer here produces one) all return `""` and change NOTHING. The
+    consequence of refusing is the pre-abort behaviour — the entry stays open and
+    the next dispatch's reconciliation settles it as a fault — which is a charge
+    the operator can see and answer, where a decrement below zero would break the
+    invariant every ceiling is computed from.
+
+    Deliberately does NOT save: the caller owns the write, so the refund and the
+    rest of the abort record reach disk together.
+    """
+    entries = list(execution.attempt_ledger)
+    if not entries:
+        return ""
+    _ordinal, opened_as, opened_reason = split_attempt(entries[-1])
+    if opened_as not in ATTEMPT_OPEN:
+        return ""
+    if opened_as == ATTEMPT_PENDING_FAULT:
+        if execution.fault_attempt_count <= 0:
+            return ""
+        execution.fault_attempt_count -= 1
+        # Re-armed from the entry's own origin, which is the fault code
+        # `_open_attempt` consumed to open it. The review that fault destroyed is
+        # still destroyed, so the dispatch after this abort is still recovery.
+        execution.pending_fault_code = opened_reason
+    else:
+        if execution.attempt_count <= 0:
+            return ""
+        execution.attempt_count -= 1
+    entries.pop()
+    execution.attempt_ledger = tuple(entries)
+    return opened_as
+
+
 def accumulate_assumptions(
     existing: Sequence[str], incoming: Sequence[str]
 ) -> tuple[str, ...]:
