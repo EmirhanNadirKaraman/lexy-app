@@ -702,6 +702,53 @@ def test_an_executor_with_no_abort_file_behaves_exactly_as_before(tmp_path):
     assert ran, "the round must have validated, not stopped early"
 
 
+def test_the_agents_own_mid_round_validation_run_is_abortable_too(tmp_path):
+    """The constraint the task named FIRST, PINNED rather than commented.
+
+    Since impl-02 (2026-08-24) the agent runs the validation suite MID-ROUND
+    through the advisory channel, so an abort can land while `pytest -n 4` is
+    live. §2 above proves the RUNNER kills its whole process group; what nothing
+    proved until here is that the advisory channel is actually HOLDING that
+    runner. It is one attribute — `_command_runner`, wrapped once in
+    `__init__` — handed to both the round's authoritative run and to
+    `_advisory_for`, and a comment saying so is not evidence that it is so.
+
+    The assertion that matters is the second `run()`: an advisory answer reading
+    "PASSED" about commands nobody launched is exactly the fail-open this file
+    exists to grade, and it would be believed — the agent asked for it.
+    """
+    worker = real_repo(tmp_path, "worker")
+    abort_file = tmp_path / "ABORT"
+    launched = []
+    executor = executor_with(
+        worker,
+        WritingAgent(worker, {}),
+        abort_file,
+        command_runner=lambda argv, **kwargs: launched.append(tuple(argv)) or _green(),
+    )
+    advisory = executor._advisory_for(
+        a_task(), GitGateway(worker, PolicyEngine(PolicyConfig()))
+    )
+
+    before = advisory.run()
+
+    assert "PASSED" in before, before
+    assert launched == [("ruff", "check", ".")], "the advisory run never executed"
+
+    abort_file.touch()
+    after = advisory.run()
+
+    assert launched == [("ruff", "check", ".")], "a command launched after the abort"
+    assert "PASSED" not in after, (
+        "the advisory channel reported green about a command nobody ran: " + after
+    )
+    assert advisory.last_run_ok is False, (
+        "the round's own record of the last advisory run must be red too — "
+        "`note()` reads this, and a True here would tell the reviewer the agent "
+        "checked its work against commands that never ran"
+    )
+
+
 def test_the_production_runner_wiring_actually_carries_the_flag(tmp_path):
     """`implement_agent_runner` is the ONE place a write-capable runner is
     built, and the abort only reaches the supervised path. This asserts the
