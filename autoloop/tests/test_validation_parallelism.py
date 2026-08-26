@@ -271,6 +271,12 @@ def test_a_task_declared_command_is_parallelised_by_the_executor(tmp_path):
         agent_runner=FakeAgent(),
         validation_commands=(("ruff", "check", "."),),
         command_runner=runner,
+        # Since advis-01 (2026-08-26) a round whose agent never uses the advisory
+        # channel is handed back once and then WITHHELD from review, and a
+        # withheld round never launches the command whose flags this test reads.
+        # `FakeAgent` cannot ask, so the contract is pinned off here and graded in
+        # `test_agent_self_validation.py` §10a.
+        advisory_zero_call_returns=0,
     )
     outcome = executor.execute(
         Directive(decision=Decision.IMPLEMENT, reason="do it", task_id="rt-01"),

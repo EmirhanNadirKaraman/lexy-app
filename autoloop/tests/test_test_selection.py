@@ -1243,6 +1243,12 @@ def test_the_pre_commit_run_is_not_narrowed_today(tmp_path):
         agent_runner_factory=make_agent_runner_factory(
             write_files={"pkg/publisher.py": "def publish():\n    return 2\n"}
         ),
+        # Since advis-01 (2026-08-26) a round whose agent never uses the advisory
+        # channel is handed back once and then WITHHELD from review — and a
+        # withheld round never reaches the pre-commit validation run this test
+        # measures. `FakeAgentRunner` cannot ask, so the contract is pinned off
+        # here and graded in `test_agent_self_validation.py` §10a.
+        advisory_zero_call_returns=0,
     )
 
     outcome = executor.execute(

@@ -227,6 +227,13 @@ def build_loop(
         agent_runner_factory=factory,
         cleanup_paths_for=cleanup_paths_for if wire_cleanup else None,
         revert_authority=revert_authority,
+        # The scripted agent here indexes its script by CALL and every step is
+        # written as one call per ROUND. Since advis-01 a round whose agent never
+        # uses the advisory channel is handed back once, which would consume the
+        # NEXT round's step. Pinned at zero so each test keeps grading the
+        # mechanism it is about; the hand-back has its own coverage in
+        # `test_agent_self_validation.py` §10a.
+        advisory_zero_call_returns=0,
     )
 
     def no_client():

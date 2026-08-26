@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from autoloop import implement_executor
 from autoloop.audit.agents import AgentResult
 from autoloop.git_gateway import GitGateway
 from autoloop.implement_executor import (
@@ -36,15 +37,20 @@ from autoloop.implement_executor import (
     ADVISORY_RESULT_TMP_FILE,
     ADVISORY_VALIDATION_MAX_CALLS,
     ADVISORY_VALIDATION_TIMEOUT_SECONDS,
+    ADVISORY_ZERO_CALL_RETURNS,
     AdvisoryRendezvous,
     AdvisoryValidation,
     ImplementExecutor,
+    _combined_report,
     _extract_assumptions,
     _extract_cleanup_requests,
+    _extract_delete_requests,
+    _zero_call_return_instruction,
     advisory_tool_descriptor,
     serve_advisory_tool_call,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
+from autoloop.state import EXECUTION_ABORTED
 from autoloop.tasks import Task
 from autoloop.validation import NOT_RUN
 
@@ -157,6 +163,8 @@ def build_executor(
     validation=(),
     command_runner=None,
     advisory_max_calls=ADVISORY_VALIDATION_MAX_CALLS,
+    advisory_zero_call_returns=ADVISORY_ZERO_CALL_RETURNS,
+    abort_file=None,
 ):
     policy = PolicyEngine(PolicyConfig())
     return ImplementExecutor(
@@ -168,6 +176,11 @@ def build_executor(
         policy=policy,
         agent_runner_factory=agent_runner_factory,
         advisory_max_calls=advisory_max_calls,
+        advisory_zero_call_returns=advisory_zero_call_returns,
+        # None (the production default is a real path) means "no abort
+        # capability", which is what every test here wants except the one that
+        # checks an abort outranks the withhold.
+        abort_file=abort_file,
     )
 
 
@@ -261,6 +274,13 @@ def test_the_advisory_run_and_the_executors_own_run_launch_the_same_thing(
         make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}),
         validation=(("ruff", "check", "SOMETHING-ELSE"),),
         command_runner=runner,
+        # `FakeAgentRunner` cannot ask, so since the 2026-08-27 revision this
+        # round would be WITHHELD before the executor's own run and there would
+        # be no authoritative launch to compare against. Pinned off: §10a is
+        # where the withhold is graded, and this test is about the two runs
+        # being one computation. Same reason at every `advisory_zero_call_
+        # returns=0` below.
+        advisory_zero_call_returns=0,
     )
 
     outcome = executor.execute(implement_directive(), task)
@@ -486,6 +506,10 @@ def test_the_executors_own_run_still_happens_and_still_decides(main_repo, worker
         make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}),
         validation=(RUFF,),
         command_runner=runner,
+        # The hand-back/withhold is pinned off here: the advisory run below is
+        # made against a SEPARATE service, so the round's own record would still
+        # read zero and the round would never reach the run this test is about.
+        advisory_zero_call_returns=0,
     )
     task = make_task()
 
@@ -508,6 +532,10 @@ def test_the_rounds_recorded_validation_is_never_the_advisory_text(
         make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}),
         validation=(RUFF,),
         command_runner=RecordingRunner(),
+        # Pinned off: a withheld round records `validation = "not run"`, which is
+        # a true statement about a round that never reached its own run — and not
+        # the recorded-verdict question this test asks.
+        advisory_zero_call_returns=0,
     )
     outcome = executor.execute(implement_directive(), make_task())
 
@@ -535,6 +563,10 @@ def test_the_round_reports_the_count_and_whether_the_last_run_was_green(
         make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}),
         validation=(RUFF,),
         command_runner=RecordingRunner(returncodes=returncodes),
+        # Pinned off so the parametrized status really comes from the executor's
+        # own run. With the withhold live, BOTH cases would end `error` for the
+        # zero requests and this would grade nothing.
+        advisory_zero_call_returns=0,
     )
     outcome = executor.execute(implement_directive(), make_task())
 
@@ -554,6 +586,10 @@ def test_a_failed_agent_round_still_reports_the_channel(main_repo, worker_repo):
 
 
 def test_a_round_that_changed_nothing_still_reports_the_channel(main_repo, worker_repo):
+    """Deliberately NOT pinned: this round makes zero advisory requests too, and
+    the point since the 2026-08-27 revision is that "changed no files" is the
+    MORE fundamental refusal and is still the one reported. The withhold is
+    checked later, and a round that produced nothing never reaches it."""
     executor = build_executor(
         main_repo, worker_repo, make_agent_runner_factory(write_files={}), validation=(RUFF,)
     )
@@ -561,6 +597,7 @@ def test_a_round_that_changed_nothing_still_reports_the_channel(main_repo, worke
 
     assert outcome.status == "error"
     assert "changed no files" in outcome.summary
+    assert "WITHHELD" not in outcome.summary, "the more fundamental refusal was swallowed"
     assert "Agent self-validation:" in outcome.summary
 
 
@@ -580,6 +617,12 @@ def test_a_missing_declared_validation_cwd_still_reports_the_channel(
 
     assert outcome.status == "error"
     assert "does not exist in the worker repo" in outcome.summary
+    # THE SHARPEST ordering case, and also not pinned. An advisory run in this
+    # round could only ever have answered `NOT RUN` naming that directory, so
+    # withholding it for making no request would refuse the round for failing to
+    # obtain evidence it could not obtain — and would tell the reviewer "it never
+    # ran the suite" about a round whose real problem is its own configuration.
+    assert "WITHHELD" not in outcome.summary
     assert "Agent self-validation:" in outcome.summary
 
 
@@ -601,6 +644,11 @@ def test_an_agents_claim_that_it_ran_the_suite_is_not_evidence_that_it_did(
         make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=boast),
         validation=(RUFF,),
         command_runner=RecordingRunner(),
+        # Pinned off so this stays a test about the SUMMARY's provenance on an
+        # ordinary forwarded round. The echo case against the hand-back and the
+        # withhold is `test_a_handback_cannot_be_talked_out_of` in §10a, which
+        # runs at the real allowance.
+        advisory_zero_call_returns=0,
     )
     outcome = executor.execute(implement_directive(), make_task())
 
@@ -1199,3 +1247,953 @@ def test_the_pending_marker_never_reads_as_a_finished_result(worker_repo):
     assert slow.is_set()
     assert seen[0].startswith(f"{ADVISORY_PENDING_PREFIX} #1")
     assert not seen[0].startswith(ADVISORY_RESULT_PREFIX)
+
+
+# ---- 10: a round that never ran the suite, and an ask nobody answered ------
+#
+# advis-01 (2026-08-26; withhold added in the 2026-08-27 revision). Two
+# behaviours over the one contract above:
+#
+#   1. a report that made ZERO advisory requests is handed BACK to the agent
+#      rather than forwarded to the reviewer — bounded, because a refusal that
+#      can loop is strictly worse than the park it replaces — and if the record
+#      STILL shows zero when the allowance is spent, the round is WITHHELD:
+#      `status="error"`, no commit, no candidate, no packet;
+#   2. a request that reached `PENDING #n` and never became `RESULT #n` is
+#      reported as UNANSWERED, distinct from a run that completed and FAILED.
+#
+# Everything below derives from the executor's own counters. The agent's prose is
+# never an input, which is what section 6's echo test already pins for the older
+# half of `note()` and what `test_a_handback_cannot_be_talked_out_of` pins here.
+
+
+#: The first line of the hand-back section, computed from the production
+#: renderer rather than copied — a literal would keep passing after the section
+#: it is supposed to detect had been reworded out from under it.
+HANDBACK_MARK = _zero_call_return_instruction(1, True).splitlines()[0]
+
+
+def _proc(returncode=0, stdout="All checks passed!\n", stderr=""):
+    class Proc:
+        pass
+
+    Proc.returncode = returncode
+    Proc.stdout = stdout
+    Proc.stderr = stderr
+    return Proc
+
+
+class ForgetfulAgentRunner(RendezvousAgentRunner):
+    """An agent that forgets to run the suite until it is handed the round back.
+
+    The FIRST invocation asks nothing at all — which is exactly what the 18
+    never-asked rounds looked like — and every invocation after it asks once,
+    through the same Write/Read rendezvous the parent uses. Nothing here reads a
+    counter or an executor internal: the only thing it keys on is whether the
+    prompt it was handed carries the hand-back section.
+    """
+
+    def __init__(self, *args, fail_when_handed_back=False, reports=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fail_when_handed_back = fail_when_handed_back
+        self.reports = list(reports or [])
+        self.invocations = 0
+        self.handed_back = 0
+
+    def run(self, spec):
+        self.invocations += 1
+        back = HANDBACK_MARK in spec.prompt
+        if back:
+            self.handed_back += 1
+            self.fail = self.fail_when_handed_back
+        # A hand-back that is going to FAIL asks nothing, so that test isolates
+        # the failure path instead of also moving the run counters.
+        self.asks = 1 if back and not self.fail_when_handed_back else 0
+        if self.reports:
+            self.raw_text = self.reports[min(self.invocations - 1, len(self.reports) - 1)]
+        return super().run(spec)
+
+
+def make_forgetful_factory(**kwargs):
+    holder = {}
+
+    def factory(root):
+        holder["agent"] = ForgetfulAgentRunner(worker_repo=root, **kwargs)
+        return holder["agent"]
+
+    return factory, holder
+
+
+# ---- 10a: behaviour 1 — the hand-back, and its bound -----------------------
+
+
+def test_a_round_that_never_ran_the_suite_is_handed_back_to_the_agent(
+    main_repo, worker_repo
+):
+    """THE CLAIM's first half. A report with zero advisory requests does not
+    reach the reviewer as an ordinary candidate: the agent is re-invoked, and on
+    that second invocation it really does run the configured suite."""
+    runner = RecordingRunner()
+    factory, holder = make_forgetful_factory(write_files={"feature.py": "x = 1\n"})
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(RUFF,), command_runner=runner
+    )
+
+    outcome = executor.execute(implement_directive(), make_task())
+    agent = holder["agent"]
+
+    assert agent.invocations == 2, "the zero-request report was forwarded unchecked"
+    assert agent.handed_back == 1
+    assert HANDBACK_MARK not in agent.specs[0].prompt, "invocation 1 is an ordinary one"
+    assert HANDBACK_MARK in agent.specs[1].prompt
+    # It really ran, through the same file rendezvous — two launches, the agent's
+    # and then the executor's own.
+    assert agent.answers[0].startswith(f"{ADVISORY_RESULT_PREFIX} #1")
+    assert [call["argv"] for call in runner.calls] == [RUFF, RUFF]
+    assert outcome.status == "ok"
+    assert "ran the suite 1 time(s)" in outcome.summary
+    assert "handed this round back to the agent 1 time(s)" in outcome.summary
+
+
+def test_the_hand_back_is_bounded_and_a_stubborn_round_is_withheld_from_review(
+    main_repo, worker_repo
+):
+    """THE HARD PART, and the revision's claim in one round.
+
+    An agent that never asks however often it is handed the round back must
+    still END the round — a refusal that can loop would spend the whole round
+    re-invoking and produce nothing, which is worse than the park it replaces.
+    And when the allowance is spent with the record still at zero, the round
+    does NOT go on as an ordinary candidate: it comes back `status="error"`, so
+    `orchestrator._dispatch_task_postcommit` returns at its non-ok test — before
+    the commit, before the packet — and there is nothing for a reviewer to
+    approve. That half is proved end to end in `test_postcommit_flow.py::
+    test_a_round_that_never_ran_the_suite_produces_no_candidate_to_review`.
+    """
+    runner = RecordingRunner()
+    captured = []
+
+    def factory(root):
+        agent = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        captured.append(agent)
+        return agent
+
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(RUFF,), command_runner=runner
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    agent = captured[0]
+    assert agent.specs, "the agent ran at least once"
+    # THE BOUND: one ordinary invocation plus the allowance, and not one more,
+    # whatever the agent does.
+    assert len(agent.specs) == 1 + ADVISORY_ZERO_CALL_RETURNS
+    assert outcome.status == "error", "a zero-request round was forwarded anyway"
+    assert "WITHHELD from review" in outcome.summary
+    # ...and it must not read as a red suite, which is the misreport behaviour 2
+    # exists to stop. Nothing ran at all — no advisory run, and the executor's
+    # own run is never reached.
+    assert "validation failed" not in outcome.summary
+    assert outcome.validation == "not run"
+    assert runner.calls == [], "a withheld round still paid for a validation run"
+    # The measured zero and the spent hand-back are both on the record.
+    assert "0 time(s)" in outcome.summary
+    assert "handed this round back" in outcome.summary
+    # THE ATTEMPT BUDGET. An empty `fault_kind` is what routes this to
+    # `ATTEMPT_TASK`/`executor_reported_failure` in the orchestrator, so a task
+    # whose agent keeps skipping the suite is bounded ACROSS rounds by the
+    # attempt ceiling that already exists. Naming a fault would spend the fault
+    # budget instead and let it refuse forever.
+    assert not outcome.fault_kind
+    # The work is still reported even though it is not committed — the reviewer
+    # of a withheld round gets the same evidence every other uncommitted round
+    # carries.
+    assert outcome.changed_paths == ("feature.py",)
+    assert "feature.py" in outcome.summary
+    assert outcome.assumptions == ()
+
+
+@pytest.mark.parametrize("allowance", [0, -3], ids=["zero", "negative"])
+def test_an_allowance_of_zero_or_less_disables_both_halves(
+    main_repo, worker_repo, allowance
+):
+    """ONE KNOB, ONE MEANING. The allowance gates the hand-back AND the
+    withhold, so zero means "this executor does not enforce the ask" — not
+    "refuse the round without ever telling the agent to run the suite", which
+    would be punishment without notice. A negative reads as zero, never as
+    unbounded.
+
+    This is the only way either half switches off, which is why the shipped
+    value is pinned by the test below."""
+    captured = []
+
+    def factory(root):
+        agent = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        captured.append(agent)
+        return agent
+
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        factory,
+        validation=(RUFF,),
+        command_runner=RecordingRunner(),
+        advisory_zero_call_returns=allowance,
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(captured[0].specs) == 1
+    assert "handed this round back" not in outcome.summary
+    assert "WITHHELD" not in outcome.summary
+    assert outcome.status == "ok"
+
+
+def test_the_shipped_allowance_enforces_the_contract_and_no_operator_can_zero_it():
+    """The guard the test above could otherwise be read as switching off.
+
+    Two facts, and both are needed. The shipped allowance is at least one, so a
+    production round always hands back before it withholds; and the knob is not
+    reachable from configuration — `cli._build_executor` is the only production
+    construction of `ImplementExecutor` and passes neither advisory argument, so
+    no `config.toml` can leave the loop sitting at zero. The only callers that
+    pass anything else are tests whose subject is something else entirely."""
+    assert ADVISORY_ZERO_CALL_RETURNS >= 1
+    cli_source = Path(implement_executor.__file__).with_name("cli.py").read_text(
+        encoding="utf-8"
+    )
+    assert "advisory_zero_call_returns" not in cli_source, (
+        "the allowance became configurable — re-read `ADVISORY_ZERO_CALL_RETURNS`, "
+        "because an operator can now switch both halves of the contract off"
+    )
+
+
+def test_a_round_whose_agent_used_the_channel_is_not_handed_back(
+    main_repo, worker_repo
+):
+    """The unchanged path, and the one that must stay byte-for-byte what it
+    was: one invocation, one report, no hand-back sentence."""
+    agent = None
+
+    def factory(root):
+        nonlocal agent
+        agent = RendezvousAgentRunner(
+            worker_repo=root, asks=1, write_files={"feature.py": "x = 1\n"}
+        )
+        return agent
+
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        factory,
+        validation=(RUFF,),
+        command_runner=RecordingRunner(),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(agent.specs) == 1
+    assert "handed this round back" not in outcome.summary
+    assert "UNANSWERED" not in outcome.summary
+    assert "WITHHELD" not in outcome.summary
+    assert "ran the suite 1 time(s)" in outcome.summary
+    assert "PASSED." in outcome.summary
+    assert outcome.status == "ok"
+
+
+def test_a_failed_agent_is_never_handed_back(main_repo, worker_repo):
+    """A round whose agent failed is already reported as a failure with its
+    partial work measured. Handing it back would replace an honest failure with
+    a second one, and pay for an agent call to do it."""
+    captured = []
+
+    def factory(root):
+        agent = FakeAgentRunner(worker_repo=root, write_files={}, fail=True)
+        captured.append(agent)
+        return agent
+
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(RUFF,), command_runner=RecordingRunner()
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(captured[0].specs) == 1
+    assert outcome.status == "error"
+    assert "agent exploded" in outcome.summary
+    assert "handed this round back" not in outcome.summary
+    # It is refused for the RIGHT reason. A failed agent is not a round that
+    # skipped the suite, and reporting it as one would hide the actual cause.
+    assert "WITHHELD" not in outcome.summary
+
+
+def test_a_hand_back_whose_agent_fails_keeps_the_first_reports_account(
+    main_repo, worker_repo
+):
+    """A TORN HAND-BACK IS NOT THE ROUND'S CAUSE. The surviving claim after the
+    withhold landed: the first invocation returned cleanly, so the round must
+    not be reported as "implementation agent failed" and must not lose that
+    invocation's own account of itself.
+
+    It is still WITHHELD, because `asked` is still zero — a hand-back that fell
+    over changes nothing about the evidence that is missing. Historical: before
+    the 2026-08-27 revision this round was forwarded as an ordinary candidate,
+    on the reasoning that a hand-back must never turn a reviewable round into a
+    failed one. Under the contract it is refused for, it was never a reviewable
+    round."""
+    factory, holder = make_forgetful_factory(
+        write_files={"feature.py": "x = 1\n"},
+        fail_when_handed_back=True,
+        reports=["ASSUMPTION: the first invocation's own account", "torn"],
+    )
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(RUFF,), command_runner=RecordingRunner()
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert holder["agent"].invocations == 2
+    assert outcome.status == "error"
+    assert "WITHHELD from review" in outcome.summary
+    assert "implementation agent failed" not in outcome.summary
+    assert "ended in an agent failure" in outcome.summary
+    assert "0 time(s)" in outcome.summary, "the measured zero still stands"
+    # A torn re-invocation is an agent fault; this round is not. The withhold is
+    # the task's own problem and must keep charging the task's attempts.
+    assert not outcome.fault_kind
+    # The first invocation's report is what the round carries, and the failed
+    # one's text is not.
+    assert "the first invocation's own account" in outcome.details
+    assert "torn" not in outcome.details
+    # Nothing is committed from a withheld round, so nothing is carried forward
+    # about code the reviewer is not being shown — the same rule every other
+    # uncommitted round follows.
+    assert outcome.assumptions == ()
+
+
+def test_every_invocations_report_reaches_the_reviewer_and_none_is_dropped(
+    main_repo, worker_repo
+):
+    """A later report does not supersede an earlier one. `DELETE-FILE:`,
+    `REMOVE-OUT-OF-SCOPE:` and `ASSUMPTION:` are all read out of this text, so
+    keeping only the last would silently drop an authorized deletion the first
+    invocation made.
+
+    The deletion is really PERFORMED here, not merely carried: the task declares
+    the scratch path, invocation 1 asks for it and invocation 2 does not repeat
+    the request, so the file being gone afterwards is only explicable by the
+    first report having survived. `scratch.py` is untracked and removed in the
+    same round, so git has nothing to report and `changed_paths` carries only the
+    file that stayed — which is what makes the round SUMMARY the disclosure."""
+    factory, holder = make_forgetful_factory(
+        write_files={"feature.py": "x = 1\n", "scratch.py": "# temporary\n"},
+        reports=[
+            "ASSUMPTION: read the narrow one\nDELETE-FILE: scratch.py",
+            "ASSUMPTION: and then I ran the suite",
+        ],
+    )
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(RUFF,), command_runner=RecordingRunner()
+    )
+    task = Task(
+        id="t1",
+        title="Add widget",
+        description="Implement the widget feature.",
+        approved_paths=("feature.py", "scratch.py"),
+    )
+
+    outcome = executor.execute(implement_directive(), task)
+
+    assert holder["agent"].invocations == 2
+    assert "DELETE-FILE" not in holder["agent"].reports[1], "invocation 2 never asked"
+    assert not (worker_repo / "scratch.py").exists(), (
+        "the first invocation's authorized deletion was dropped by the hand-back"
+    )
+    assert "DELETED 1 file(s)" in outcome.summary
+    assert "scratch.py" in outcome.summary
+    assert outcome.changed_paths == ("feature.py",)
+    assert "read the narrow one" in outcome.details
+    assert "and then I ran the suite" in outcome.details
+    assert outcome.assumptions == (
+        "read the narrow one",
+        "and then I ran the suite",
+    )
+
+
+def test_the_hand_back_section_is_echo_safe_and_says_not_to_redo_the_work():
+    """Two properties of the text, both of which cost a round when absent.
+
+    A re-invocation is a fresh `claude -p` carrying the whole original brief, so
+    a section that did not say "already implemented, do not redo it" invites a
+    second change note and a duplicated test. And like every other prompt
+    section it must not be quotable back into a disclosure or a deletion
+    request."""
+    text = _zero_call_return_instruction(2, final=True)
+
+    assert _extract_assumptions(text) == ()
+    assert _extract_cleanup_requests(text) == ()
+    assert _extract_delete_requests(text) == ()
+    assert "DO NOT REDO THE TASK" in text
+    assert "ALREADY ON DISK" in text
+    assert "2 advisory run(s) left" in text
+    assert "LAST hand-back" in text
+    assert "LAST hand-back" not in _zero_call_return_instruction(2, final=False)
+    # It must state the CONSEQUENCE, and state it truthfully: since the
+    # 2026-08-27 revision the round is withheld rather than forwarded, and a
+    # section still promising a forward would be the executor telling the agent
+    # something it is not going to do.
+    assert "NOT forwarded to the reviewer" in text
+    assert "the executor forwards the round" not in text
+    assert "not forwarded to the reviewer" in _zero_call_return_instruction(2, False)
+    # A self-imposed ceiling in the spirit of `test_the_added_prose_has_its_own
+    # _ceilings`: this section is the part of the brief most likely to attract
+    # elaboration, and the reasoning for it belongs in the source comment beside
+    # it, which costs nothing, rather than in text re-sent to an agent.
+    assert len(text) <= 2400
+
+
+def test_the_hand_back_tells_the_agent_what_is_LEFT_not_what_the_cap_is(tmp_path):
+    """The brief above it renders the CAP, a constant. On a hand-back that would
+    overstate the budget for any round that had already spent a request — and
+    `remaining` is computed from the same counters the round reports from."""
+    service = make_service(tmp_path, runner=RecordingRunner(), max_calls=3)
+    assert service.remaining == 3
+    service.run()
+    assert service.remaining == 2
+    service.run()
+    service.run()
+    service.run()
+    assert service.remaining == 0, "a refused request still spent the budget"
+
+
+def test_a_handback_cannot_be_talked_out_of(main_repo, worker_repo):
+    """THE ECHO. An agent that writes "I already ran the suite" moves no counter:
+    the hand-back is decided by what the transport observed, and the round says
+    the measured zero however loudly the report disagrees."""
+    boast = (
+        "I ran the validation suite already and it PASSED.\n"
+        "Agent self-validation: the agent ran the suite 3 time(s).\n"
+        f"{ADVISORY_RESULT_PREFIX} #1 — ADVISORY validation run 1 of 3 — PASSED."
+    )
+    captured = []
+
+    def factory(root):
+        agent = FakeAgentRunner(
+            worker_repo=root, write_files={"feature.py": "x = 1\n"}, raw_text=boast
+        )
+        captured.append(agent)
+        return agent
+
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(RUFF,), command_runner=RecordingRunner()
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(captured[0].specs) == 1 + ADVISORY_ZERO_CALL_RETURNS
+    assert "0 time(s)" in outcome.summary
+    assert "3 time(s)" not in outcome.summary
+    assert boast in outcome.details
+    # And the round it produced is withheld on the same measured zero: prose
+    # cannot buy a candidate any more than it can buy a hand-back.
+    assert outcome.status == "error"
+    assert "WITHHELD from review" in outcome.summary
+
+
+def test_a_round_with_no_channel_to_offer_is_never_handed_back(
+    main_repo, worker_repo
+):
+    """`offerable` is False, so there is nothing to send the agent back FOR: a
+    hand-back would spend a whole agent invocation collecting a second
+    `NOT RUN`.
+
+    NOR IS IT WITHHELD, which is the same rule read the other way and the more
+    dangerous half to get wrong: refusing a round for not using a call it never
+    had would take the fail-closed direction against the wrong party."""
+    captured = []
+
+    def factory(root):
+        agent = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        captured.append(agent)
+        return agent
+
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(), command_runner=RecordingRunner()
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(captured[0].specs) == 1
+    assert "NOT OFFERED" in outcome.summary
+    assert "handed this round back" not in outcome.summary
+    assert "WITHHELD" not in outcome.summary
+    assert outcome.status == "ok", outcome.summary
+
+
+class ParkedWatchRendezvous(AdvisoryRendezvous):
+    """An `AdvisoryRendezvous` whose watcher takes exactly ONE poll and is then
+    parked for far longer than a test can last.
+
+    Every test below writes its request AFTER that first poll, so the watcher
+    provably cannot take it: the state under test — a request nobody has
+    consumed — is reached deterministically rather than by winning a race.
+    """
+
+    def __init__(self, service, root, **_kwargs):
+        super().__init__(service, root, poll_seconds=300.0, join_timeout=5.0)
+        self.polled = threading.Event()
+
+    def serve_once(self):
+        served = super().serve_once()
+        self.polled.set()
+        return served
+
+
+def test_a_round_whose_ask_went_unanswered_is_never_withheld(
+    main_repo, worker_repo, monkeypatch
+):
+    """THE INTERACTION between this task's two behaviours, and the one place
+    they could contradict each other.
+
+    port-05 round 1 asked for a run and never got one. Withholding THAT round
+    would punish the agent for the channel's own failure and rebuild, one level
+    up, exactly the misreport behaviour 2 exists to remove. So the withhold is
+    keyed on `asked` — what the transport observed — and never on "no run
+    completed", which would catch this round too.
+
+    It is also the round in which `asked` alone is NOT enough: the hand-back is
+    decided before `stop()` sweeps, so the ask is on the filesystem and not yet
+    on the counter. `ask_outstanding()` is what the loop consults, and the two
+    tests below grade that predicate on its own.
+
+    Deterministic rather than timing-dependent: the watcher is let through
+    exactly ONE poll, which happens before the agent writes anything, and is
+    then parked for far longer than the round can last, so the request provably
+    cannot be taken. `stop()`'s sweep is what sees it — the production path for
+    an ask nobody answered."""
+    made = []
+
+    class RecordedParkedWatch(ParkedWatchRendezvous):
+        def __init__(self, service, root, **kwargs):
+            super().__init__(service, root, **kwargs)
+            made.append(self)
+
+    monkeypatch.setattr(implement_executor, "AdvisoryRendezvous", RecordedParkedWatch)
+
+    class AsksAndGivesUp:
+        """Writes the request with Write, exactly as the brief describes, and
+        returns without ever seeing an answer."""
+
+        def __init__(self, root):
+            self.root = Path(root)
+            self.specs = []
+
+        def run(self, spec):
+            self.specs.append(spec)
+            assert made, "the executor never built a rendezvous"
+            assert made[0].polled.wait(5), "the watcher never took its first poll"
+            (self.root / ADVISORY_REQUEST_FILE).write_text("please run the suite\n")
+            (self.root / "feature.py").write_text("x = 1\n")
+            return AgentResult(
+                domain=spec.domain,
+                raw_text="I asked and nothing came back",
+                returncode=0,
+                duration_seconds=0.1,
+                command=("claude",),
+            )
+
+    captured = []
+
+    def factory(root):
+        agent = AsksAndGivesUp(root)
+        captured.append(agent)
+        return agent
+
+    runner = RecordingRunner()
+    executor = build_executor(
+        main_repo, worker_repo, factory, validation=(RUFF,), command_runner=runner
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(captured[0].specs) == 1, "an unanswered ask was treated as no ask"
+    assert outcome.status == "ok", outcome.summary
+    assert "WITHHELD" not in outcome.summary
+    assert "UNANSWERED" in outcome.summary
+    assert "no answer landed" in outcome.summary
+    # The executor's own run still happened, and it is still the verdict.
+    assert [call["argv"] for call in runner.calls] == [RUFF]
+
+
+def test_an_unconsumed_ask_is_visible_before_the_sweep_counts_it(worker_repo):
+    """THE GATE the test above stands on, at the rendezvous level.
+
+    `record_request_asked` fires when the watcher TAKES a request or, failing
+    that, when `stop()` finds one still in the tree — and `stop()` does not run
+    until the round is over. So between the agent writing its request and the
+    sweep, `AdvisoryValidation.asked` is still zero and only the filesystem
+    knows an ask happened. `ask_outstanding()` is what the hand-back decision
+    reads instead, and without it a round hands itself back to an agent that
+    asked and was never answered.
+
+    Both of `stop()`'s own gates are inherited rather than restated: residue
+    from a round that never watched is not an ask (`_started`), and the broken
+    channel is `test_a_broken_channel_leaves_no_outstanding_ask_to_count_twice`.
+    """
+    service = make_service(worker_repo)
+    rendezvous = ParkedWatchRendezvous(service, worker_repo)
+
+    # Residue from a round that died: an entry is present, but this rendezvous
+    # has never watched, so it is nobody's ask.
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("from a round that died\n")
+    assert rendezvous.ask_outstanding() is False
+
+    rendezvous.start()  # sweeps that residue away, then watches
+    assert rendezvous.polled.wait(5), "the watcher never took its first poll"
+    assert rendezvous.ask_outstanding() is False, "nothing has been asked yet"
+
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("please run the suite\n")
+
+    assert rendezvous.ask_outstanding() is True
+    assert service.asked == 0, "the counter cannot see it until the sweep"
+
+    rendezvous.stop()
+
+    assert service.asked == 1, "the sweep is what counts it, exactly as before"
+    assert rendezvous.ask_outstanding() is False, "the sweep took the file"
+
+
+def test_a_broken_channel_leaves_no_outstanding_ask_to_count_twice(
+    worker_repo, monkeypatch
+):
+    """The `_broken` gate, which is the double-count this predicate would
+    otherwise introduce.
+
+    That branch has already recorded its ask AND answered it, and the file it
+    could not remove is that same request — so it is not an outstanding one.
+    Reporting it as outstanding would suppress a hand-back on the strength of a
+    request the agent was already told about, and `stop()` would count the ask a
+    second time."""
+    service = make_service(worker_repo, runner=RecordingRunner())
+    rendezvous = ParkedWatchRendezvous(service, worker_repo)
+    rendezvous.start()
+    assert rendezvous.polled.wait(5), "the watcher never took its first poll"
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("please run the suite\n")
+
+    real = implement_executor._remove_entry
+    monkeypatch.setattr(
+        implement_executor,
+        "_remove_entry",
+        lambda path: False if path.name == ADVISORY_REQUEST_FILE else real(path),
+    )
+    # Served by hand: the watcher is parked inside `_stopping.wait(300)` and
+    # reaches no file operation until `stop()`, so patching a module global
+    # while it is alive races nothing.
+    assert rendezvous.serve_once() is False
+    monkeypatch.undo()
+
+    assert (worker_repo / ADVISORY_REQUEST_FILE).exists(), "the branch under test"
+    assert service.asked == 1, "the broken branch counted the ask it answered"
+    assert service.delivered == 1
+    assert rendezvous.ask_outstanding() is False
+
+    rendezvous.stop()
+
+    assert service.asked == 1, "counted once, never twice"
+    assert service.unanswered == 0
+
+
+def test_the_ask_is_recorded_before_the_request_file_is_removed():
+    """The line order the hand-back gate's race argument rests on, and the one
+    way it could fail OPEN.
+
+    `_run_implementation` checks `ask_outstanding()` BEFORE `advisory.asked`,
+    which is safe only because `_take_request` counts the ask before it removes
+    the file: a request that is already gone was already counted. Swap those two
+    lines and a request consumed between the two reads becomes no ask at all —
+    the round is handed back to an agent that asked, and nothing else in the
+    code says why."""
+    source = inspect.getsource(AdvisoryRendezvous._take_request)
+
+    assert source.index("record_request_asked") < source.index("_remove_entry(path)")
+
+
+def test_an_abort_outranks_the_withhold(main_repo, worker_repo, tmp_path):
+    """An operator who pressed the button is not handed a charged failure.
+
+    The abort check runs BEFORE the withhold, so a round stopped mid-flight
+    reports itself as aborted — which costs the task no attempt. The other order
+    would build an `attempt_count_ceiling` out of the operator's own button,
+    which is the abort-01 failure mode wearing this feature's name."""
+    abort_file = tmp_path / "ABORT"
+
+    class ArmsTheAbort(FakeAgentRunner):
+        def run(self, spec):
+            result = super().run(spec)
+            abort_file.touch()
+            return result
+
+    captured = []
+
+    def factory(root):
+        agent = ArmsTheAbort(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        captured.append(agent)
+        return agent
+
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        factory,
+        validation=(RUFF,),
+        command_runner=RecordingRunner(),
+        abort_file=abort_file,
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(captured[0].specs) == 1, "the operator's stop paid for a hand-back"
+    assert outcome.status == EXECUTION_ABORTED, outcome.summary
+    assert "WITHHELD" not in outcome.summary
+    # The zero is still on the record — the round says what it did, it just does
+    # not blame the agent for a round the operator ended.
+    assert "0 time(s)" in outcome.summary
+
+
+def test_a_single_report_round_carries_exactly_the_text_it_always_did():
+    """`_combined_report` must be the identity for every round that was never
+    handed back, which is every round in which the agent used the channel."""
+    assert _combined_report(["only this"]) == "only this"
+    assert _combined_report([]) == ""
+    assert _combined_report(["", "only this"]) == "only this"
+    joined = _combined_report(["first", "second"])
+    assert joined.startswith("first")
+    assert joined.endswith("second")
+    assert _extract_assumptions(joined) == ()
+
+
+# ---- 10b: behaviour 2 — an ask that never became an answer -----------------
+
+
+def test_a_request_that_never_became_a_result_is_reported_as_unanswered(worker_repo):
+    """THE CLAIM's second half, in its simplest shape: `PENDING #1` was written,
+    the round ended, no `RESULT #1` ever landed."""
+    release = threading.Event()
+    started = threading.Event()
+
+    def blocking_runner(argv, **kwargs):
+        started.set()
+        release.wait(10)
+        return _proc()
+
+    service = make_service(worker_repo, runner=blocking_runner)
+    rendezvous = AdvisoryRendezvous(
+        service, worker_repo, poll_seconds=0.01, join_timeout=0.05
+    )
+    rendezvous.start()
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("go\n")
+    assert started.wait(5), "the advisory run must have begun"
+
+    rendezvous.stop()
+    note = service.note()
+
+    assert service.asked == 1
+    assert service.delivered == 0
+    assert service.unanswered == 1
+    assert "UNANSWERED" in note
+    assert "no answer landed" in note
+    assert "not a pass" in note.lower()
+    release.set()
+
+
+def test_a_stale_failed_verdict_is_not_reported_as_the_rounds_last_run(worker_repo):
+    """PORT-05 ROUND 1, reproduced. The agent asked for run #2, never got it,
+    and the round reported run #1's `FAILED` as "its last run FAILED" — so the
+    reviewer refused work that was never shown to be defective. Both facts must
+    now be present, and the stale one must not be the headline."""
+    release = threading.Event()
+    second_started = threading.Event()
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(tuple(argv))
+        if len(calls) == 1:
+            return _proc(returncode=1, stdout="", stderr="boom\n")
+        second_started.set()
+        release.wait(10)
+        return _proc()
+
+    service = make_service(worker_repo, runner=runner)
+    rendezvous = AdvisoryRendezvous(
+        service, worker_repo, poll_seconds=0.01, join_timeout=0.05
+    )
+    rendezvous.start()
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("first\n")
+    deadline = time.monotonic() + 5
+    while service.delivered < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert service.delivered == 1, "the first answer must have landed"
+
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("second\n")
+    assert second_started.wait(5), "the second run must have begun"
+    rendezvous.stop()
+    note = service.note()
+
+    assert service.asked == 2
+    assert service.unanswered == 1
+    assert "UNANSWERED" in note
+    assert "no answer landed" in note
+    # The completed red run is still reported — suppressing it would be the
+    # opposite error — but it is no longer the round's stated state.
+    assert "FAILED" in note
+    assert "its last run FAILED" not in note
+    release.set()
+
+
+def test_an_ask_the_watcher_never_took_is_still_an_ask(worker_repo):
+    """THE SWEPT-EVIDENCE CASE, and the fail-open this design would otherwise
+    have. A request the watcher never takes is deleted by `stop()`'s sweep — and
+    with it the only trace that the agent asked. If the count came from
+    `_take_request` alone, the round would report the older run's verdict as its
+    state and the alarm would never fire.
+
+    Deterministic rather than timing-dependent: the watcher is held INSIDE a
+    blocking run, so the second request provably cannot be taken."""
+    release = threading.Event()
+    started = threading.Event()
+
+    def blocking_runner(argv, **kwargs):
+        started.set()
+        release.wait(10)
+        return _proc()
+
+    service = make_service(worker_repo, runner=blocking_runner)
+    rendezvous = AdvisoryRendezvous(
+        service, worker_repo, poll_seconds=0.01, join_timeout=0.05
+    )
+    rendezvous.start()
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("first\n")
+    assert started.wait(5), "the watcher must be occupied inside the run"
+    # `_take_request` removed the first one, so this is a NEW file, and the
+    # watcher cannot reach it — it is still inside the run above.
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("second\n")
+
+    rendezvous.stop()
+
+    assert service.asked == 2, "the ask the sweep was about to delete still counts"
+    assert service.delivered == 0
+    assert service.unanswered == 2
+    assert "UNANSWERED" in service.note()
+    assert not (worker_repo / ADVISORY_REQUEST_FILE).exists()
+    release.set()
+
+
+def test_residue_from_a_dead_round_is_not_counted_as_this_rounds_ask(worker_repo):
+    """The other direction, and the reason the sweep-time count is gated on
+    `start()`. A request file left by a round that died is residue, not an ask,
+    and inventing an UNANSWERED from it would be this report crying wolf.
+
+    (`note()` here says NOT OFFERED for the separate reason that nothing exposed
+    the channel; the counter is the claim.)"""
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("from a round that died\n")
+    service, rendezvous = make_rendezvous(worker_repo)
+
+    rendezvous.stop()
+
+    assert service.asked == 0
+    assert service.unanswered == 0
+    assert "UNANSWERED" not in service.note()
+    assert not (worker_repo / ADVISORY_REQUEST_FILE).exists()
+
+
+def test_a_completed_failing_run_is_reported_as_failed_and_not_as_unanswered(
+    worker_repo,
+):
+    """The distinction this whole half exists for: a run that COMPLETED and went
+    red is evidence, and must keep saying so."""
+    service, rendezvous = make_rendezvous(
+        worker_repo, runner=RecordingRunner(returncodes=(1,))
+    )
+    rendezvous.start()
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("go\n")
+    deadline = time.monotonic() + 5
+    while service.delivered < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    rendezvous.stop()
+    note = service.note()
+
+    assert service.asked == 1
+    assert service.delivered == 1
+    assert service.unanswered == 0
+    assert "UNANSWERED" not in note
+    assert "its last run FAILED." in note
+
+
+def test_a_broken_channel_answers_the_agent_and_is_not_reported_unanswered(
+    worker_repo, monkeypatch
+):
+    """A `NOT RUN` refusal IS an answer: the agent was told. It must not read as
+    a run (nothing executed), it must not read as UNANSWERED, and it must not
+    move `requests` — which is precisely why the hand-back is keyed on `asked`
+    and not on `requests`: this agent asked and did nothing wrong."""
+    runner = RecordingRunner()
+    service, rendezvous = make_rendezvous(worker_repo, runner=runner)
+    # `expose()` directly rather than `start()`, because `start()` sweeps first
+    # and the watcher would race this single hand-driven `serve_once`.
+    service.expose()
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("please run the suite\n")
+
+    real = implement_executor._remove_entry
+    monkeypatch.setattr(
+        implement_executor,
+        "_remove_entry",
+        lambda path: False if path.name == ADVISORY_REQUEST_FILE else real(path),
+    )
+    assert rendezvous.serve_once() is False
+    monkeypatch.undo()
+    rendezvous.stop()
+    note = service.note()
+
+    assert service.asked == 1
+    assert service.delivered == 1
+    assert service.unanswered == 0
+    assert service.requests == 0, "nothing was ever handed to the bound call"
+    assert service.runs == 0
+    assert runner.calls == []
+    assert "UNANSWERED" not in note
+    assert "asked 1 time(s)" in note
+
+
+def test_an_unanswered_ask_with_no_completed_run_says_so_without_a_verdict(worker_repo):
+    """No run ever completed, so there is no verdict to report — and the note
+    must not manufacture one in either direction."""
+    release = threading.Event()
+    started = threading.Event()
+
+    def blocking_runner(argv, **kwargs):
+        started.set()
+        release.wait(10)
+        return _proc()
+
+    service = make_service(worker_repo, runner=blocking_runner)
+    rendezvous = AdvisoryRendezvous(
+        service, worker_repo, poll_seconds=0.01, join_timeout=0.05
+    )
+    rendezvous.start()
+    (worker_repo / ADVISORY_REQUEST_FILE).write_text("go\n")
+    assert started.wait(5)
+    rendezvous.stop()
+    note = service.note()
+
+    assert "UNANSWERED" in note
+    assert "ran 0 time(s)" in note
+    assert "PASSED" not in note
+    assert "FAILED" not in note
+    release.set()
+
+
+def test_an_unoffered_round_still_says_not_offered_whatever_the_counters_hold(
+    worker_repo,
+):
+    """`NOT OFFERED` is a fact about the ROUND and outranks every counter below
+    it: a channel the agent could not reach must never be reported as one it
+    used badly."""
+    service = make_service(worker_repo)
+    service.record_request_asked()
+
+    note = service.note()
+
+    assert "NOT OFFERED" in note
+    assert "UNANSWERED" not in note
+    assert "could not" in note

@@ -746,6 +746,13 @@ def test_post_commit_reruns_the_tasks_own_validation_not_the_audit_set(tmp_path)
             agent_runner_factory=lambda root: _WritingAgent(
                 lambda _t: root, "t1", "src/thing.py"
             ),
+            # Since advis-01 (2026-08-26) a round whose agent never uses the
+            # advisory channel is handed back once and then WITHHELD from review.
+            # `_WritingAgent` cannot ask, and this test is about which validation
+            # commands reach the pre- and post-commit gates — a withheld round
+            # runs neither. Pinned off; the contract is graded in
+            # `test_agent_self_validation.py` §10a.
+            advisory_zero_call_returns=0,
         )
 
     orch, repo_root, worktrees, execution_store, _intents, _task = build_postcommit(
@@ -775,6 +782,81 @@ def test_post_commit_reruns_the_tasks_own_validation_not_the_audit_set(tmp_path)
     # task re-runs the same thing rather than falling back.
     execution = execution_store.load("t1")
     assert execution.validation_commands == DECLARED
+
+
+def test_a_round_that_never_ran_the_suite_produces_no_candidate_to_review(tmp_path):
+    """advis-01 (revision, 2026-08-27), END TO END: a round whose agent never
+    used the advisory validation channel does not reach the reviewer.
+
+    The executor-level half — the bounded hand-back, and the `status="error"`
+    that follows a record still showing zero — is graded in
+    `test_agent_self_validation.py` §10a. What only this file can show is the
+    CONSEQUENCE, through the real orchestrator: `_dispatch_task_postcommit`
+    returns at its non-ok test, so no commit is made, no `candidate_sha` is
+    recorded, no `CommitIntent` survives and no review round is opened. There is
+    nothing for an approval to publish.
+
+    And the existing machinery is what bounds a repeat: the round is charged to
+    the TASK's attempt budget (`executor_reported_failure`), not to the fault
+    budget, so a task whose agent keeps skipping the suite walks into the
+    `attempt_count_ceiling` park that already exists rather than looping
+    forever. No new park kind, no orchestrator change.
+
+    `_WritingAgent` writes with no advisory request, exactly like the 18
+    never-asked rounds, and the DEFAULT allowance is used deliberately — this
+    test is about what production does.
+    """
+    from autoloop.implement_executor import ImplementExecutor
+
+    calls: list[tuple[str, ...]] = []
+
+    def recorder(argv, **kwargs):
+        calls.append(tuple(argv))
+
+        class Proc:
+            returncode = 0
+            stdout = "ok\n"
+            stderr = ""
+
+        return Proc()
+
+    def make_executor(worktrees):
+        return ImplementExecutor(
+            git=GitGateway(tmp_path / "repo", PolicyEngine(PolicyConfig())),
+            agent_runner=_WritingAgent(worktrees.path_for, "t1", "src/thing.py"),
+            validation_commands=(("ruff", "check", "."),),
+            command_runner=recorder,
+            worker_repo_root_for=worktrees.path_for,
+            policy=PolicyEngine(PolicyConfig()),
+            agent_runner_factory=lambda root: _WritingAgent(
+                lambda _t: root, "t1", "src/thing.py"
+            ),
+        )
+
+    orch, _repo, _worktrees, execution_store, intent_store, task = build_postcommit(
+        tmp_path,
+        executor=None,
+        validation_runner=recorder,
+        approved_paths=("src/thing.py",),
+        executor_factory=make_executor,
+    )
+
+    orch._dispatch_executor(implement(task.id))
+
+    execution = execution_store.load(task.id)
+    assert execution is not None
+    assert execution.candidate_sha == "", "a zero-request round produced a candidate"
+    assert execution.review_round == 0, "a zero-request round opened a review"
+    assert intent_store.load(task.id) is None
+    # Neither validation gate ran: the executor short-circuits before its own
+    # run, and the post-commit re-run needs a commit that was never made.
+    assert calls == []
+    # Charged to the task, by the existing route, with the existing reason.
+    assert execution.attempt_count == 1
+    assert execution.fault_attempt_count == 0
+    assert "executor_reported_failure" in execution.attempt_ledger[-1]
+    # The reviewer is TOLD — they are simply not shown a candidate.
+    assert "WITHHELD from review" in orch.state.outbox
 
 
 def test_post_commit_validation_honours_the_declared_cwd(tmp_path):

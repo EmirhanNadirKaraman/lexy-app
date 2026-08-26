@@ -140,6 +140,15 @@ def build_executor(main_repo, worker_repo, agent_runner_factory, validation=(), 
         worker_repo_root_for=lambda task_id: worker_repo,
         policy=policy,
         agent_runner_factory=agent_runner_factory,
+        # Since advis-01 (2026-08-26) a round whose agent never uses the advisory
+        # validation channel is handed back once and then WITHHELD from review
+        # (`status="error"`, no candidate). Every stand-in agent in this file is
+        # a plain `FakeAgentRunner` that cannot ask, and this file grades the
+        # executor's OTHER behaviours — prompt, scope, partial work, validation.
+        # Pinned at zero so those keep being graded; the contract itself is
+        # graded in `test_agent_self_validation.py` §10a, which passes its own
+        # allowance explicitly.
+        advisory_zero_call_returns=0,
     )
 
 
