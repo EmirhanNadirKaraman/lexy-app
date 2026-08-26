@@ -382,6 +382,55 @@ test_selection = "reachable"
 # `reprovision-publisher --confirm` — an operator confirming that a new push
 # destination is correct — so it is set aside without a retry and nothing is
 # pushed.
+#
+# THE SECOND HALF (halt-03, 2026-08-25): STALE RECORDS, rebuilt at the current
+# head. Six more codes — task_base_behind_head, push_candidate_stale,
+# push_candidate_unresolvable, state_inconsistent, audit_revise_no_record and
+# changeset_binding_missing — whose fault is not a transport fault at all but a
+# record the loop is still holding that no longer describes anything. Each of
+# them ARCHIVES that record, REBUILDS at the current head and RE-DISPATCHES,
+# which is exactly what an operator does by hand today: measured 2026-08-24,
+# task_base_behind_head was the second largest cause of parked time (15 parks,
+# 18.5h) at a MEDIAN of 0.54h — cleared as fast as it was seen.
+#
+# NOTHING IS DELETED. An execution record is archived to executions/archive/ and
+# its worker repository quarantined, both under one label, through the same
+# `release_task_to_pending` path the reviewer's `recut` uses — with the same
+# refusals (a published candidate, a candidate whose verdict is still in flight,
+# a record that cannot be read, an operator hold) and the same per-task cap. A
+# session pointer that has no on-disk form is written to the transcript before
+# it is cleared, so an operator's queued `review-changeset` can never evaporate
+# with nothing saying so. Any refusal falls through to the park the loop has
+# today, with the question it always had, and says so in the transcript.
+#
+# NOTHING AN OPERATOR QUEUED IS DROPPED TO GET THE LOOP MOVING EITHER.
+# changeset_binding_missing is the one code here whose stale record is the
+# PACKET rather than the record it names: the queued review stays exactly as it
+# was and the packet is re-rendered from the immutable git objects, so the next
+# round presents the same candidate under a binding an approval can still
+# resolve. The four identifiers are read only off the queued entry — never
+# re-derived from the checkout's current branch, which could rebind a candidate
+# to a destination nobody named — and a packet that cannot be rendered, or that
+# comes back without them, parks instead of being sent.
+#
+# The one path that CAN drop a queued review is the changeset arm of
+# push_candidate_unresolvable, and it acts only on git's own answer: the
+# repository must report that its object database does not hold the reviewed
+# candidate. No gateway to ask, a probe that died, a checkout that is not there,
+# an entry nothing can read or one naming no candidate at all are UNANSWERED
+# questions rather than answers, and each parks with the review exactly where it
+# was. That record exists nowhere else once the state file is rewritten, so it is
+# destroyed on evidence or not at all.
+#
+# AND NOTHING IS LEFT UNPUBLISHABLE. The two push_candidate_* codes hold a stale
+# APPROVAL BINDING rather than a record, and dropping one is only half a remedy:
+# the candidate the task still holds would have no packet a later approval could
+# name, so the loop would have moved while making the operator's job harder.
+# Both instead RE-PRESENT that candidate — a freshly rendered review packet,
+# checked before it is sent to carry everything the next round binds on — so the
+# very next verdict can publish it. Where nothing can be re-presented because the
+# recorded candidate itself no longer resolves, the record is archived and the
+# task requeued through the same path as above, never re-dispatched blind.
 enabled = false
 
 # A CEILING on the per-code retry budgets in blockers.AUTONOMOUS_RECOVERIES,

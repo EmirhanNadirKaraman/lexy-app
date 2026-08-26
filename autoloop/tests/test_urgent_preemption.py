@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from autoloop import cli, orchestrator as orchestrator_module
+from autoloop import cli, execution_records, orchestrator as orchestrator_module
 from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
 from autoloop.contract import RETIRED_DECISIONS, Decision, Directive
 from autoloop.errors import GitCommandError, TaskGraphError, TemplateError
@@ -461,7 +461,12 @@ def test_a_resumable_residue_is_left_paired_so_the_next_dispatch_continues_it(
     into the directory that is still there, discarding a round that could have
     been continued. The record goes back beside it instead, which is exactly
     what a killed round leaves."""
-    monkeypatch.setattr(orchestrator_module, "worker_repo_is_reusable", lambda p, b: True)
+    # Patched on `execution_records`, which is where `_worker_can_resume`
+    # resolves the probe since shrink-01 (2026-08-26) lifted the release path
+    # out of `orchestrator`. Patching `orchestrator` instead reaches only the
+    # dispatch-side calls, which this path never runs — the assertions below
+    # would then fail against the real probe, which refuses this worker.
+    monkeypatch.setattr(execution_records, "worker_repo_is_reusable", lambda p, b: True)
     workers = FlakyWorkerRepos(
         WorkerRepoManager(config.workers_root, config.worker_hooks_dir), failures=2
     )

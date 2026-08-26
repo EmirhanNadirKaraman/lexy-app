@@ -388,8 +388,9 @@ class AuditConfig:
 
 @dataclass(frozen=True)
 class AutonomyConfig:
-    """`[autonomy]` — how the loop behaves when a transport or environment
-    fault would otherwise park it for a human (halt-02, 2026-08-25).
+    """`[autonomy]` — how the loop behaves when a fault it already knows the
+    remedy for would otherwise park it for a human (halt-02 / halt-03,
+    2026-08-25).
 
     OFF BY DEFAULT, and the default is the compatibility contract: with this
     section absent — which is every existing config file, since the template is
@@ -399,8 +400,17 @@ class AutonomyConfig:
     here forecloses the current behaviour.
 
     What `enabled` switches on is described by `blockers.AUTONOMOUS_RECOVERIES`,
-    which is an ALLOWLIST of six codes and cannot reach
-    `blockers.HARD_HALT_CODES` at all.
+    an ALLOWLIST with two halves and TWELVE codes in total, which cannot reach
+    `blockers.HARD_HALT_CODES` at all:
+
+    * `blockers.TRANSPORT_RECOVERIES` (halt-02) — six transport or environment
+      faults, answered by re-entering the recovery path that already exists and
+      then setting the one task in flight aside;
+    * `blockers.STALE_RECORD_RECOVERIES` (halt-03) — six faults whose cause is a
+      RECORD that no longer describes anything, answered by archiving that
+      record, rebuilding at the current head and re-dispatching. The archival
+      is recut-01's `release_task_to_pending`, refusals and cap included; no
+      second archival mechanism exists.
     """
 
     #: The flag. False means "park exactly as today" at every site.
@@ -408,8 +418,10 @@ class AutonomyConfig:
     #: A CEILING on the per-code retry budgets in `blockers.AUTONOMOUS_
     #: RECOVERIES`, never a floor: the effective budget is `min(the code's
     #: own max_attempts, this)`. So lowering it to 0 keeps the set-aside
-    #: behaviour while performing no retries at all, and raising it above a
-    #: code's own number changes nothing — a config value can restrain the
+    #: behaviour while performing no retries at all — and, since halt-03,
+    #: performs no REBUILD either, which is how an operator switches the
+    #: automatic archival off without switching autonomy off. Raising it above
+    #: a code's own number changes nothing: a config value can restrain the
     #: table, never widen it. Two by default, matching the largest number the
     #: table actually asks for.
     max_recovery_attempts: int = 2
