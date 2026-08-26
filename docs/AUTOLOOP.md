@@ -6513,26 +6513,80 @@ ONE case moves that 93% by about seven points. The theming was a keyword pass,
 not the loop's own `reasons.py` classifier. The relationship is correlational.
 What makes it actionable is the specific signature, not the size of the gap.
 
-**Behaviour 1 — a zero-request report is handed back, once.**
-`_run_implementation` re-invokes the agent when `AdvisoryValidation.asked` is
-zero, under four conditions: the channel was offerable, the first invocation
-succeeded, the transport observed no request, and no abort is in effect.
-`ADVISORY_ZERO_CALL_RETURNS` (1) is the whole allowance.
+**Behaviour 1 — a zero-request report is handed back, once, and then withheld.**
+`_run_implementation` re-invokes the agent when NO ask is on the record, under
+five conditions: the channel was offerable, the first invocation succeeded, no
+unconsumed request is sitting on the request path, the transport observed no
+request (`AdvisoryValidation.asked` is zero), and no abort is in effect.
+`ADVISORY_ZERO_CALL_RETURNS` (1) is the whole allowance, and a round whose record
+still shows zero when it is spent does not reach the reviewer at all.
 
+* **The counter alone is not the whole of "no ask", and the gap is timing**
+  (revision, 2026-08-27). `record_request_asked` fires when the watcher TAKES a
+  request or, failing that, when `stop()` finds one still in the tree — and
+  `stop()` runs in the `finally` AFTER the hand-back decision. So a request the
+  agent wrote and nobody took has moved no counter yet, and a loop keyed on
+  `asked` alone would hand the round back to an agent that asked and was never
+  answered, which is the round behaviour 2 exists for.
+  `AdvisoryRendezvous.ask_outstanding()` is the missing half: the same predicate
+  `stop()` already counted on (`_started`, not `_broken`, an entry present),
+  exposed read-only so that nothing is counted twice. It is checked BEFORE the
+  counter, because `_take_request` records the ask before it removes the file —
+  so a file that is already gone was already counted, while the other order
+  leaves a window in which a consumed request reads as no ask at all. The
+  WITHHOLD needs no companion: `stop()` has swept by the time it is read.
 * **The bound is the hard part, not the hand-back.** A refusal that can loop is
   strictly worse than the forward it replaces — it spends the round re-invoking
   and produces nothing. The counter lives in `_run_implementation`, is
   incremented BEFORE each re-invocation, and is never derived from anything the
   agent wrote, so the loop ends after `max_returns` iterations whatever the
   agent does. A negative allowance reads as zero, never as unbounded.
-* **Once the allowance is spent the round proceeds exactly as it did before.**
-  The report is forwarded, and `note()` records both the measured zero and the
-  hand-back that failed to change it.
+* **Once the allowance is spent and the record still shows zero, the round is
+  WITHHELD** (revision, 2026-08-27). Forwarding it anyway would give away the
+  whole finding: this is exactly the round the measurement says the reviewer
+  refuses. The mechanism is the one every other refusal in `_run_implementation`
+  already uses — `status="error"` with NO `fault_kind` — so
+  `_dispatch_task_postcommit` returns at its `status != "ok"` test, before the
+  commit and before any packet: no candidate, no review round, no
+  `CommitIntent`. The reviewer is still TOLD (the summary goes out through the
+  `implementation_review` template); they are simply not shown a candidate.
+  `note()` still records the measured zero and the spent hand-back.
+* **It is charged to the TASK, not to the fault budget.** An empty `fault_kind`
+  routes the round to `ATTEMPT_TASK`/`executor_reported_failure`, so a task whose
+  agent keeps skipping the suite walks into the `attempt_count_ceiling` park that
+  already exists. This adds no park kind and changes no orchestrator code — the
+  existing park is reached by the existing route. Naming a fault would spend the
+  fault budget instead and let a stubborn task refuse forever, which is the one
+  genuine fail-open in the design.
+* **The allowance is ONE KNOB with ONE MEANING.** It gates the hand-back and the
+  withhold together. Zero therefore means "this executor does not enforce the
+  ask at all" — not "refuse without ever telling the agent to run the suite",
+  which would be punishment without notice. The shipped value is 1 and is not
+  reachable from `config.toml`: `cli._build_executor` passes neither advisory
+  argument, and a test asserts both facts.
 * **A hand-back can never make a round worse.** If the re-invoked agent fails,
-  the FIRST invocation's result is kept and the round still commits — turning a
-  reviewable round into an "implementation agent failed" would be this feature
-  causing the loss it exists to prevent. The failed invocation's text is not
-  carried.
+  the FIRST invocation's result and report are kept — the round is never
+  reported as "implementation agent failed" when the first agent returned
+  cleanly, and the failed invocation's text is not carried. It is still withheld,
+  because `asked` is still zero: a hand-back that fell over changes nothing about
+  the evidence that is missing.
+* **Three rounds are NOT withheld**, and each is a different party's failure:
+  one whose channel was never offerable (`NOT OFFERED` — refusing it would take
+  the fail-closed direction against the wrong party), one whose ask went
+  UNANSWERED (`asked >= 1` — that is port-05's round, and withholding it would
+  rebuild the misreport behaviour 2 removes), and one an operator aborted (the
+  abort check runs first, so no attempt is charged for the button).
+* **The check sits late, just before the authoritative run**, because three
+  refusals above it are about something more fundamental than missing evidence
+  and would otherwise be swallowed: a failed agent, a round that changed no
+  files, and a declared `validation_cwd` that does not exist. The last is the
+  sharpest — an advisory run there could only ever have answered `NOT RUN`
+  naming that directory, so withholding would blame the agent for a
+  configuration problem. What the placement does skip is the expensive part: the
+  authoritative suite, for a candidate that will not exist. The deletion,
+  cleanup and restore passes have already run by then, so their notes are
+  threaded into the withheld summary exactly as they are into a failed-validation
+  one.
 * **Every completed invocation's report reaches the reviewer** via
   `_combined_report`, in order. A later report supersedes nothing:
   `DELETE-FILE:`, `REMOVE-OUT-OF-SCOPE:`, `REVERT-OUT-OF-SCOPE:` and
@@ -6569,7 +6623,10 @@ answer landed" — distinct from a run that completed and FAILED.
   the opposite error.
 * **`asked`, not `requests`, decides both.** The broken-channel branch answers
   the agent without ever calling `run()`, so a hand-back keyed on `requests`
-  would re-invoke an agent that asked, was answered, and did nothing wrong.
+  would re-invoke an agent that asked, was answered, and did nothing wrong. The
+  hand-back reads `ask_outstanding()` alongside it for the timing reason
+  behaviour 1 records; the withhold and `note()` read the counter alone, because
+  both run after the sweep that fills it.
 
 **Nothing about the posture moves.** No tool is added, `WRITE_ALLOWED_TOOLS` and
 `IMPLEMENT_DISALLOWED_TOOLS` are unchanged, `Bash` stays disallowed, no flag is
@@ -6582,7 +6639,11 @@ to the full suite on essentially every round, pressing agents to ask made the
 "never landed" failure mode MORE common, not less. Narrow selection first, then
 require the ask.
 
-Pinned by `autoloop/tests/test_agent_self_validation.py` section 10.
+Pinned by `autoloop/tests/test_agent_self_validation.py` section 10, and — for
+the consequence only the orchestrator can show — by
+`test_postcommit_flow.py::test_a_round_that_never_ran_the_suite_produces_no_candidate_to_review`,
+which drives a real dispatch and asserts no `candidate_sha`, no review round, no
+`CommitIntent`, neither validation gate run, and the attempt charged to the task.
 
 ---
 

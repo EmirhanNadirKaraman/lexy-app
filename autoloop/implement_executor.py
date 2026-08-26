@@ -181,9 +181,10 @@ five times and it was green" moves no number here. It also distinguishes
 "offered and unused" from NOT OFFERED, because a guard nobody could reach must
 not read as one nobody wanted.
 
-**A round that never ran the suite goes BACK to the agent, once; an ask that
-was never answered says so** (advis-01, 2026-08-26). Two behaviours over the
-one contract above, both keyed on counters this module owns.
+**A round that never ran the suite goes BACK to the agent once and is then
+WITHHELD; an ask that was never answered says so** (advis-01, 2026-08-26;
+withhold added by the 2026-08-27 revision). Two behaviours over the one contract
+above, both keyed on counters this module owns.
 
 Measured over the 147 rounds carrying an advisory line (2026-08-26), pairing
 each round's self-validation outcome against the reviewer's NEXT decision: last
@@ -197,14 +198,40 @@ one case moves the 93% by seven points; the theming was a keyword pass, not
 SIGNATURE — rounds that skip the suite are refused for what the suite catches —
 not the size of the gap.
 
-So `_run_implementation` re-invokes the agent when `AdvisoryValidation.asked` is
-zero, and `ADVISORY_ZERO_CALL_RETURNS` bounds that at one. The bound is the hard
-part: a refusal that can loop is strictly worse than the forward it replaces,
-so the counter is the executor's, is spent BEFORE the call, and nothing the agent
-writes can raise it. A hand-back whose agent fails keeps the FIRST invocation's
-result — this must never turn a reviewable round into a failed one — and once
-the allowance is spent the round proceeds exactly as it did before, with the
-zero and the spent hand-back both on the record.
+So `_run_implementation` re-invokes the agent when NO ask is on the record —
+`AdvisoryValidation.asked` is zero AND `AdvisoryRendezvous.ask_outstanding()` is
+false, because a request the watcher has not taken yet is still an ask and is not
+counted until `stop()` sweeps — and `ADVISORY_ZERO_CALL_RETURNS` bounds that at
+one. The bound is the hard part: a refusal that can loop is strictly worse than
+the park it replaces, so the counter is the executor's, is spent BEFORE the call,
+and nothing the agent writes can raise it.
+
+And when the allowance is spent and the record STILL shows zero, the round is
+WITHHELD rather than forwarded (advis-01 revision, 2026-08-27): a report that was
+never checked against the suite must not reach the reviewer as an ordinary
+candidate, which is the whole finding above and would be given away by sending it
+on anyway. The mechanism is the one every other refusal in this method already
+uses — `status="error"` with NO `fault_kind` — so nothing is committed (
+`orchestrator._dispatch_task_postcommit` returns at its `status != "ok"` branch,
+well before the commit), no packet is built, and the round is charged as a TASK
+attempt exactly like a failed validation or a round that changed no files. The
+existing park is therefore preserved rather than replaced: this adds no park
+kind, edits no orchestrator code, and reaches the attempt ceiling by the same
+route those two already do. `fault_kind` is deliberately left empty — filling it
+would charge the FAULT budget instead, and a refusal that does not consume the
+task's own attempts is the one genuine fail-open in this design.
+
+The check sits LATE — after the file-moving passes and the `validation_cwd`
+check, immediately before the authoritative run — so that three more fundamental
+refusals are still reported as themselves: a failed agent, a round that changed
+no files, and a declared validation directory that does not exist. Withholding
+ahead of that last one would refuse a round for not obtaining evidence the round
+could not obtain.
+
+A hand-back whose agent fails still keeps the FIRST invocation's result and
+report — a torn re-invocation is not an account this round can act on, and the
+round must not be reported as "implementation agent failed" when the first agent
+returned cleanly. It is still withheld, because `asked` is still zero.
 
 The second behaviour is the reporting one, and port-05 round 1 is its case: the
 agent asked for run #2, never got it, and the round reported run #1's `FAILED`
@@ -913,6 +940,17 @@ ADVISORY_VALIDATION_TIMEOUT_SECONDS = 600.0
 #: iterations whatever the agent does. Nothing the agent writes can raise it, and
 #: `AdvisoryValidation` normalises a negative to zero exactly as it does for
 #: `max_calls`, so a misconfiguration cannot read as "unbounded".
+#:
+#: ONE KNOB, ONE MEANING. This allowance gates BOTH halves of the contract: how
+#: many times a round hands itself back, and whether a round whose record still
+#: shows zero at the end is WITHHELD from review. Zero therefore means "this
+#: executor does not enforce the ask at all" — no hand-back and no withhold —
+#: rather than "refuse the round without ever telling the agent to run the
+#: suite", which would be punishment without notice. Two things keep that from
+#: being a guard that quietly switches itself off: the shipped value is 1, pinned
+#: by a test, and it is NOT reachable from `config.toml` or `cli.py` — the only
+#: callers that pass anything else are tests whose subject is something else
+#: entirely (scope, abort, selection), which say so at the call site.
 ADVISORY_ZERO_CALL_RETURNS = 1
 
 #: The name a transport publishes the zero-argument call under.
@@ -998,12 +1036,19 @@ class AdvisoryValidation:
     it, and the round reported its FIRST run's `FAILED` as "its last run FAILED".
     The reviewer refused work that was never shown to be defective.
 
-    `asked` is also the counter that decides whether the round is handed BACK to
-    the agent (see `ADVISORY_ZERO_CALL_RETURNS`), and it is deliberately not
-    `requests`: the broken-channel branch of `AdvisoryRendezvous._take_request`
-    answers the agent without ever calling `run()`, so a round keyed on
-    `requests` would re-invoke an agent that asked, was answered, and did nothing
-    wrong.
+    `asked` is also what decides whether the round is handed BACK to the agent
+    and whether it is WITHHELD (see `ADVISORY_ZERO_CALL_RETURNS`), and it is
+    deliberately not `requests`: the broken-channel branch of
+    `AdvisoryRendezvous._take_request` answers the agent without ever calling
+    `run()`, so a round keyed on `requests` would re-invoke an agent that asked,
+    was answered, and did nothing wrong.
+
+    It is not the WHOLE of the hand-back decision, for one reason of timing: an
+    ask the watcher has not taken yet moves no counter here until
+    `AdvisoryRendezvous.stop()` sweeps, which happens after the hand-back loop.
+    `_run_implementation` therefore consults `ask_outstanding()` as well. The
+    WITHHOLD, which is read later, needs no such companion — the sweep has
+    already recorded that ask by then.
     """
 
     def __init__(
@@ -1616,21 +1661,49 @@ class AdvisoryRendezvous:
         agent asked at all. Counting it here is what stops the round reporting an
         older run's verdict as "its last run" on a round whose newest ask went
         nowhere, and it is an observation of the executor's own filesystem rather
-        than of anything the agent claimed. Gated twice. On `_started`: a request
-        file in a rendezvous that never watched is residue from a round that
-        died, not this round's ask. And on `_broken`: that branch has already
-        counted the ask it could not consume AND answered it, and the file it
-        could not remove is that same request — counting it twice would report an
-        UNANSWERED ask on a round where the agent was told exactly what happened.
+        than of anything the agent claimed. `ask_outstanding()` is that
+        observation and carries the two gates it has always been made under —
+        see it, rather than a second copy of the reasoning here. This is the one
+        place that COUNTS what it reports; the hand-back decision reads the same
+        predicate earlier and records nothing.
         """
         self._stopping.set()
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=self._join_timeout)
         with self._lock:
-            if self._started and not self._broken and _entry_present(self.request_path):
+            # `ask_outstanding()` takes no lock of its own, deliberately: this
+            # call is already inside it and `threading.Lock` is not reentrant.
+            if self.ask_outstanding():
                 self._service.record_request_asked()
             self._sweep()
+
+    def ask_outstanding(self) -> bool:
+        """Is an ask sitting on the request path that nobody has taken yet?
+
+        The SAME predicate `stop()` counts on, exposed so that the hand-back
+        decision in `_run_implementation` can ask it BEFORE the sweep — an
+        unconsumed request has not moved `AdvisoryValidation.asked` yet, and a
+        round that read the counter alone would hand itself back to an agent
+        that asked and was never answered (advis-01 revision, 2026-08-27).
+
+        Read-only and counter-free on purpose. Recording the ask here instead
+        would double-count it: the watcher's own `_take_request` records it when
+        it takes the file, and `stop()` records it when it finds one left.
+
+        Takes NO lock — `stop()` calls it from inside `self._lock` and
+        `threading.Lock` is not reentrant, so acquiring here would deadlock the
+        executor rather than fail a test.
+
+        Gated twice, exactly as `stop()`'s sweep-time count always was. On
+        `_started`: a request file in a rendezvous that never watched is residue
+        from a round that died, not this round's ask. And on `_broken`: that
+        branch already counted its ask AND answered it, so the file it could not
+        remove is not a second one.
+        """
+        return bool(
+            self._started and not self._broken and _entry_present(self.request_path)
+        )
 
     def _watch(self) -> None:
         # Never raises: an exception here would kill the watcher silently and
@@ -2530,10 +2603,17 @@ def _zero_call_return_instruction(remaining: int, final: bool) -> str:
     disclosure nor a request to delete or restore a file.
     """
     ending = (
-        "This is the LAST hand-back this round gets: whatever happens, the "
-        "executor forwards the round after this invocation."
+        "This is the LAST hand-back this round gets, and it is not a formality: "
+        "if the executor's record still shows zero requests when you return, the "
+        "round is NOT forwarded to the reviewer at all — it is reported as a "
+        "failed round, nothing is committed, and the task spends an attempt on "
+        "it."
         if final
-        else "Further hand-backs are bounded and few; do not rely on another."
+        else (
+            "Further hand-backs are bounded and few; do not rely on another, and "
+            "a round whose record still shows zero when they run out is not "
+            "forwarded to the reviewer at all."
+        )
     )
     return (
         "THIS ROUND WAS HANDED BACK TO YOU, AND THE TASK ABOVE IS ALREADY "
@@ -2554,9 +2634,9 @@ def _zero_call_return_instruction(remaining: int, final: bool) -> str:
         "  2. Poll for the stamped answer and read it.\n"
         "  3. Fix ONLY what it reports, and only inside your approved scope.\n"
         "  4. Return your report, ending with the ADVERSARIAL CASES section.\n"
-        f"You have {remaining} advisory run(s) left this round. {ending} The "
-        "executor still runs the suite itself after you return, and that run is "
-        "still the verdict.\n"
+        f"You have {remaining} advisory run(s) left this round. {ending} Once you "
+        "have asked, the executor still runs the suite itself after you return, "
+        "and that run is still the verdict.\n"
         "Your report does not replace the earlier one: both are carried to the "
         "reviewer, in order, so you need not repeat what the first already said."
     )
@@ -3811,7 +3891,7 @@ class ImplementExecutor:
             # the passed bucket. It is not a general quality gap; it is the suite
             # catching what the suite catches.
             #
-            # FOUR CONDITIONS, and each one is load-bearing:
+            # FIVE CONDITIONS, and each one is load-bearing:
             #
             #   * `offered` — a round whose channel could never run anything
             #     (`AdvisoryValidation.offerable`) has nothing to send the agent
@@ -3820,6 +3900,14 @@ class ImplementExecutor:
             #   * `result.ok` — a failed agent is already reported as a failure
             #     with its partial work measured; handing the round back would
             #     replace an honest failure with a second one.
+            #   * `not rendezvous.ask_outstanding()` — an ask the watcher has not
+            #     taken YET is still an ask, and this is the only place that can
+            #     see it: `record_request_asked` fires when the request is taken
+            #     or, failing that, when `stop()` finds it in the tree, and
+            #     `stop()` does not run until the `finally` below. Without this
+            #     the round hands itself back to an agent that asked and was
+            #     never answered — port-05's own round, and the one behaviour 2
+            #     exists to stop misreporting (advis-01 revision, 2026-08-27).
             #   * `advisory.asked == 0` — the TRANSPORT's count, not `requests`.
             #     The broken-channel branch answers the agent without ever
             #     calling `run()`, so keying on `requests` would re-invoke an
@@ -3828,18 +3916,29 @@ class ImplementExecutor:
             #   * the abort check — an operator who pressed the button is not
             #     waiting for one more agent invocation.
             #
+            # THE TWO ASK CHECKS ARE IN THIS ORDER, and the order is the whole of
+            # the race argument. `_take_request` calls `record_request_asked()`
+            # BEFORE `_remove_entry()` (see those two adjacent lines), so a
+            # request file that is absent when `ask_outstanding()` looks was
+            # already counted before it looked, and the `asked` read that follows
+            # cannot miss it. Reading the counter first would leave a window in
+            # which the file has just been consumed, the counter has not been
+            # re-read, and a round that asked is handed back anyway. If those two
+            # lines ever swap, this gate fails OPEN and nothing else here says so.
+            #
             # THE BOUND IS THE POINT. `returns` is this executor's own counter,
             # incremented BEFORE each re-invocation and never derived from
             # anything the agent produced, so the loop ends after `max_returns`
-            # iterations however the agent behaves. Once the allowance is spent
-            # the round proceeds exactly as it did before this existed — the
-            # report is forwarded and `note()` records both the zero requests and
-            # the hand-back that failed to change them. A refusal that could loop
-            # would be strictly worse than the forward it replaces.
+            # iterations however the agent behaves. A refusal that could loop
+            # would be strictly worse than the park it replaces — it would burn
+            # the whole round on re-invocations and produce nothing. When the
+            # allowance IS spent and the record still shows zero, the round does
+            # not proceed as an ordinary candidate: see the withhold below.
             returns = 0
             while (
                 offered
                 and result.ok
+                and not rendezvous.ask_outstanding()
                 and advisory.asked == 0
                 and returns < advisory.max_returns
                 and not abort_in_effect(self._abort_file, self._abort_ledger)
@@ -4069,11 +4168,108 @@ class ImplementExecutor:
                 validation="not run",
                 changed_paths=tuple(sorted(changed)),
             )
-        # THE AUTHORITATIVE RUN. Independent of everything above: it runs
-        # unconditionally, it runs the full configured list, and it is the only
-        # thing that sets `validation` and decides the status. A green advisory
-        # run does not skip it, shorten it or stand in for it — the agent's runs
-        # are evidence for the AGENT, and this one is evidence for the reviewer.
+        if offered and advisory.max_returns > 0 and advisory.asked == 0:
+            # THE ROUND IS WITHHELD (advis-01 revision, 2026-08-27). The agent has
+            # been handed this round back and the executor's own record STILL
+            # shows zero advisory requests, so the report in hand was never
+            # checked against the suite by the agent that wrote it — and that is
+            # the exact round the measurement says the reviewer refuses, 77.8%
+            # against 41.0%, with 93% of the refusals on the validation theme.
+            # Forwarding it anyway would give away the whole finding.
+            #
+            # THE MECHANISM IS THE ONE ALREADY HERE, deliberately: `status=
+            # "error"` with NO `fault_kind`, exactly like the failed-validation
+            # and changed-nothing branches. `orchestrator._dispatch_task_
+            # postcommit` returns at its `status != "ok"` test, before the commit
+            # and before any packet, so the candidate cannot reach review; and an
+            # empty `fault_kind` charges the round to the TASK's own attempt
+            # budget, which is what makes a repeat bounded ACROSS rounds by the
+            # attempt ceiling that already exists. Naming a fault instead would
+            # spend the fault budget and let a stubborn task refuse forever. No
+            # park kind is added and no orchestrator code changes: the existing
+            # park is reached by the existing route.
+            #
+            # WHY HERE, AND NOT THE MOMENT THE AGENT RETURNED. Three refusals
+            # above this line are about something MORE fundamental than missing
+            # evidence, and each would be swallowed by an earlier withhold: an
+            # agent that failed, a round that changed no files, and a declared
+            # `validation_cwd` that does not exist. The last one is the sharpest —
+            # an advisory run there could only ever have answered `NOT RUN`
+            # naming that directory, so refusing the round for not obtaining
+            # evidence it could not obtain would blame the wrong party, and the
+            # reviewer would be told "it never ran the suite" about a round whose
+            # real problem is its own configuration. What this placement DOES
+            # short-circuit is the expensive part: the authoritative run below,
+            # minutes of it, for a candidate that is not going to exist.
+            #
+            # The file-moving passes above have already run, exactly as they have
+            # for the failed-validation branch since they existed, so their notes
+            # are threaded below: a round that unlinked a file must say so
+            # whether or not it is being forwarded.
+            #
+            # THREE CONDITIONS, and the middle one is not a rubber stamp:
+            #
+            #   * `offered` — a channel the agent could not reach is NOT OFFERED,
+            #     and refusing a round for not using a call it never had would be
+            #     the fail-closed direction taken against the wrong party.
+            #   * `advisory.max_returns > 0` — the allowance gates both halves
+            #     (see `ADVISORY_ZERO_CALL_RETURNS`). Withholding a round that
+            #     was never handed back would be punishment without notice, and
+            #     with an allowance configured the loop above has normally spent
+            #     one by the time this is reached. NORMALLY, not always: an abort
+            #     flag that appears before the loop and is cleared before the
+            #     check below skips the hand-back without ending the round. So
+            #     the sentence reports `advisory.returns`, the number actually on
+            #     the record, rather than asserting the allowance was spent —
+            #     a report that states a hand-back nobody made is the same class
+            #     of defect as the stale verdict behaviour 2 removes.
+            #   * `advisory.asked == 0` — the TRANSPORT's count. A round whose ask
+            #     went UNANSWERED has `asked >= 1` and is NOT withheld: that round
+            #     is port-05's, the one behaviour 2 exists to stop misreporting,
+            #     and withholding it would punish the agent for the channel's own
+            #     failure. Keying this on "no run completed" instead would do
+            #     precisely that. This needs no companion to
+            #     `ask_outstanding()`, unlike the hand-back loop above: `stop()`
+            #     has already run in that method's `finally`, so an ask the
+            #     watcher never took is on the counter by the time this is read,
+            #     and the request file itself is gone.
+            #
+            # `result.ok` is already true here, so a hand-back whose own agent
+            # failed still lands here on the FIRST invocation's good result —
+            # withheld for the zero, never reported as "implementation agent
+            # failed".
+            return ExecutionOutcome(
+                status="error",
+                summary=(
+                    f"task '{task.id}': WITHHELD from review — the executor's own "
+                    "record shows ZERO advisory validation requests this round "
+                    f"(handed back {advisory.returns} time(s) of an allowance of "
+                    f"{advisory.max_returns}), so nothing here was ever run against "
+                    "the suite by the agent that wrote it. That is NOT a failing "
+                    "suite and NOT a pass: nothing was executed, so nothing is "
+                    "known either way. Nothing is committed and no candidate is "
+                    "produced; the work is still in the worker repo for the next "
+                    "round."
+                    + _partial_work_note(changed, partial)
+                    + _scoped_delete_note(deletes)
+                    + _revert_note(reverts, reverts_recorded)
+                    + advisory.note()
+                ),
+                details=raw_text,
+                validation="not run",
+                changed_paths=tuple(changed),
+            )
+
+        # THE AUTHORITATIVE RUN. Independent of every advisory RESULT above it:
+        # it runs the full configured list and is the only thing that sets
+        # `validation` and decides the status. A green advisory run does not skip
+        # it, shorten it or stand in for it — the agent's runs are evidence for
+        # the AGENT, and this one is evidence for the reviewer. The only things
+        # that can keep it from running are the branches above that already
+        # decided this round produces NO candidate (a failed agent, an unreadable
+        # repo, no files changed, a missing validation directory, and — since the
+        # advis-01 revision — a withheld round); none of them is an advisory
+        # verdict, and none of them lets the round be reviewed.
         passed, validation_summary = run_validation_commands(
             commands,
             validation_cwd,

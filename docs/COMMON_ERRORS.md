@@ -572,6 +572,49 @@ you are reading a packet: both reports are the agent's own account, neither
 supersedes the other, and a `DELETE-FILE:` or `ASSUMPTION:` line in EITHER was
 honoured.
 
+### Asking again while a run is in flight destroys the answer you were waiting for
+**Symptom:** you write `.autoloop-validation-request` a second time before
+`RESULT #1` has appeared, and `RESULT #1` never reaches you: the next thing you
+read is `PENDING #2`. Both runs are spent from the cap of
+`ADVISORY_VALIDATION_MAX_CALLS` and you have read neither verdict. Hit during
+advis-01's revision round (2026-08-27).
+**Cause:** the result file is a SINGLE SLOT, not a queue. The watcher writes
+`RESULT #1`, then takes the request that is already sitting there and overwrites
+the file with `PENDING #2` on its next poll. Nothing is lost by the channel —
+the answer really was published — but if you were not reading in that window it
+is gone, and the ordinals are the only way to notice it happened.
+**Fix:** poll for your own `RESULT #n` and read it BEFORE writing the next
+request. Queueing ahead to save wall-clock does not save any: the watcher serves
+one run at a time anyway, so the second request cannot start until the first
+finishes. If you already did this, say in your report which ordinals you asked
+for and which you actually read — an answer you never read is not evidence, and
+`Agent self-validation: UNANSWERED` in the round summary will say so.
+
+### The round was WITHHELD from review and nothing was committed
+**Symptom:** an implement round comes back `status="error"` with a summary
+beginning `task '<id>': WITHHELD from review`, `validation` reads `not run`, no
+commit exists, no candidate reaches the reviewer, and the task is charged an
+attempt — yet no test failed and no agent crashed. Since advis-01's revision
+(2026-08-27).
+**Cause:** the executor's own record shows ZERO advisory validation requests for
+the round. The agent was already handed the round back once
+(`implement_executor.ADVISORY_ZERO_CALL_RETURNS`, 1) and still did not ask, so
+the report was never checked against the suite by the agent that wrote it — the
+exact round the 2026-08-26 measurement says a reviewer refuses. It is charged to
+the TASK's attempt budget, not the fault budget, so repeating it walks into the
+ordinary `attempt_count_ceiling` park.
+**Fix:** as the agent, ask for the run in your FIRST invocation and this can
+never fire; the work itself is not the problem and the diff is still in the
+worker repo. A round whose ask went UNANSWERED is NOT this — that one has
+`asked >= 1`, is never handed back (the executor sees the unconsumed request on
+disk before the sweep puts it on the counter) and is forwarded normally, and
+neither is a round refused for changing no files or for a `validation_cwd` that
+does not exist: those are reported first, because they are more fundamental.
+The withhold happens after the
+deletion, cleanup and restore passes and before the authoritative run, so
+any file this round unlinked really is gone from the worker repo and is named in
+the same summary — read the whole line, not just the first sentence.
+
 ### The round summary says "its last run FAILED" but nothing in the diff is broken
 **Symptom:** a candidate is refused for failing validation the agent supposedly
 saw, and re-reading the diff shows nothing wrong. The summary's advisory line
@@ -3570,3 +3613,6 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-26 | select-01 | New §2 entry: advisory validation says `autoloop/tests: TIMEOUT` while `ruff check .` PASSes and `tests/` reads `NOT RUN`. The cap is `implement_executor.ADVISORY_VALIDATION_TIMEOUT_SECONDS` = 600s, deliberately far below the 1800s `run_validation_commands` default the executor's own post-agent run uses, so it is neither a pass nor the round's verdict. Hit twice in this round over two different trees; the entry says to cut your own repo-wide test cost before spending another run rather than re-running unchanged. |
 | 2026-08-26 | advis-01 | Two new §2 entries. "The implement agent ran TWICE, and the packet carries two reports" is the NEW symptom this change introduces — a round that made zero advisory requests is handed back once — and the fix is addressed to the re-invoked agent: the work is already on disk, so a second change note or a re-added test lands twice and fails the round. Neither report supersedes the other, and a `DELETE-FILE:` or `ASSUMPTION:` line in either was honoured. |
 | 2026-08-26 | advis-01 | The second entry is the symptom that cost port-05 round 1: "the round summary says its last run FAILED but nothing in the diff is broken". The agent asked for a later run whose answer never landed, and the summary reported the earlier run's stale verdict as the round's state. It now reads UNANSWERED. Remedy for an agent: a full advisory run takes minutes and one run is capped at 600s, so poll for your own `RESULT #n` before returning — returning mid-run is what produces it. |
+| 2026-08-27 | advis-01 | A fourth §2 entry, found by hitting it in this round: asking again while a run is in flight DESTROYS the answer you were waiting for. The result file is a single slot, so the watcher writes `RESULT #1` and then overwrites it with `PENDING #2` on its next poll. Two runs spent from the cap, neither verdict read. Queueing ahead saves no wall-clock either — the watcher serves one run at a time. Read your own `RESULT #n` before writing the next request, and report which ordinals you asked for against which you actually read. |
+| 2026-08-27 | advis-01 | REVISION adds a third §2 entry: "the round was WITHHELD from review and nothing was committed". `status="error"`, `validation` reads `not run`, no test failed and no agent crashed — the record simply showed zero advisory requests after the one hand-back was spent. It is charged to the task's attempt budget, so repeating it reaches the ordinary `attempt_count_ceiling` park. The entry also says what it is NOT: an unanswered ask, a round that changed no files, and a missing `validation_cwd` are each reported first and separately. |
+| 2026-08-27 | advis-01 | That entry's "what it is NOT" clause is corrected in the same section: an UNANSWERED round is not handed back EITHER, not merely spared the withhold. The hand-back is decided before `stop()` sweeps, so an unconsumed request has not reached `AdvisoryValidation.asked` yet and the executor now reads `AdvisoryRendezvous.ask_outstanding()` beside the counter. Nothing an agent does differs: ask in your first invocation, read your own `RESULT #n`, and neither symptom fires. |

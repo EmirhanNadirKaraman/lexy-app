@@ -611,6 +611,13 @@ def executor_with(worker_repo, agent, abort_file, *, validation=(("ruff", "check
         # runner factory. Passed explicitly here so a test can write into it
         # exactly where a real `AbortableProcessHandle` would.
         abort_ledger=ledger,
+        # Since advis-01 (2026-08-26) a round whose agent never uses the advisory
+        # channel is handed back once and then WITHHELD from review. This file's
+        # subject is the ABORT verb, and its stand-in agents cannot ask, so the
+        # contract is pinned off here — otherwise every round below would end as
+        # a withheld one and stop grading what it is about. It has its own
+        # coverage in `test_agent_self_validation.py` §10a.
+        advisory_zero_call_returns=0,
     )
 
 
@@ -719,12 +726,12 @@ def test_an_executor_with_no_abort_file_behaves_exactly_as_before(tmp_path):
     ).execute(implement(), a_task())
 
     assert outcome.status == "ok", outcome.summary
-    # TWO, not one, and not because of anything abort-related: `executor_with`
-    # configures validation, so the advisory channel is offered, and this agent
-    # never uses it — since advis-01 (2026-08-26) a report with zero advisory
-    # requests is handed back to the agent once before the round is forwarded.
-    # What this test is about is unchanged: the round ran to completion.
-    assert agent.runs == 2
+    # ONE, because `executor_with` pins the advis-01 hand-back off for this whole
+    # file (see the comment at its `advisory_zero_call_returns`): its stand-in
+    # agents cannot use the advisory channel, and the round would otherwise be
+    # handed back and then withheld, which is a different test's subject. What
+    # this test is about is unchanged: the round ran to completion.
+    assert agent.runs == 1
     assert ran, "the round must have validated, not stopped early"
 
 
@@ -1694,6 +1701,10 @@ def killed_suite_executor(
         agent_runner_factory=lambda root: WritingAgent(root, {"A.py": "x\n" * 30}),
         abort_file=abort_file,
         abort_ledger=ledger,
+        # Same pin, same reason as `executor_with` above — and load-bearing here:
+        # the abort is armed by the VALIDATION command, which a withheld round
+        # never reaches at all.
+        advisory_zero_call_returns=0,
     )
 
 

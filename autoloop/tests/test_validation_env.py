@@ -420,6 +420,12 @@ def test_failed_validation_reports_error_and_leaves_nothing_committed(tmp_path, 
         validation_commands=(("pytest", "-q"),),
         command_runner=failing,
         validation_env=loaded,
+        # Since advis-01 (2026-08-26) a round whose agent never uses the advisory
+        # channel is handed back once and then WITHHELD from review, and a
+        # withheld round never launches the validation subprocess this test is
+        # about. `FakeAgent` cannot ask, so the contract is pinned off here and
+        # graded in `test_agent_self_validation.py` §10a.
+        advisory_zero_call_returns=0,
     )
     outcome = executor.execute(
         Directive(decision=Decision.IMPLEMENT, reason="do it", task_id="rt-01"),

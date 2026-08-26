@@ -375,6 +375,12 @@ def test_the_pre_commit_executor_run_stops_at_the_first_failure(tmp_path):
         agent_runner=FakeAgent(),
         validation_commands=(RUFF, SUITE_A, SUITE_B),
         command_runner=runner,
+        # Since advis-01 (2026-08-26) a round whose agent never uses the advisory
+        # channel is handed back once and then WITHHELD from review, and a
+        # withheld round runs no command at all — which is the opposite of what
+        # this test measures. `FakeAgent` cannot ask, so the contract is pinned
+        # off here and graded in `test_agent_self_validation.py` §10a.
+        advisory_zero_call_returns=0,
     )
 
     outcome = executor.execute(
