@@ -45,6 +45,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Component | File(s) | Owns |
 |---|---|---|
 | Orchestrator | `orchestrator.py` | Persisted state machine (ready → [delivering] → submitting → awaiting → executing), failure routing, budgets, review-integrity gates, produce-then-review dispatch (`_dispatch_task_postcommit` — the only executor-dispatch path). `delivering` is entered only for a review packet whose patch is too large for one chat message (§5d-bis). |
+| Execution-record lifecycle | `execution_records.py` | `release_task_to_pending` (THE release path — §4f-quinquies), the `Release` it returns, and the six helpers only it calls. Extracted from `orchestrator.py` unchanged on 2026-08-26 (shrink-01), which imports both public names back, so `orchestrator.release_task_to_pending` and `orchestrator.Release` still resolve exactly as before. |
 | Lock | `lock.py` | Single-instance lock per state dir (see §3). |
 | Change manifest (retired, kept for its own unit tests) | `manifest.py` | The old task-owned change-manifest commit gate (see §4) — **no production caller since 2026-07-30** (docs/SECURITY.md S21/S22). |
 | Worktrees / task execution | `worktree.py` (`WorktreeManager`, unused in production — see §4c), `worktask.py` (`TaskExecution`, `CommitIntent`, `reconcile_after_crash`) | Per-task worktree/branch bookkeeping, and the crash-safe commit-intent/candidate-sha bookkeeping for produce-then-review (see §4b). |
@@ -3324,6 +3325,21 @@ different instants and a failure between them has to be reportable:
   `_report_preemption` prints the matching remedy. That repair belongs to the
   tolerating path only — on the raising path it would shut the repository-wide
   merge window behind a traceback, a cost nobody chose.
+
+**WHERE THAT CODE LIVES, since shrink-01 (2026-08-26).** `release_task_to_pending`,
+`Release` and the six helpers it calls (`_archived_record_path`,
+`_loaded_execution`, `_worker_can_resume`, `_repair_orphaned_record`,
+`_surviving_worker_path`, `_surviving_execution_record`) are defined in
+`autoloop/execution_records.py`, not in `orchestrator.py`. `orchestrator.py`
+imports the two PUBLIC names straight back, so `orchestrator.release_task_to_pending`
+and `orchestrator.Release` still resolve and `cli.py` is untouched; the six
+helpers are private and are not re-exported, so grep the new module for those.
+Pure
+rearrangement: same definitions, same order, same signatures, nothing about the
+path changed. The one thing that moved with it is where a test patches the
+resumability probe — `_worker_can_resume` resolves `worker_repo_is_reusable`
+in `execution_records`' globals now, so that is the module a monkeypatch has to
+name.
 
 **Only a PLANNED task is displaced; an AUDIT round already in flight is waited
 out.** An audit unit is minted per run, is absent from the registry, holds no
