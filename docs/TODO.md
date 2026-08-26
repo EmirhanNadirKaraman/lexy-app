@@ -867,7 +867,10 @@ the shared behaviour is a convention, not a shared import.
 **Do this BEFORE removing `autoloop/`, not after.** It is a self-contained
 change to one file and it makes the removal a clean subtraction.
 
-**Relation:** `docs/AUTOLOOP_TODO.md` §D1 is the full removal manifest.
+**Relation:** `docs/AUTOLOOP_REMOVAL.md` is the full removal manifest, and this
+item is its Step 0. That document is language-app's, not the harness's, and is
+deliberately absent from its own `git rm` list — it survives the removal and
+becomes the record of it.
 
 ---
 

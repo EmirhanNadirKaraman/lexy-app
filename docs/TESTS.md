@@ -1154,16 +1154,24 @@ Backend suite baseline (W13, 2026-05-20): **521 passed / 2 skipped** (xdist para
 ## Autoloop tests — `autoloop/tests/` (NOT this repository's test surface)
 
 > **Read this banner before anything below it.** `autoloop/` is a separate
-> project that currently still sits in this checkout. Nothing in this repository
-> imports it and it imports nothing from this repository; it is developed,
-> linted and tested where it is maintained, not here.
+> project that currently still sits in this checkout. It imports nothing from
+> this repository and is developed, linted and tested where it is maintained,
+> not here.
+>
+> **One import goes the other way**, and no command in §"Validation commands"
+> (below) can see it: `scripts/seed_validation_db.py:48` does
+> `from autoloop.validation_env import repo_declared_db_name`. That script is
+> ours — it seeds the validation database ~55 backend tests need in order to
+> assert rather than skip — and nothing under `tests/` imports it, so a green
+> root run is silent about it. It must be lifted before the directory is
+> removed: docs/TODO.md **#46**, manifest in `docs/AUTOLOOP_REMOVAL.md`.
 >
 > As of this change it is **out of this repository's tooling entirely**:
 > `pytest.ini` does not collect it (`testpaths = tests`), `ruff.toml` excludes
 > it, and `.github/workflows/tests.yml` no longer has a job for it. None of the
-> commands in "Validation commands" above run any of it, so **nothing recorded
-> below is evidence about a change made here**, and a green run here says
-> nothing about the harness.
+> commands in §"Validation commands" (below) run any of it, so **nothing
+> recorded below is evidence about a change made here**, and a green run here
+> says nothing about the harness.
 >
 > The rest of this section is retained only because the directory it describes
 > is still physically present. It is a historical record of a suite this
@@ -2019,8 +2027,10 @@ take minutes.
 
 As of 2026-08-01 this suite was **790 passed, 1 skipped** (~2m26s serial).
 **It has grown a great deal since: measured 2026-08-25 it collects 3,672 tests**
-(`python3 -m pytest autoloop/tests --collect-only -q`, one deselected), so a
-bare root `pytest` now collects **4,040** across both trees. The
+(`python3 -m pytest autoloop/tests --collect-only -q`, one deselected), which
+was when a bare root `pytest` collected **4,040** across both trees. It no
+longer does: `testpaths` is `tests` alone and a bare root run collects 368, so
+read 3,672 as a dated measurement of a tree this repository does not gate. The
 one skip is `test_real_db_validation_command_succeeds`, which needs an
 operator-supplied dedicated test database — see its row below. Every other
 test is hermetic (no network, no database, no real `claude` CLI).
@@ -3066,12 +3076,14 @@ Run all three. The lint step is not optional.
 >
 > Between 2026-08-04 (rt-05) and this change, `testpaths` also named
 > `autoloop/tests` and a bare root `pytest` collected 4,040 tests across two
-> trees. That second tree is the loop harness, which is a separate project: it
-> is not imported by anything here, imports nothing from here, and is tested
-> where it is maintained. It is no longer part of this repository's test
-> surface, so a bare `pytest` no longer reports on it. **A bare `pytest` here
-> going from 4,040 collected to 368 is that change, not a regression** — but do
-> not read the smaller green run as covering what the larger one did.
+> trees. That second tree is the loop harness, which is a separate project:
+> it imports nothing from here and is tested where it is maintained. It is no
+> longer part of this repository's test surface, so a bare `pytest` no longer
+> reports on it. **A bare `pytest` here going from 4,040 collected to 368 is
+> that change, not a regression** — but do not read the smaller green run as
+> covering what the larger one did. (The one import that goes the OTHER way,
+> `scripts/seed_validation_db.py:48`, was never covered by either figure —
+> nothing under `tests/` imports that script. See docs/TODO.md #46.)
 
 > **Running the root suite in parallel.** Adding `-n auto` to your own
 > invocation is safe. Adding it to `pytest.ini`'s `addopts` is **not**: in
@@ -3892,3 +3904,5 @@ whatever came after it.
 | 2026-08-26 | port-05 | No test added, removed or renamed. The test SURFACE narrowed: root `pytest.ini` drops `autoloop/tests` from `testpaths`, so a bare root `pytest` goes from 4,040 collected to 368. That is the intended change, not a regression — but it is a FAIL-OPEN one: the run stays GREEN while covering 3,672 fewer tests, so do not read a green root run here as evidence about the harness. `-p no:randomly` is unchanged and still load-bearing. `-m "not isolated"` and the `isolated` marker are KEPT although inert here — nothing under `tests/` carries that marker. |
 | 2026-08-26 | port-05 | `.github/workflows/tests.yml` loses its `autoloop` job, including the separate blocking `-m isolated` step; `lint` and `pipeline` remain. `ruff.toml` gains `extend-exclude = ["autoloop"]` — `extend-`, because a plain `exclude` REPLACES ruff's built-in exclusions and would start linting virtualenvs and `dist/`. "All checks passed!" is now a statement about this repository only. The autoloop-tests section above is banner-marked and frozen rather than deleted: excising it plus `docs/AUTOLOOP.md` would exceed the review packet cap. |
 | 2026-08-26 | port-05 | REVISION: `tests.yml` gains a `docs` job re-stating the repository-specific guards the removed autoloop job carried — tracker section shape, exactly one CHANGE-NOTES marker, the 700-character note-line limit, and `docs/audit_charters.toml` parsing to its six domains. Fail-closed on the file SET as well as the contents: a missing tracker is a failure, never an empty loop reporting success. New §"What the autoloop job used to guard" holds the preserved/not-preserved accounting; the remainder is tracked as docs/TODO.md #45. |
+| 2026-08-26 | port-05 | REVISION 2, still no test added, removed or renamed. Two false claims corrected here: the autoloop-tests banner and the Validation-commands note both said nothing in this repository imports the harness. `scripts/seed_validation_db.py:48` does, and NO command in the validation table covers it — nothing under `tests/` imports that script, so a green root run is silent about it. Pre-removal fix tracked as docs/TODO.md #46. |
+| 2026-08-26 | port-05 | REVISION 2: the 3,672 `autoloop/tests` figure is now labelled a dated 2026-08-25 measurement instead of feeding a "bare root `pytest` now collects 4,040" sentence that stopped being true in this same task. The removal manifest moved to the new `docs/AUTOLOOP_REMOVAL.md`, which is absent from its own `git rm` list; `docs/AUTOLOOP_TODO.md` §D1 is now a pointer to it. |

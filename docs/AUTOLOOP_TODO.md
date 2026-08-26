@@ -286,72 +286,19 @@ before that buys mainly a sophisticated way to break your own tooling.
 
 ---
 
-## D1. Operator removal manifest — the `git rm` list (port-05, 2026-08-26)
+## D1. Operator removal manifest — moved (port-05, 2026-08-26)
 
-port-05 disconnected this harness from language-app's **tooling**: `pytest.ini`
-no longer collects `autoloop/tests`, `ruff.toml` excludes `autoloop`, and
-`.github/workflows/tests.yml` has no harness job. The files are still on disk,
-untouched and merely unreferenced. Deleting them is one operator action and
-cannot be done by a loop round — the executor has no delete tool for
-pre-existing paths, and a 76,225-line deletion would blow past the review
-packet's 400,000-byte cap by two orders of magnitude.
+The `git rm` list for taking `autoloop/` out of the language-app checkout lives
+in **`docs/AUTOLOOP_REMOVAL.md`**, not here.
 
-**Precondition, non-negotiable:** do not run any of this until the extracted
-repository has run `python -m autoloop doctor` **and a full round** against
-language-app as an EXTERNAL target. Until then the harness lives here.
+It was written here first and moved on review, for one reason: this file is on
+that list. A manifest that is deleted by the operation it describes cannot be
+the handoff — the operator would lose the instructions half way through. The
+new home is a language-app document that survives the removal and becomes the
+record of it, and two other surviving files point at it (`docs/TODO.md` **#46**
+and the measurement note in `docs/ROADMAP.md`).
 
-### Remove — autoloop-owned, unreferenced by this repository
-
-| Path | Note |
-|---|---|
-| `autoloop/` | the package and its tests, the whole tree |
-| `docs/AUTOLOOP.md` | the harness manual (8,101 lines) |
-| `docs/AUTOLOOP_TODO.md` | this file — the harness's own TODO, including this manifest |
-| `scripts/check_heartbeat.py` | judges the loop from `~/.autoloop/heartbeat.json`; **move first**, it is the harness's monitor |
-| `scripts/install_health_monitor.sh` | installs the launchd agent that runs the file above; copies it out of `$REPO_DIR/scripts/`, so it moves with it |
-| `scripts/autoloop_health_notify.sh` | runs `python3 -m autoloop health`; **move and fix its `AUTOLOOP_REPO` default**, which is `$HOME/Documents/GitHub/language-app` |
-| `scripts/restart_autoloop_chrome.sh` | the retired-restart tombstone; see the ordering note below |
-
-Three of those four `scripts/` files are a **move**, not a plain delete: the
-health monitor is real operational tooling for the loop and should land in the
-new repository before it is removed here. `check_heartbeat.py` deliberately
-imports nothing from `autoloop` (macOS TCC blocks a launchd agent from reading
-`~/Documents`, so it is copied to `~/.autoloop` and run from there) — that
-independence is what makes the move trivial, and an already-installed copy at
-`~/.autoloop/check_heartbeat.py` keeps running either way. Only re-installation
-needs the source.
-
-`scripts/restart_autoloop_chrome.sh` is the one with an ordering constraint. It
-is kept on purpose as a **failing tombstone** for a live `.autoloop/config.toml`
-whose `browser.restart_command` still names it: it restarts nothing, prints the
-`restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]` line to
-paste, and exits non-zero. Its replacement leaves in the same `git rm`, so
-before removing it, check every live config has been migrated. After that its
-advice is stale anyway and it should go with the rest.
-
-### Keep — referenced here, or about this repository
-
-| Path | Disposition |
-|---|---|
-| `.gitignore`'s `.autoloop/` entry | **keep.** That is the loop's STATE AND CONFIG directory, not the package. The loop still runs against this repository as an external target and still reads `.autoloop/config.toml` here. Dropping it would untrack a private conversation URL and make the checkout read as dirty to the loop. |
-| `docs/audit_charters.toml` | **keep.** It describes THIS repository and is read by the harness from the root of whatever checkout it audits. Its absence is a *supported* state that silently falls back to built-in domains, so losing it is invisible — which is why the `docs` CI job now checks it. |
-| `.gitattributes` | **keep.** Deliberately rule-free; its prose is the record of why `merge=union` was tried and removed. It names `autoloop/note_merge.py` as a cross-repository pointer, which stays accurate. |
-| `ruff.toml`'s `extend-exclude = ["autoloop"]` | **keep now, delete in the removal commit.** A pattern matching nothing is not an error for ruff, so it stays correct through the removal and is simply dead afterwards. |
-| `pytest.ini`, `requirements.txt`, `AGENTS.md`, `docs/SCHEMA.md`, `.github/workflows/dependency-audit.yml` | **keep unchanged.** None of them references `autoloop` at all. `requirements.txt` never declared the harness's dependencies (it is one `-r` line into the backend set); declaring them properly is the new repository's job. |
-| `CLAUDE.md` §12's loop rules | **keep.** Change-note merge rules, the out-of-scope cleanup/revert authorities, `DELETE-FILE`, intake — these govern how a loop round must behave *in this repository*. They describe an external tool acting here, not a package shipped here. |
-| `docs/SUMMARY.md`, `docs/TESTS.md`, `docs/COMMON_ERRORS.md`, `docs/SECURITY.md` autoloop sections | **keep until the removal commit, then excise the banner-marked blocks.** Each already carries a banner saying it describes a package this repository no longer owns. They were not deleted here because doing so alongside the tooling change would exceed the review packet cap. `docs/SECURITY.md` findings are never deleted (§14, regression history) — they travel with the code. |
-| `docs/AUDIT_2026-07-30.md`, `-08-02`, `-08-03`, `-08-05`, `-08-22` | **keep.** Dated audit reports. Historical records of what was true on a date; not descriptions of current structure. |
-| `docs/ROADMAP.md`'s 2026-08-25 measurement | **keep as a dated measurement.** It quotes `autoloop/tests` 3,672 as of that date; annotated in place rather than rewritten. |
-| `.autoloop/config.toml` | **not in this repository** — gitignored, operator-owned, and therefore not on any `git rm` list. It still needs a human pass at removal time: `browser.restart_command` (see the tombstone above), `state_dir`, and the `[repo]` paths all point at a layout that is about to change. Nothing in a checkout can make that edit for you. |
-| `.github/workflows/tests.yml`'s `docs`-job comment | **keep the job, touch up the comment in the removal commit.** The header names `autoloop/tests/test_docs_merge.py` and `autoloop/tests/test_audit_charters.py` to explain where those checks came from. Those paths stop existing at the `git rm`, so the comment should be reworded to past tense then — it is the one in-scope file that would otherwise describe a package this repository no longer contains. The checks themselves are about `docs/` and stay. |
-
-### One path that BREAKS on removal — fix before, not after
-
-`scripts/seed_validation_db.py:48` does
-`from autoloop.validation_env import repo_declared_db_name`. It is the only
-non-`autoloop/` file in this repository that imports the package, and it is
-**language-app's** script (it seeds this repository's validation database for
-the backend suite). `git rm -r autoloop/` gives it an `ImportError` at line 48
-before it does anything. Neither validation command catches this: `ruff` does
-not resolve imports, and nothing under `tests/` imports the script. Tracked as
-**#46** in `docs/TODO.md`.
+What port-05 itself did is unchanged and is stated there: this repository's
+tooling no longer references `autoloop/` — `pytest.ini` does not collect it,
+`ruff.toml` excludes it, the workflows do not run it — while the directory
+still sits on disk, untouched.

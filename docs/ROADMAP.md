@@ -80,7 +80,8 @@ clean, alembic head still **037**.
 > this repository's tooling entirely — `pytest.ini` does not collect it,
 > `ruff.toml` excludes it, and `.github/workflows/tests.yml` has no job for it.
 > A bare root `pytest` here collects 368, not 4,040. Drop the figure at the next
-> re-measure; see `docs/AUTOLOOP_TODO.md` §D1 for the removal manifest.
+> re-measure; see `docs/AUTOLOOP_REMOVAL.md` for the operator removal manifest,
+> which survives the removal it prescribes.
 
 > Historical baselines quoted elsewhere in this file (847/274 as of
 > 2026-07-27, and 745 backend / 671 root / 238 frontend before that) are

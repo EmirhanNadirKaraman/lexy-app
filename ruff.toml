@@ -20,8 +20,15 @@ target-version = "py311"
 # for adding a single path.
 #
 # `autoloop/` is the loop harness. It is a separate project that happens to sit
-# in this checkout: nothing in this repository imports it, it imports nothing
-# from this repository, and it carries its own lint gate where it is maintained.
+# in this checkout: it imports nothing from this repository, and it carries its
+# own lint gate where it is maintained. The reverse direction has exactly ONE
+# exception — `scripts/seed_validation_db.py:48` imports
+# `autoloop.validation_env.repo_declared_db_name`, and that import must be
+# lifted before the directory is removed (docs/TODO.md #46,
+# `docs/AUTOLOOP_REMOVAL.md`). Excluding the tree here does not hide it: ruff
+# never resolved imports, so `ruff check .` said nothing about that edge before
+# this line existed and says nothing about it now.
+#
 # Linting it from here made this repository's baseline depend on a tree it does
 # not own — a finding in the harness turned `ruff check .` red for whoever was
 # working on the app, and, since the loop stops at the first failing validation
