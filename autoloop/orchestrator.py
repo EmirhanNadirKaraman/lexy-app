@@ -317,7 +317,7 @@ import hashlib
 import json
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import tempfile
 from pathlib import Path
@@ -365,6 +365,7 @@ from .contract import (
     TASK_DECISIONS,
     Decision,
     Directive,
+    TaskSpec,
     parse_response,
     verify_review,
 )
@@ -644,6 +645,16 @@ MAX_CEILING_EXTENSIONS = 1
 #: limit", and the reversible one: raising it later is a constant, lowering it
 #: after tasks exist on disk at depth 2 is not. A child at the bound is not
 #: stranded — it still gets its own extension, and then the hard wall.
+#:
+#: The reviewer's `split` verb (split-03) is bounded by this SAME field and this
+#: SAME number, and is not exempted from it. Two consequences worth stating
+#: because a reviewer will meet both: a `split` of an ordinary task spends the
+#: one level, so its successors can afterwards be neither `split` nor
+#: ceiling-decomposed; and a `split` of a task that is already a successor is
+#: refused outright. Exempting the verb was the alternative and it is the
+#: unbounded subdivision the verb exists to bound — "one testable claim" is a
+#: judgement and can always be applied again, so nothing would stop a chain of
+#: splits from deferring the work forever.
 MAX_SPLIT_DEPTH = 1
 
 #: The floor under a child's attempt budget after it inherits its parent's spend.
@@ -664,6 +675,14 @@ MIN_CHILD_ATTEMPTS = 2
 #: `MIN_CHILD_ATTEMPTS` more attempts under a new id — a rename that buys
 #: budget. A reviewer that believes the work is one unit is asking for an
 #: extension, and the refusal says so.
+#:
+#: SHARED with the reviewer's own `split` verb (split-03), where it carries a
+#: second argument as well: it is the one mechanical answer to "this task is
+#: already ONE claim, so it may not be split". A verb that accepted a
+#: one-successor split would be a way to defer work indefinitely under a new id
+#: every round, which is exactly what the reviewer must not be handed. The name
+#: keeps its `CEILING_` prefix deliberately — two names for one number is the
+#: drift this module writes docstrings against, and a rename buys nothing.
 MIN_CEILING_SPLIT_TASKS = 2
 
 #: The `retire_execution` label a ceiling-split parent's execution record and
@@ -671,6 +690,113 @@ MIN_CEILING_SPLIT_TASKS = 2
 #: human reading either one can tell the round was decomposed rather than
 #: released, recut or displaced.
 CEILING_SPLIT_RETIREMENT_REASON = "split-at-attempt-ceiling"
+
+#: The same label for the split a reviewer proposes with `contract.Decision.
+#: SPLIT` (split-03, 2026-08-26). A DIFFERENT string from the one above on
+#: purpose, exactly as `AUTONOMOUS_REBUILD_RETIREMENT_REASON` differs from
+#: `RECUT_RETIREMENT_REASON`: both file their two halves through
+#: `retire_execution` as `<task>-<reason>-<stamp>`, and an operator reading
+#: `quarantine/` has to be able to tell a task that RAN OUT OF ATTEMPTS from one
+#: the reviewer judged undeliverable in a single piece. The mechanism they share
+#: is the same; the evidence they were reached on is not.
+REVIEWER_SPLIT_RETIREMENT_REASON = "split-by-reviewer"
+
+
+@dataclass(frozen=True)
+class SplitOrigin:
+    """Everything that DIFFERS between the two ways a split is proposed.
+
+    THE POINT OF THIS TYPE is what it does not contain. Acceptance — the durable
+    marker, `add_many`, `retire(superseded_by=...)`, `release_task_to_pending`,
+    and the crash boundary between them — lives once, in
+    `Orchestrator._apply_split`. What varies is labels: the denial code a
+    refusal reports, the `retire_execution` label the archived record and
+    quarantined worker are filed under, and the transcript event. A second
+    acceptance path is the thing `contract.Decomposition` calls out by name, and
+    parameterising the labels is how there goes on being only one.
+
+    **Every code is a LITERAL here rather than an f-string at the emit site.**
+    `policy._RETIRED_DENIALS` gives the reason: a code assembled from a prefix
+    cannot be grepped back to the place that emits it, and these strings appear
+    in the loop log, in blocker records and in docs. Written out once, in this
+    table, `rg ceiling_split_candidate_published` still lands somewhere useful.
+
+    The two PARK codes (`code_parent_not_retired`, `code_retirement_failed`)
+    move out of a literal `code=` keyword by being here, so
+    `test_m1_hardening._emitted_blocker_codes` — which AST-walks `code=`
+    constants — no longer sees them. That costs nothing measurable: the walk
+    feeds `test_every_precondition_key_matches_a_real_emitted_code`, which asks
+    only that every key of `cli._RESOLUTION_PRECONDITIONS` be an emitted code,
+    and neither of these is such a key (both are `task_fatal` parks that an
+    operator's answer genuinely resolves). `test_split_decision.py` asserts
+    both origins' full code sets directly instead, which is a stronger check
+    than the walk gave them.
+    """
+
+    #: `"ceiling"` / `"reviewer"` — which report to render, and nothing else.
+    kind: str
+    #: `retire_execution` label; also the `SplitIntent.reason` a crash recovery
+    #: re-files the surviving halves under.
+    label: str
+    #: Leading clause of the registry retirement reason, completed with the
+    #: successor ids: "<note> a, b".
+    retirement_note: str
+    #: Transcript event name for a split that landed.
+    log_event: str
+    code_unavailable: str
+    code_depth: str
+    code_too_small: str
+    code_names_parent: str
+    code_dependency_stranded: str
+    code_dependent_in_progress: str
+    code_record_unreadable: str
+    code_no_execution: str
+    code_candidate_published: str
+    code_intent_unwritable: str
+    code_parent_not_retired: str
+    code_retirement_failed: str
+
+
+#: The ceiling decomposition (ceil-01). Every code is the string it has emitted
+#: since that task shipped — this table moved them, it did not rename them.
+CEILING_SPLIT_ORIGIN = SplitOrigin(
+    kind="ceiling",
+    label=CEILING_SPLIT_RETIREMENT_REASON,
+    retirement_note="decomposed at the attempt ceiling into",
+    log_event="task_ceiling_split",
+    code_unavailable="ceiling_split_unavailable",
+    code_depth="ceiling_split_depth",
+    code_too_small="ceiling_split_too_small",
+    code_names_parent="ceiling_split_names_parent",
+    code_dependency_stranded="ceiling_split_dependency_stranded",
+    code_dependent_in_progress="ceiling_split_dependent_in_progress",
+    code_record_unreadable="ceiling_split_record_unreadable",
+    code_no_execution="ceiling_split_no_execution",
+    code_candidate_published="ceiling_split_candidate_published",
+    code_intent_unwritable="ceiling_split_intent_unwritable",
+    code_parent_not_retired="ceiling_split_parent_not_retired",
+    code_retirement_failed="ceiling_split_retirement_failed",
+)
+
+#: The reviewer's own `split` verb (split-03). Same acceptance, its own labels.
+REVIEWER_SPLIT_ORIGIN = SplitOrigin(
+    kind="reviewer",
+    label=REVIEWER_SPLIT_RETIREMENT_REASON,
+    retirement_note="split by the reviewer as undeliverable in one piece, into",
+    log_event="task_reviewer_split",
+    code_unavailable="reviewer_split_unavailable",
+    code_depth="reviewer_split_depth",
+    code_too_small="reviewer_split_too_small",
+    code_names_parent="reviewer_split_names_parent",
+    code_dependency_stranded="reviewer_split_dependency_stranded",
+    code_dependent_in_progress="reviewer_split_dependent_in_progress",
+    code_record_unreadable="reviewer_split_record_unreadable",
+    code_no_execution="reviewer_split_no_execution",
+    code_candidate_published="reviewer_split_candidate_published",
+    code_intent_unwritable="reviewer_split_intent_unwritable",
+    code_parent_not_retired="reviewer_split_parent_not_retired",
+    code_retirement_failed="reviewer_split_retirement_failed",
+)
 
 #: `blockers.Blocker.code` for a split acceptance the startup reconciliation
 #: could NOT settle by itself (split-04, 2026-08-25) — the marker is unreadable,
@@ -4428,6 +4554,19 @@ class Orchestrator:
             # puts the task back in the queue, and the next `implement` for it
             # is an ordinary first dispatch off the current base.
             self._dispatch_recut(directive)
+        elif decision is Decision.SPLIT:
+            # The reviewer judging a task undeliverable as ONE candidate. Its own
+            # branch for the same reason `recut` has one: it runs NO executor and
+            # starts no round — it retires the parent into the successors the
+            # directive names and puts them in the roadmap, and the next
+            # `implement` for one of them is an ordinary first dispatch.
+            #
+            # Explicitly BEFORE the terminal `else`, which routes to
+            # `_dispatch_executor`. That is the same hole the RETIRED_DECISIONS
+            # branch below exists to keep shut: a decision that falls through to
+            # the executor is dispatched as if it were `implement`, against a
+            # task the reviewer just said is too big to work as one.
+            self._dispatch_split(directive)
         elif decision in RETIRED_DECISIONS:
             # Retired 2026-08-06, mirroring the retired legacy git path below.
             # `authorize_directive` denies a retired decision unconditionally,
@@ -8066,6 +8205,355 @@ class Orchestrator:
     def _dispatch_ceiling_split(self, directive: Directive, parent: Task) -> None:
         """Apply a `plan` that answers `parent`'s attempt-ceiling request.
 
+        The ceiling TRIGGER only: the three refusals below are the ones whose
+        wording belongs to a task standing at its attempt ceiling, and the
+        acceptance itself is `_apply_split`, which the reviewer's own `split`
+        verb reaches through `_dispatch_split`. Two triggers, one mechanism —
+        see `SplitOrigin` for why the difference between them is labels and
+        nothing else.
+        """
+        specs = directive.tasks or ()
+        origin = CEILING_SPLIT_ORIGIN
+        if self._execution_store is None or self._worker_repos is None:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_unavailable,
+                    "this loop has no execution store and worker-repository "
+                    "manager configured, so it cannot retire the parent's record "
+                    "and worker — and adding subtasks while leaving the parent's "
+                    "candidate live is worse than doing neither. Nothing was "
+                    "changed.",
+                ),
+            )
+            return
+        may_extend, may_split = self._ceiling_remedies(parent)
+        if not may_split:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_depth,
+                    f"task '{parent.id}' is already a subtask at split depth "
+                    f"{self._nonneg_int(parent.split_depth)} (cap "
+                    f"{MAX_SPLIT_DEPTH}), so it cannot be decomposed again — "
+                    "splitting without a bound is how one looping task becomes "
+                    "an unbounded family of them. "
+                    + (
+                        "Answer with a differing `decomposition` for it instead, "
+                        "or with `stop`."
+                        if may_extend
+                        else "Answer with `stop`."
+                    )
+                    + " Nothing was changed.",
+                ),
+            )
+            return
+        if len(specs) < MIN_CEILING_SPLIT_TASKS:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_too_small,
+                    f"a decomposition of '{parent.id}' must name at least "
+                    f"{MIN_CEILING_SPLIT_TASKS} subtasks; this plan names "
+                    f"{len(specs)}. One subtask inherits the parent's spend and "
+                    "then hands the SAME unit of work a fresh floor of attempts "
+                    "under a new id, which is a rename that buys budget. If the "
+                    "work really is one unit, that is answer A — `revise` with a "
+                    "`decomposition` that differs from the one on record. "
+                    "Nothing was changed.",
+                ),
+            )
+            return
+        self._apply_split(directive, parent, specs, origin)
+
+    # ---- the reviewer's own `split`: this task is too big to review ---------
+    #
+    # THE SECOND TRIGGER ON THE MECHANISM ABOVE, and the reason it exists rather
+    # than being folded into one of the verbs that already existed.
+    #
+    # brw-14 (2026-08-24) produced a 416,193-byte range diff against a
+    # 400,000-byte packet cap and parked on `review_packet_build_failed`. It
+    # PASSED post-commit review; it was refused only because the reviewer could
+    # not be shown the diff in full. A task can therefore be CORRECT and still
+    # undeliverable, and nothing in the decision vocabulary could say that:
+    # `revise` orders the same size again, `recut` orders the same task from a
+    # clean base, `stop` ends the round with a reason nobody acts on. Five task
+    # descriptions written that same day each carry a hand-written "this is ONE
+    # ROADMAP ITEM, NOT ONE COMMIT — produce a split plan if it is too large",
+    # which is an operator working around a missing verb five times in one day.
+    #
+    # The bounds, each with the check that carries it:
+    #
+    #   * ONE LEVEL — `MAX_SPLIT_DEPTH`, the same field and the same number a
+    #     ceiling decomposition is bounded by (`_ceiling_remedies`). A successor
+    #     of a split cannot be split again, so the verb cannot defer work
+    #     indefinitely by subdividing forever.
+    #   * NOT A TASK THAT IS ALREADY ONE CLAIM — `MIN_CEILING_SPLIT_TASKS`
+    #     successors at minimum. A one-successor split is a rename that buys a
+    #     fresh floor of attempts, and a reviewer that believes the work is one
+    #     unit is asking for `revise`.
+    #   * EVIDENCE, NOT SPECULATION — refused for a task that has committed no
+    #     candidate. "Too large to review" is a judgement about something the
+    #     reviewer has seen; without a candidate there is nothing to have judged,
+    #     and the verb would become a way to defer a task that was never
+    #     attempted. (The ceiling trigger deliberately tolerates no candidate —
+    #     it has an attempt ledger instead — which is why this check lives here
+    #     and not in `_apply_split`.)
+    #   * NEVER DISCARD WORK THAT MAY ALREADY BE APPROVED — a published
+    #     candidate is refused outright, and so is one whose verdict is still
+    #     outstanding, through the same `_recut_outstanding_verdict` a recut
+    #     uses and for the same budget-01 reason.
+    #   * NOTHING IS DELETED and THE PARENT DOES NOT VANISH — the retirement is
+    #     `retire(superseded_by=<successors>)` plus `release_task_to_pending`,
+    #     so a reader follows the parent's row to its successors and finds the
+    #     archived record and the quarantined worker under one label.
+
+    def _dispatch_split(self, directive: Directive) -> None:
+        """Retire `directive.task_id` into the successors the directive names,
+        because it cannot be delivered as one reviewable candidate.
+
+        Every refusal happens BEFORE anything moves, cheapest-and-most-specific
+        first so the reviewer is told the actual reason rather than the first
+        one that happens to fire. The acceptance is `_apply_split` — the SAME
+        body a ceiling decomposition runs — because a second acceptance path is
+        precisely what `contract.Decomposition` forbids by name.
+        """
+        state = self.state
+        task_id = directive.task_id or ""
+        specs = directive.tasks or ()
+        origin = REVIEWER_SPLIT_ORIGIN
+
+        if task_id == AUDIT_TASK_ID or task_id.startswith("audit-"):
+            # Refused by NAME rather than by registry lookup, exactly as
+            # `_dispatch_recut` does: most audit units are not in the registry
+            # at all, so a lookup would answer `task_unknown` and send the
+            # reviewer looking for a planning mistake that never happened.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "reviewer_split_audit_unit",
+                    f"'{task_id}' is an audit unit, not a roadmap task — it has "
+                    "no registry row to retire and no successors to be retired "
+                    "into. Narrow the next `audit` with `scope` instead. Nothing "
+                    "was changed.",
+                ),
+            )
+            return
+        if not self._registry.has(task_id):
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "task_unknown",
+                    f"task '{task_id}' is not in the registry, so there is "
+                    "nothing to split. Nothing was changed.",
+                ),
+            )
+            return
+        if self._execution_store is None or self._worker_repos is None:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_unavailable,
+                    "this loop has no execution store and worker-repository "
+                    "manager configured, so it cannot retire the parent's record "
+                    "and worker — and adding successors while leaving the "
+                    "parent's candidate live is worse than doing neither. "
+                    "Nothing was changed.",
+                ),
+            )
+            return
+        if state.pending_request is not None:
+            # Defence in depth against a state the ordinary single-request flow
+            # does not reach, and the literal form of the bound a recut carries
+            # for the same reason: never discard a candidate while this loop is
+            # waiting to hear about one.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "reviewer_split_verdict_outstanding",
+                    "this loop is still waiting on a reply to request "
+                    f"'{state.pending_request.request_id}', so a verdict is in "
+                    "flight and nothing may be retired yet. Nothing was changed.",
+                ),
+            )
+            return
+        task = self._registry.get(task_id)
+        terminal = self._registry.state_of(task_id)
+        if terminal in (
+            TaskState.COMPLETED,
+            TaskState.RETIRED,
+            TaskState.SHIPPED_ELSEWHERE,
+        ):
+            # `policy._check_task_reference` already refuses COMPLETED and
+            # RETIRED, and this is not a duplicate of it: it has no arm for
+            # SHIPPED_ELSEWHERE, which falls through as ALLOWED. Reaching
+            # `_apply_split` with such a parent adds the successors and only THEN
+            # meets `retire`'s own `task_shipped_elsewhere` refusal — from inside
+            # `release_task_to_pending`, after the children are in the registry,
+            # i.e. the half-applied park. The ceiling trigger cannot reach it
+            # (`ceiling_plan_pending` filters terminal rows), so the guard lives
+            # on this path, where the hole is.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "reviewer_split_task_terminal",
+                    f"task '{task_id}' is {task.status} — a record, not queue. "
+                    "Splitting it would retire work that already has an outcome, "
+                    "and a retirement satisfies no dependency, so every task "
+                    "waiting on it would be stranded. If what landed needs "
+                    "following up, that is a new task. Nothing was changed.",
+                ),
+            )
+            return
+        # READ FAIL-CLOSED, not through `_nonneg_int`. That helper answers 0 for
+        # a value it cannot read, which is the right default where the number is
+        # being SPENT (a budget) and exactly the wrong one where it is a BOUND: a
+        # depth of 0 is "may be split", so an unreadable counter would switch the
+        # one-level rule off at the moment it is doing work. `tasks.
+        # _persisted_nonneg_int` refuses such a value at LOAD, so this is
+        # unreachable from a `tasks.json` on disk — it covers a `Task` handed in
+        # by an embedder or a test, which passes through no such gate, and a
+        # `bool`, which is an `int` in Python.
+        raw_depth = getattr(task, "split_depth", 0)
+        if isinstance(raw_depth, bool) or not isinstance(raw_depth, int) or raw_depth < 0:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_depth,
+                    f"task '{task_id}' carries a split depth this loop cannot "
+                    f"read ({raw_depth!r}), so whether it is already a successor "
+                    "of an earlier split cannot be established — and reading that "
+                    "as 'not yet split' is how the one-level bound would switch "
+                    "itself off. An operator has to look at its row. Nothing was "
+                    "changed.",
+                ),
+            )
+            return
+        depth = int(raw_depth)
+        if depth >= MAX_SPLIT_DEPTH:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_depth,
+                    f"task '{task_id}' is already a successor of an earlier "
+                    f"split, at split depth {depth} (cap {MAX_SPLIT_DEPTH}), so "
+                    "it cannot be split again. One level is the whole bound: "
+                    "subdividing without one is how a verb for oversized work "
+                    "becomes a way to defer it forever, because 'one testable "
+                    "claim' is a judgement that can always be applied again. "
+                    "`revise` it, or `stop` for a human. Nothing was changed.",
+                ),
+            )
+            return
+        if len(specs) < MIN_CEILING_SPLIT_TASKS:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_too_small,
+                    f"a split of '{task_id}' must name at least "
+                    f"{MIN_CEILING_SPLIT_TASKS} successors; this one names "
+                    f"{len(specs)}. A single successor inherits the parent's "
+                    "spend and then hands the SAME unit of work a fresh floor of "
+                    "attempts under a new id — a rename that buys budget, not a "
+                    "split. A task that is already ONE claim is not too big to "
+                    "review: if the work is wrong, `revise` it. Nothing was "
+                    "changed.",
+                ),
+            )
+            return
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateError, OSError) as exc:
+            # Unreadable, NOT absent — the fail-closed reading `recut` and the
+            # ceiling split both take. A record this cannot parse may name a
+            # published candidate, and it carries the spend every successor's
+            # budget is derived from. `_apply_split` re-reads it below; the read
+            # is duplicated because the checks between here and there need the
+            # candidate sha, and re-reading a small JSON file on a rare path is
+            # cheaper than threading a loaded record through the shared body.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_record_unreadable,
+                    f"task '{task_id}' has an execution record this loop cannot "
+                    f"read ({exc}), so neither its published state nor the "
+                    "attempts its successors must inherit can be established. An "
+                    "operator has to look at it. Nothing was changed.",
+                ),
+            )
+            return
+        if execution is None:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_no_execution,
+                    f"task '{task_id}' has no execution record — it has never "
+                    "been dispatched, so there is no candidate whose size could "
+                    "have been judged, no spend for successors to inherit and "
+                    "nothing to retire. Re-scoping a task that has not started "
+                    "is a roadmap edit, not a split. Nothing was changed.",
+                ),
+            )
+            return
+        if execution.published_sha:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_candidate_published,
+                    f"task '{task_id}' has ALREADY PUBLISHED candidate "
+                    f"{execution.published_sha[:12]} — published work is never "
+                    "retired by this loop. If what shipped needs following up, "
+                    "that is a new task. Nothing was changed.",
+                ),
+            )
+            return
+        if not execution.candidate_sha:
+            # THE EVIDENCE REQUIREMENT. Deliberately AFTER the published check
+            # so a published task is told the truer thing about itself.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "reviewer_split_no_candidate",
+                    f"task '{task_id}' has committed no candidate, so nothing "
+                    "has been produced for you to judge as too large to review. "
+                    "`split` answers evidence — a candidate you were shown and "
+                    "could not be shown in one piece — and a split proposed "
+                    "before any work exists is a re-scoping that defers the task "
+                    "instead. Let it produce a candidate first, or `stop` and "
+                    "let an operator re-plan it. Nothing was changed.",
+                ),
+            )
+            return
+        outstanding = self._recut_outstanding_verdict(
+            state, task_id, execution.candidate_sha
+        )
+        if outstanding:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "reviewer_split_verdict_outstanding",
+                    f"candidate {execution.candidate_sha[:12]} for task "
+                    f"'{task_id}' was presented for review under request "
+                    f"'{outstanding}', which this reply does not answer — so an "
+                    "approval for it can still arrive and the work may already "
+                    "be approved. Judge that packet first, then split if it is "
+                    "still needed. Nothing was changed.",
+                ),
+            )
+            return
+        self._apply_split(directive, task, specs, origin)
+
+    def _apply_split(
+        self,
+        directive: Directive,
+        parent: Task,
+        specs: tuple[TaskSpec, ...],
+        origin: SplitOrigin,
+    ) -> None:
+        """Retire `parent` into `specs` across the registry, the execution
+        record and the worker repository. THE acceptance — there is one, and
+        both triggers reach it here.
+
         EVERY refusal happens before anything moves, and the writes that do move
         are ordered so the residue a crash leaves is the loudest one available:
         the children are added and the parent retired into them by
@@ -8097,54 +8585,18 @@ class Orchestrator:
         `recut` and an operator `release` already use.
         """
         state = self.state
-        specs = directive.tasks or ()
         if self._execution_store is None or self._worker_repos is None:
+            # Unreachable from either caller — both check first, so that a
+            # trigger-specific sentence can be given. Kept because a guard whose
+            # absence would be a `None` attribute error mid-retirement is not a
+            # guard the callers should be trusted to hold for it.
             self._handle_policy_denial(
                 directive,
                 Verdict.deny(
-                    "ceiling_split_unavailable",
+                    origin.code_unavailable,
                     "this loop has no execution store and worker-repository "
                     "manager configured, so it cannot retire the parent's record "
-                    "and worker — and adding subtasks while leaving the parent's "
-                    "candidate live is worse than doing neither. Nothing was "
-                    "changed.",
-                ),
-            )
-            return
-        may_extend, may_split = self._ceiling_remedies(parent)
-        if not may_split:
-            self._handle_policy_denial(
-                directive,
-                Verdict.deny(
-                    "ceiling_split_depth",
-                    f"task '{parent.id}' is already a subtask at split depth "
-                    f"{self._nonneg_int(parent.split_depth)} (cap "
-                    f"{MAX_SPLIT_DEPTH}), so it cannot be decomposed again — "
-                    "splitting without a bound is how one looping task becomes "
-                    "an unbounded family of them. "
-                    + (
-                        "Answer with a differing `decomposition` for it instead, "
-                        "or with `stop`."
-                        if may_extend
-                        else "Answer with `stop`."
-                    )
-                    + " Nothing was changed.",
-                ),
-            )
-            return
-        if len(specs) < MIN_CEILING_SPLIT_TASKS:
-            self._handle_policy_denial(
-                directive,
-                Verdict.deny(
-                    "ceiling_split_too_small",
-                    f"a decomposition of '{parent.id}' must name at least "
-                    f"{MIN_CEILING_SPLIT_TASKS} subtasks; this plan names "
-                    f"{len(specs)}. One subtask inherits the parent's spend and "
-                    "then hands the SAME unit of work a fresh floor of attempts "
-                    "under a new id, which is a rename that buys budget. If the "
-                    "work really is one unit, that is answer A — `revise` with a "
-                    "`decomposition` that differs from the one on record. "
-                    "Nothing was changed.",
+                    "and worker. Nothing was changed.",
                 ),
             )
             return
@@ -8153,7 +8605,7 @@ class Orchestrator:
             self._handle_policy_denial(
                 directive,
                 Verdict.deny(
-                    "ceiling_split_names_parent",
+                    origin.code_names_parent,
                     f"this plan names '{parent.id}' as one of its own subtasks. "
                     "The parent is retired into its children, so a child under "
                     "the same id cannot be created and the split would be "
@@ -8162,12 +8614,29 @@ class Orchestrator:
                 ),
             )
             return
+        stranding = self._successors_that_would_strand(parent, specs)
+        if stranding:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    origin.code_dependency_stranded,
+                    "this plan would leave a successor waiting forever: "
+                    + "; ".join(stranding)
+                    + ". `state_of` counts a dependency satisfied only when it "
+                    "is completed (or shipped elsewhere), and neither a retired "
+                    "task nor the parent being retired here can ever reach that "
+                    "— there is no command that would release such a successor "
+                    "afterwards. Order the successors among THEMSELVES if one "
+                    "must follow another. Nothing was changed.",
+                ),
+            )
+            return
         blocking = self._in_progress_dependents(parent.id)
         if blocking:
             self._handle_policy_denial(
                 directive,
                 Verdict.deny(
-                    "ceiling_split_dependent_in_progress",
+                    origin.code_dependent_in_progress,
                     f"task(s) {', '.join(blocking)} depend on '{parent.id}' and "
                     "are in progress, so retiring it would rewrite the "
                     "dependencies a running dispatch is being judged against. "
@@ -8184,7 +8653,7 @@ class Orchestrator:
             self._handle_policy_denial(
                 directive,
                 Verdict.deny(
-                    "ceiling_split_record_unreadable",
+                    origin.code_record_unreadable,
                     f"task '{parent.id}' has an execution record this loop cannot "
                     f"read ({exc}), so neither its published state nor the "
                     "attempts its children must inherit can be established. An "
@@ -8196,7 +8665,7 @@ class Orchestrator:
             self._handle_policy_denial(
                 directive,
                 Verdict.deny(
-                    "ceiling_split_no_execution",
+                    origin.code_no_execution,
                     f"task '{parent.id}' has no execution record, so there is no "
                     "spend for its children to inherit and nothing to retire. "
                     "Nothing was changed.",
@@ -8207,7 +8676,7 @@ class Orchestrator:
             self._handle_policy_denial(
                 directive,
                 Verdict.deny(
-                    "ceiling_split_candidate_published",
+                    origin.code_candidate_published,
                     f"task '{parent.id}' has ALREADY PUBLISHED candidate "
                     f"{execution.published_sha[:12]} — published work is never "
                     "retired by this loop. If it is wrong, that is a new task. "
@@ -8246,14 +8715,14 @@ class Orchestrator:
                 SplitIntent(
                     parent_id=parent.id,
                     child_ids=child_ids,
-                    reason=CEILING_SPLIT_RETIREMENT_REASON,
+                    reason=origin.label,
                 )
             )
         except OSError as exc:
             self._handle_policy_denial(
                 directive,
                 Verdict.deny(
-                    "ceiling_split_intent_unwritable",
+                    origin.code_intent_unwritable,
                     f"the durable marker recording this decomposition of "
                     f"'{parent.id}' could not be written ({exc}), and without it a "
                     "crash partway through would leave the registry describing a "
@@ -8279,6 +8748,12 @@ class Orchestrator:
                 ),
             )
             return
+        # Idempotent for the reviewer trigger, where the parent normally carries
+        # no request at all: `clear_ceiling_plan_request` writes `""` over `""`.
+        # It is not skipped for that trigger, because a task CAN be split by the
+        # reviewer while a ceiling request is standing, and a retired row that
+        # kept the marker would be offered as the pending parent of the next
+        # unrelated `plan` — a split applied to the wrong task.
         self._registry.clear_ceiling_plan_request(parent.id)
         try:
             release = release_task_to_pending(
@@ -8287,15 +8762,12 @@ class Orchestrator:
                 self._execution_store,
                 self._worker_repos,
                 persist=lambda: self._task_store.save(self._registry),
-                reason=CEILING_SPLIT_RETIREMENT_REASON,
+                reason=origin.label,
                 tolerate_retirement_failure=True,
                 move=lambda tid: self._registry.retire(
                     tid,
                     superseded_by=child_ids,
-                    reason=(
-                        "decomposed at the attempt ceiling into "
-                        + ", ".join(child_ids)
-                    ),
+                    reason=f"{origin.retirement_note} " + ", ".join(child_ids),
                 ),
             )
         except TaskGraphError as exc:
@@ -8313,14 +8785,14 @@ class Orchestrator:
             self._clear_split_intent(parent.id)
             state.last_response = None
             self._to_needs_user(
-                f"task {parent.id}: its decomposition into "
+                f"task {parent.id}: its split into "
                 f"{', '.join(child_ids)} was half-applied — the subtasks now "
                 f"exist, but the parent could not be retired into them ({exc}). "
                 "Its candidate, worker repository and execution record are all "
                 "untouched. Retire it by hand once the obstacle is cleared, or "
                 "remove the subtasks.",
                 kind="task_fatal",
-                code="ceiling_split_parent_not_retired",
+                code=origin.code_parent_not_retired,
                 task_id=parent.id,
                 detail=f"children={','.join(child_ids)} error={exc.code}: {exc}",
             )
@@ -8328,7 +8800,7 @@ class Orchestrator:
 
         retirement = release.retirement
         self._log(
-            "task_ceiling_split",
+            origin.log_event,
             request_id=state.last_response.request_id if state.last_response else None,
             data={
                 "task_id": parent.id,
@@ -8384,7 +8856,7 @@ class Orchestrator:
         if not release.artifacts_retired:
             state.last_response = None
             self._to_needs_user(
-                f"task {parent.id}: it was decomposed into "
+                f"task {parent.id}: it was split into "
                 f"{', '.join(child_ids)} and retired, but its artefacts could "
                 f"not be retired — {release.obstacle}. "
                 + (
@@ -8403,7 +8875,7 @@ class Orchestrator:
                 "marker is deliberately KEPT, so the next start retries the "
                 "retirement by itself once the obstacle is gone.",
                 kind="task_fatal",
-                code="ceiling_split_retirement_failed",
+                code=origin.code_retirement_failed,
                 task_id=parent.id,
                 detail=(
                     f"children={','.join(child_ids)} "
@@ -8414,7 +8886,12 @@ class Orchestrator:
             )
             return
 
-        state.outbox = self._ceiling_split_report(
+        report = (
+            self._ceiling_split_report
+            if origin.kind == "ceiling"
+            else self._reviewer_split_report
+        )
+        state.outbox = report(
             directive,
             parent,
             execution,
@@ -8431,6 +8908,61 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
+
+    def _successors_that_would_strand(
+        self, parent: Task, specs: tuple[TaskSpec, ...]
+    ) -> list[str]:
+        """Successor dependencies that could never be satisfied, in words — one
+        entry per offending `(successor, dependency)` pair, empty when the plan
+        is reachable.
+
+        THE STRAND PRECONDITION FOR THE SUCCESSORS, and it is the mirror of the
+        one `TaskRegistry.retire` already applies to the parent's DEPENDENTS.
+        `state_of` satisfies a dependency on `SATISFIES_DEPENDENCY` and nothing
+        else, so a successor waiting on a task that has reached any other
+        terminal status waits forever, and there is no supported command that
+        releases it — the operator route is `--rewrite-dependents`, which had to
+        be used by hand twice on 2026-08-24.
+
+        Two shapes are refused, and both are reachable rather than theoretical:
+
+          * a successor depending on THE PARENT. `add_many` accepts it (the
+            parent is still live at that moment), and then `retire` re-points
+            that edge at the live successors — so every successor ends up
+            depending on all the others, and if they ALL name the parent that is
+            a cycle `_check_acyclic` raises on, from INSIDE `retire`, after the
+            children are already in the registry. That is the half-applied
+            `*_parent_not_retired` park, reached from a plan a refusal could
+            have caught for free.
+          * a successor depending on an already-RETIRED task, which `add_many`
+            accepts because the row exists and which nothing downstream would
+            ever satisfy.
+
+        Deliberately NOT refused: a dependency on a `blocked` task (an operator
+        can release it), on a `pending`/`in_progress` one (the ordinary case), on
+        a sibling in this same batch, or on an id that does not exist at all —
+        that last one is `add_many`'s own atomic refusal, which fires before the
+        marker is cleared and reports the graph error verbatim.
+        """
+        sibling_ids = {s.id for s in specs}
+        problems: list[str] = []
+        for spec in specs:
+            for dep in spec.depends_on:
+                if dep in sibling_ids:
+                    continue
+                if dep == parent.id:
+                    problems.append(
+                        f"'{spec.id}' depends on '{parent.id}', the task being "
+                        "retired by this split"
+                    )
+                    continue
+                if self._registry.has(dep) and (
+                    self._registry.get(dep).status == "retired"
+                ):
+                    problems.append(
+                        f"'{spec.id}' depends on '{dep}', which is retired"
+                    )
+        return problems
 
     def _in_progress_dependents(self, task_id: str) -> list[str]:
         """Ids of DIRECT dependents of `task_id` that are in progress.
@@ -8479,6 +9011,46 @@ class Orchestrator:
             "starts it, and cannot be dispatched at all without `approved_paths`."
         )
 
+    def _reviewer_split_report(
+        self, directive, parent, execution, child_ids, inherited, child_cap, release
+    ) -> str:
+        """What the loop tells the reviewer after its own `split` landed.
+
+        A SECOND report and not a second mechanism: the acceptance was the same
+        one a ceiling decomposition runs, and what differs is the two things a
+        reviewer that chose this verb needs and the ceiling text does not say —
+        that the discarded candidate is still on disk under a label naming THIS
+        decision, and that the one level of subdivision is now spent, so the
+        successors cannot be split again by anyone, through either trigger.
+        """
+        retirement = release.retirement
+        return (
+            f"SPLIT APPLIED — task {parent.id} is retired into "
+            f"{', '.join(child_ids)}.\n\n"
+            f"Your reason: {directive.reason}\n\n"
+            f"Its candidate {execution.candidate_sha[:12] or '(none committed)'} "
+            f"on {execution.task_branch} was NOT deleted: the execution record "
+            "was archived to "
+            f"{retirement.record_path if retirement and retirement.record_path else '(no record on disk)'} "
+            "and the worker repository quarantined at "
+            f"{retirement.worker_path if retirement and retirement.worker_path else '(no worker on disk)'}"
+            f", both under the label {retirement.label if retirement else '(none)'}. "
+            f"The parent's row records `superseded_by = {', '.join(child_ids)}`, "
+            "so a reader follows it from the retired task to its successors.\n\n"
+            f"THE BUDGET IS NOT REFUNDED. Each successor inherits the {inherited} "
+            f"attempt(s) already spent, so each starts with {child_cap} of the "
+            f"usual {MAX_TASK_ATTEMPTS} — a split is a re-scoping, not a fresh "
+            "allowance.\n\n"
+            f"THE ONE LEVEL IS NOW SPENT. These successors are at split depth "
+            f"{self._nonneg_int(parent.split_depth) + 1} of {MAX_SPLIT_DEPTH}: "
+            "none of them may be split again, by this verb or at its own attempt "
+            "ceiling. Each may still be extended once at that ceiling, and a "
+            "successor that still cannot be delivered is `stop` for a human.\n\n"
+            "They are ORDINARY tasks: each needs its own `decomposition` on the "
+            "`implement` that starts it, and cannot be dispatched at all without "
+            "`approved_paths`."
+        )
+
     # ---- split acceptance: the startup half ---------------------------------
 
     def _clear_split_intent(self, parent_id: str) -> None:
@@ -8502,8 +9074,9 @@ class Orchestrator:
     def _reconcile_split_acceptance(self) -> None:
         """Finish, or discard, every split acceptance a crash left in flight.
 
-        THE invariant this exists for: after `_dispatch_ceiling_split` has
-        started, the task registry, the parent's execution record and the
+        THE invariant this exists for: after `_apply_split` has
+        started — through either trigger, the ceiling decomposition or the
+        reviewer's own `split` — the task registry, the parent's execution record and the
         parent's worker repository are either all in agreement, or a durable
         marker names the parent and the next start settles it. There is no third
         state, and before split-04 there was: a process that died between the

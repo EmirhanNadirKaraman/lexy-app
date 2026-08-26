@@ -343,10 +343,10 @@ class PolicyEngine:
         Commits and pushes happen ONLY via directives whose decision explicitly
         approves them (enforced structurally: the orchestrator calls the git
         gateway only from those branches); this check adds the configurable
-        layer on top. Task references (implement/revise, and the optional
-        completion id on commits) must point at a known task that is not
-        blocked and not already completed — deterministic graph state, never
-        ChatGPT's claim about it.
+        layer on top. Task references (implement/revise, the task a `split`
+        retires, and the optional completion id on commits) must point at a
+        known task that is not blocked and not already completed —
+        deterministic graph state, never ChatGPT's claim about it.
 
         A RETIRED decision (`ask_user` today) is refused here
         unconditionally — see the check below.
@@ -395,6 +395,27 @@ class PolicyEngine:
                 verdict = self._check_decomposition(directive, registry)
                 if not verdict.allowed:
                     return verdict
+        elif decision is Decision.SPLIT:
+            # A `split` names the task it retires, so the same deterministic
+            # graph check every other task-naming decision passes applies to it
+            # — and it is the only gate this layer puts on the verb. Everything
+            # ELSE a split may be refused for (the depth cap, the successor
+            # count, an unpublished-verdict hazard, a missing candidate) is
+            # dispatch-time state, not policy configuration, and lives in
+            # `orchestrator._dispatch_split` exactly as `recut`'s bounds live in
+            # `_dispatch_recut`.
+            #
+            # It earns its place here rather than being another line down there:
+            # `task_retired`'s denial is the one that NAMES the successor a
+            # retired id was superseded by, which is precisely what a reviewer
+            # asking to split an already-split task needs to be told, and
+            # duplicating that lookup at dispatch would be a second copy of the
+            # rule. NOT phase-gated on `implement_enabled`, for the same reason
+            # `recut` is not: the phase gate authorizes write-capable executor
+            # work, and a split runs no executor.
+            verdict = self._check_task_reference(directive.task_id, registry)
+            if not verdict.allowed:
+                return verdict
         elif decision in COMMIT_DECISIONS and directive.task_id is not None:
             # Completing an already-completed task is an idempotent no-op
             # (crash recovery re-dispatches the same approval), so it is

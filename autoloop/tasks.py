@@ -938,12 +938,14 @@ class Task:
     #: TEXT rather than a list of step records, deliberately. It is agent
     #: instructions in the same category as `description`, nothing schedules or
     #: dispatches per step, and a machine-actionable step list here would be a
-    #: second way to split a task. There is exactly one way, and it is a
-    #: reviewer's `plan` answering an attempt-ceiling classification request
-    #: (`orchestrator._dispatch_ceiling_split`, ceil-01): subtasks added,
-    #: parent's spend carried onto them, parent retired into them. This comment
-    #: used to credit `split-01` with that mechanism — a task recorded completed
-    #: whose work never shipped, so it named code that did not exist.
+    #: second way to split a task. There is exactly one way — subtasks added,
+    #: parent's spend carried onto them, parent retired into them, all in
+    #: `orchestrator._apply_split` — reached by two reviewer decisions: a `plan`
+    #: answering an attempt-ceiling classification request (ceil-01) and a
+    #: `split` judging the task undeliverable as one candidate (split-03).
+    #: Neither reads this field. This comment used to credit `split-01` with
+    #: that mechanism — a task recorded completed whose work never shipped, so
+    #: it named code that did not exist.
     #:
     #: Written only by `set_decomposition`, from the dispatch path, before the
     #: executor for that round starts. New field with a default, so a
@@ -1046,8 +1048,9 @@ class Task:
     #: cannot read rather than defaulting it to 0: reading an unreadable grant
     #: count as "none spent yet" hands back the whole allowance silently.
     attempt_extensions: int = 0
-    #: Attempts this task's PARENT had already spent when a reviewer decomposed
-    #: it at the attempt ceiling — carried onto every child at creation and never
+    #: Attempts this task's PARENT had already spent when a reviewer split it —
+    #: at the attempt ceiling (ceil-01) or by judging it undeliverable as one
+    #: candidate (split-03) — carried onto every child at creation and never
     #: rewritten afterwards.
     #:
     #: THE ANTI-REFUND. A split that gave each subtask a fresh
@@ -1059,10 +1062,12 @@ class Task:
     #: child born with a budget of zero simply rebuilds the park this exists to
     #: remove.
     inherited_attempts: int = 0
-    #: How many ceiling decompositions separate this task from a task a reviewer
-    #: planned directly: 0 for every ordinary task, parent's + 1 for a child.
+    #: How many splits separate this task from a task a reviewer planned
+    #: directly: 0 for every ordinary task, parent's + 1 for a child.
     #: `orchestrator.MAX_SPLIT_DEPTH` reads it, and is what stops a subtask
-    #: splitting again without limit.
+    #: splitting again without limit — through EITHER trigger, since both a
+    #: ceiling decomposition and a reviewer `split` write and read this same
+    #: field. That is the bound on "defer the work by splitting it again".
     split_depth: int = 0
     #: WHEN this task asked the reviewer to classify it at the attempt ceiling,
     #: as a UTC timestamp. `""` — the ordinary state — means "not waiting on a

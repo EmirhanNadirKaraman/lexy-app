@@ -76,6 +76,44 @@ class Decision(str, Enum):
     #: moving the sentence fails the suite rather than quietly telling the
     #: reviewer it has a cut it does not have.
     RECUT = "recut"
+    #: The named task cannot be delivered as ONE reviewable candidate, and this
+    #: is the reviewer saying so as a decision instead of as prose. `tasks`
+    #: carries the proposed successors — ordinary `TaskSpec`s, the same shape a
+    #: `plan` uses, so what a split produces is an ordinary roadmap task with
+    #: the same registry, the same validation and the same `approved_paths`
+    #: rules as any other.
+    #:
+    #: Why the three verbs already here are each wrong for it: `revise` tells
+    #: the agent to try again at the SAME size (brw-14's round 1 was not wrong;
+    #: repeating it produces the same 416KB range diff that
+    #: `packet.RANGE_DIFF_MAX_BYTES` refused); `recut` discards a contaminated
+    #: branch and re-cuts THE SAME TASK; `stop` ends the round with a reason
+    #: nobody acts on automatically, leaving the task exactly as large.
+    #:
+    #: ONE LEVEL, NOT RECURSION. The payload is FLAT: a `TaskSpec` has no key
+    #: through which a successor could carry a split of its own, so a nested
+    #: proposal dies at `unknown_keys` rather than being applied. A successor is
+    #: an ordinary task afterwards and is bounded by the same
+    #: `orchestrator.MAX_SPLIT_DEPTH` a ceiling decomposition is — recursive
+    #: subdivision inside one directive has no floor ("one testable claim" is a
+    #: judgement and can always be applied again), and every extra task costs a
+    #: full round.
+    #:
+    #: REFUSABLE, and bounded by `orchestrator._dispatch_split` rather than by
+    #: this enum, exactly like `RECUT` above: at most one level of subdivision
+    #: per planned task, never fewer than `orchestrator.MIN_CEILING_SPLIT_TASKS`
+    #: successors, never a published candidate, never one whose verdict is still
+    #: outstanding, and never a task that has produced no candidate to judge as
+    #: too large. Nothing is deleted — the parent is RETIRED into its successors
+    #: through the registry's own supersession, and its record and worker are
+    #: moved aside.
+    #:
+    #: There is exactly ONE acceptance path and this does not add a second: the
+    #: directive routes into `orchestrator._apply_split`, which is the body a
+    #: ceiling decomposition has used since ceil-01 (marker, `add_many`,
+    #: `retire(superseded_by=...)`, `release_task_to_pending`) with a different
+    #: label on it.
+    SPLIT = "split"
     STOP = "stop"
     #: RETIRED — no longer offered by CONTRACT_INSTRUCTIONS, still parsed. A
     #: live conversation that already saw the old instructions can answer
@@ -96,9 +134,18 @@ TASK_DECISIONS = frozenset({Decision.IMPLEMENT, Decision.REVISE})
 # Decisions that must NAME a task, whatever they then do with it. `recut` is
 # not a TASK_DECISION — it authorizes no executor work and carries no
 # decomposition — but a recut with no task id names nothing to discard, so
-# `task_id` is required for it too. Derived rather than restated so a third
-# task-naming decision cannot be added to one list and forgotten in the other.
-NAMES_A_TASK = TASK_DECISIONS | {Decision.RECUT}
+# `task_id` is required for it too. `split` is here for the same reason: a
+# split that names no parent names nothing to decompose, and a destructive verb
+# must never guess which work it is about. Derived rather than restated so a
+# fourth task-naming decision cannot be added to one list and forgotten in the
+# other.
+NAMES_A_TASK = TASK_DECISIONS | {Decision.RECUT, Decision.SPLIT}
+# Decisions whose `tasks` key carries a batch of `TaskSpec`s. TWO, and they mean
+# different things with the same payload: `plan` ADDS them to the roadmap,
+# `split` proposes them as the successors a named task is retired into. The
+# shape is deliberately identical — reusing `TaskSpec` is what makes a split's
+# successors ORDINARY tasks rather than something only the splitter understands.
+CARRIES_TASK_SPECS = frozenset({Decision.PLAN, Decision.SPLIT})
 # Decisions that authorize a git commit.
 COMMIT_DECISIONS = frozenset({Decision.COMMIT, Decision.COMMIT_AND_PUSH})
 # Decisions that authorize a git push.
@@ -216,15 +263,19 @@ class Decomposition:
     implementing agent, in the same category as `tasks.Task.description`, and
     keeping them prose is what stops this becoming a second split mechanism.
 
-    The FIRST one — the only one — is `plan`, answering a task's attempt-ceiling
-    classification request (ceil-01, 2026-08-25): `orchestrator.
-    _dispatch_ceiling_split` adds the subtasks, carries the parent's spent
-    attempts onto them, and retires the parent into them across the registry,
-    the execution record and the worker repo. That is where a task becomes
-    several. (An earlier revision of this paragraph credited `split-01` with
-    that mechanism; `split-01` is recorded completed but never shipped one —
-    `autoloop/tests/test_shipped_elsewhere.py` lists it among the tasks whose
-    work is not in the base — so the sentence named code that does not exist.)
+    A task becomes several through exactly ONE piece of code —
+    `orchestrator._apply_split`, which adds the subtasks, carries the parent's
+    spent attempts onto them, and retires the parent into them across the
+    registry, the execution record and the worker repo. TWO decisions reach it,
+    and they are two TRIGGERS on one mechanism rather than two mechanisms:
+    `plan`, answering a task's attempt-ceiling classification request (ceil-01,
+    2026-08-25, via `_dispatch_ceiling_split`), and `split`, the reviewer
+    judging a task undeliverable as one candidate (split-03, 2026-08-26, via
+    `_dispatch_split`). Neither reads this field. (An earlier revision of this
+    paragraph credited `split-01` with that mechanism; `split-01` is recorded
+    completed but never shipped one — `autoloop/tests/test_shipped_elsewhere.py`
+    lists it among the tasks whose work is not in the base — so the sentence
+    named code that does not exist.)
 
     **Optional here, required by `policy.authorize_directive` — for `revise`
     too.** The same layering `TaskSpec.approved_paths` already uses: requiring
@@ -281,6 +332,11 @@ class Directive:
     decision: Decision
     reason: str
     scope: str | None = None
+    #: The task batch, for the two decisions that carry one
+    #: (`CARRIES_TASK_SPECS`): the tasks a `plan` adds to the roadmap, or the
+    #: successors a `split` proposes for `task_id`. Same type either way — a
+    #: split's successors are ordinary tasks, and giving them their own type
+    #: here is how they would stop being.
     tasks: tuple[TaskSpec, ...] | None = None
     task_id: str | None = None
     feedback: str | None = None
@@ -358,16 +414,16 @@ trailing text is REJECTED, never guessed at. One object, these keys only:
 
   version    (required) always 3
   decision   (required) one of: audit | plan | implement | revise | commit |
-             push | commit_and_push | recut | stop
+             push | commit_and_push | recut | split | stop
   reason     (required) one short sentence explaining the decision
   scope      (audit only, optional) what the audit should focus on
-  tasks      (required for plan) list of {id, title, description, depends_on?,
-             approved_paths?}. id: a slug ([A-Za-z0-9._-], max 64).
+  tasks      (required for plan and split) list of {id, title, description,
+             depends_on?, approved_paths?}. id: a slug ([A-Za-z0-9._-], max 64).
              depends_on: ids of existing tasks or tasks in this same batch.
              approved_paths: the EXACT repo-relative files this task may touch
              — no globs, no "..", no absolute paths; name new files. A task
              with no approved path cannot be implemented.
-  task_id    (required for implement/revise/recut; optional for commit /
+  task_id    (required for implement/revise/recut/split; optional for commit /
              commit_and_push, marking that task completed)
   decomposition (required for implement) {approach, files, steps}; steps are
              worked in order; one step with a reason is valid.
@@ -407,9 +463,17 @@ Decisions:
     REFUSED for a published candidate, one whose verdict is outstanding, and
     after 2 recuts of a task (the third parks for a human: two clean cuts
     failing means the SPEC is wrong, not the branch).
+  split — task_id cannot be delivered as ONE reviewable candidate. `tasks` are
+    the SUCCESSORS it is retired into: ordinary tasks, each with its own
+    `approved_paths`. At least 2, and ONE LEVEL — a successor may never be
+    split again. No successor may depend on task_id. REFUSED with no candidate
+    yet, a published one, an outstanding verdict, or a task already split.
+    Nothing is deleted; the parent is retired into the successors it names.
   stop — end the loop.
 `recut` vs `stop`: `recut` is YOU deciding a branch is beyond saving; `stop`
-asks a HUMAN to decide. Unsure? Use `stop`."""
+asks a HUMAN to decide. Unsure? Use `stop`.
+`split` vs `revise` vs `recut`: `revise` is the same task at the same SIZE;
+`recut` the same task from a clean BASE; `split` is a task too big to review."""
 
 #: A scheduling PREFERENCE, appended to the response format above.
 #:
@@ -513,10 +577,22 @@ def _forbid(field: str, value: object, decision: Decision) -> None:
         )
 
 
-def _parse_task_specs(raw: object) -> tuple[TaskSpec, ...]:
+def _parse_task_specs(raw: object, decision: Decision) -> tuple[TaskSpec, ...]:
+    """The `tasks` batch, validated for SHAPE only.
+
+    HOW MANY specs a decision needs is not this function's call. `split`
+    requires at least `orchestrator.MIN_CEILING_SPLIT_TASKS` successors, and
+    that count is enforced at dispatch for the same layering reason
+    `TaskSpec.approved_paths` and `Decomposition` already use: a one-successor
+    split is a well-formed directive that is not AUTHORIZED, so it draws a
+    policy-style denial — which explains itself, names the alternative, and is
+    bounded by the denial budget — instead of spending the much smaller
+    parse-retry budget on a correction that says "send more".
+    """
     if not isinstance(raw, list) or not raw:
         raise ContractError(
-            "missing_field:tasks", "'tasks' must be a non-empty list for decision 'plan'"
+            "missing_field:tasks",
+            f"'tasks' must be a non-empty list for decision '{decision.value}'",
         )
     specs: list[TaskSpec] = []
     for i, item in enumerate(raw):
@@ -726,8 +802,8 @@ def parse_response(text: str) -> Directive:
         _forbid("scope", scope_raw, decision)
 
     tasks = None
-    if decision is Decision.PLAN:
-        tasks = _parse_task_specs(tasks_raw)
+    if decision in CARRIES_TASK_SPECS:
+        tasks = _parse_task_specs(tasks_raw, decision)
     else:
         _forbid("tasks", tasks_raw, decision)
 
