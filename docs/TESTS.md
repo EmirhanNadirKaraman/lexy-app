@@ -3103,6 +3103,7 @@ one job per command so a failure names its own suite:
 |---|---|---|
 | `lint` | `ruff check .` *(repo root)* | ruff installed at the pin read out of `lexy-app/backend/requirements.txt`, so a bump there moves CI with it instead of silently diverging |
 | `pipeline` | `python3 -m pytest tests/ -q` | installs the full backend requirement set, then downloads three spaCy models |
+| `docs` | inline stdlib Python over `docs/` | the four change-note trackers' section shape + the ≤700-character note limit, and `docs/audit_charters.toml` parsing to the six expected domains. Added by port-05; see "What the autoloop job used to guard" below for why it is here rather than in a test file |
 
 Deliberate choices, so they don't get "fixed" back:
 
@@ -3116,7 +3117,9 @@ Deliberate choices, so they don't get "fixed" back:
   is a separate project, tested where it is maintained, and this workflow gates
   this repository only. Root `pytest.ini` still declares the `isolated` marker
   and still deselects it, but nothing under `tests/` carries it, so there is no
-  coverage here for that step to protect.
+  coverage here for that step to protect. **That job did, however, carry checks
+  about files in `docs/`** — see the accounting immediately below, and the
+  `docs` job that now carries the mechanical half.
 - **spaCy models are downloaded, not skipped.** `de_core_news_sm` is a hard
   requirement — `subtitle-scraper/phrase_finder.py:15` loads it at module
   scope, so its absence is a collection error, not a skip. `de_core_news_md`
@@ -3148,6 +3151,71 @@ suite passed** — run it locally.
 validation commands rt-10 was scoped to, and `npm audit` already runs in
 `dependency-audit.yml`. `npm run build` + `npx vitest run` remain ungated — a
 separate gap, deliberately left named rather than half-closed.
+
+### What the autoloop job used to guard — and what now guards it (port-05, 2026-08-26)
+
+Removing the `autoloop/tests` job did not only stop testing the harness. Two
+files in that suite make assertions about **files in this repository**, and they
+ran nowhere else:
+
+- `autoloop/tests/test_docs_merge.py` — the change-note trackers' shape
+  (`docs/COMMON_ERRORS.md`, `docs/SECURITY.md`, `docs/SUMMARY.md`,
+  `docs/TESTS.md`): exactly one CHANGE-NOTES marker per file, a trailing
+  newline, no heading after the marker, the file ending on a note row, and
+  every note line at most 700 characters. Plus content assertions on `CLAUDE.md`
+  and on `.gitattributes`.
+- `autoloop/tests/test_audit_charters.py` — `docs/audit_charters.toml` parses
+  and matches the six domains the audit expects.
+
+Once the harness is maintained elsewhere its suite roots at *its* checkout, so
+none of those assertions is about these files any more. That is a real coverage
+loss, and this is its accounting.
+
+**Preserved, by the `docs` job in `.github/workflows/tests.yml`:** the tracker
+section shape, the marker-appears-exactly-once rule, the ≤700-character note
+limit, and the charter file parsing to the six expected slugs with the four
+required fields. Written as literal path lists that fail when a file is
+*missing*, not as a glob that would pass on an empty match.
+
+**NOT preserved, and deliberately so:**
+
+- Every test that exercises `note_merge.resolve_note_append` or the real merge
+  sweep. Those are tests of the harness's code and belong with it.
+- `test_claude_md_tells_a_task_to_append_one_line` (CLAUDE.md wording) and
+  `test_the_split_summary_row_kept_every_note_it_carried` (a SUMMARY.md
+  content pin). Both are about this repository's prose; neither is restored here.
+- `test_the_repo_ships_no_merge_attribute_at_all` (`.gitattributes` must stay
+  rule-free).
+
+**Three honest limits on the `docs` job — read these before treating it as
+equivalent cover.**
+
+1. **It does not fire on the population it was written for.** The workflow's
+   `on:` block is `push`/`pull_request` to `main`, and the loop does not merge
+   into `main` — its integration branch is `autoloop/mainline`, and
+   `push_exact` refuses `main` outright (`protected_branches` defaults to
+   `("main", "master")`). So the exact case these rules exist for — two parallel
+   task branches each appending a note — reaches `autoloop/mainline` **without
+   passing this job**. It fires only when that work later reaches `main`. Widening
+   the trigger was deliberately not done here: `on:` is workflow-level, so adding
+   the loop's branch would also run `lint` and `pipeline` on every loop merge, and
+   a separate workflow file is outside port-05's scope.
+2. **It does not run during a loop round.** Round validation is `ruff check .`
+   plus `pytest tests/`; neither reads these files. An over-long change note
+   still costs the round that writes it, exactly as before.
+3. **Its 700 is a mirror** of `note_merge.MAX_NOTE_LINE_CHARS`, which remains
+   the authority; after the split there is no local constant to read, and the
+   harness wins any disagreement.
+
+A fourth, outside any file: **adding a job does not make it a required check.**
+Until `docs` is listed in branch protection, a red run blocks no merge. That is a
+GitHub setting, not something a commit here can do.
+
+Given (1) and (2), the load-bearing deliverable is **#45** in `docs/TODO.md` —
+restore these as repository-owned tests under `tests/`, where the loop's own
+validation runs them. Not done here because `tests/` is outside this task's
+approved scope. Treat the `docs` job as a backstop on the path to `main`, not as
+a replacement for the coverage that left.
 
 How the backend baseline got to 847, newest last:
 
@@ -3823,3 +3891,4 @@ whatever came after it.
 | 2026-08-26 | abort-01 | Same revision, the echo guard for the tests that still REPLAY that kill: the clause is now the module constant `VALIDATION_KILL_CLAUSE`, and `test_the_replayed_kill_clause_is_the_one_production_actually_writes` kills a real process group and compares the WHOLE string. Equality, not substring — `"validation subprocess" in reason` would still hold if `killable_run` wrapped a different sentence around those two words, and every replay assertion would stay green against a clause production no longer writes. |
 | 2026-08-26 | port-05 | No test added, removed or renamed. The test SURFACE narrowed: root `pytest.ini` drops `autoloop/tests` from `testpaths`, so a bare root `pytest` goes from 4,040 collected to 368. That is the intended change, not a regression — but it is a FAIL-OPEN one: the run stays GREEN while covering 3,672 fewer tests, so do not read a green root run here as evidence about the harness. `-p no:randomly` is unchanged and still load-bearing. `-m "not isolated"` and the `isolated` marker are KEPT although inert here — nothing under `tests/` carries that marker. |
 | 2026-08-26 | port-05 | `.github/workflows/tests.yml` loses its `autoloop` job, including the separate blocking `-m isolated` step; `lint` and `pipeline` remain. `ruff.toml` gains `extend-exclude = ["autoloop"]` — `extend-`, because a plain `exclude` REPLACES ruff's built-in exclusions and would start linting virtualenvs and `dist/`. "All checks passed!" is now a statement about this repository only. The autoloop-tests section above is banner-marked and frozen rather than deleted: excising it plus `docs/AUTOLOOP.md` would exceed the review packet cap. |
+| 2026-08-26 | port-05 | REVISION: `tests.yml` gains a `docs` job re-stating the repository-specific guards the removed autoloop job carried — tracker section shape, exactly one CHANGE-NOTES marker, the 700-character note-line limit, and `docs/audit_charters.toml` parsing to its six domains. Fail-closed on the file SET as well as the contents: a missing tracker is a failure, never an empty loop reporting success. New §"What the autoloop job used to guard" holds the preserved/not-preserved accounting; the remainder is tracked as docs/TODO.md #45. |

@@ -75,6 +75,13 @@ bare-`pytest` figure, which silently drops `test_document_package.py` — use
 `tests/` **368 collected**, `autoloop/tests` **3,672**, `ruff check .` still
 clean, alembic head still **037**.
 
+> **The `autoloop/tests` figure above is a dated measurement, not this
+> repository's coverage.** Since port-05 (2026-08-26) the loop harness is outside
+> this repository's tooling entirely — `pytest.ini` does not collect it,
+> `ruff.toml` excludes it, and `.github/workflows/tests.yml` has no job for it.
+> A bare root `pytest` here collects 368, not 4,040. Drop the figure at the next
+> re-measure; see `docs/AUTOLOOP_TODO.md` §D1 for the removal manifest.
+
 > Historical baselines quoted elsewhere in this file (847/274 as of
 > 2026-07-27, and 745 backend / 671 root / 238 frontend before that) are
 > as-measured at the time of the entry that quotes them. The root suite

@@ -258,9 +258,12 @@ Three things to know before "fixing" what it reports:
     fix. Import sorting (`I`) is off for the same reason plus the E402 trap
     above.
   - **`ruff check .` does not cover `autoloop/`.** That directory is a separate
-    project that happens to sit in this checkout — nothing here imports it and
-    it imports nothing from here — and it carries its own lint gate where it is
-    maintained. `ruff.toml` names it in `extend-exclude` (not `exclude`, which
+    project that happens to sit in this checkout — it imports nothing from here,
+    and exactly one file here imports it (`scripts/seed_validation_db.py:48`,
+    `from autoloop.validation_env import repo_declared_db_name`; that import is
+    docs/TODO.md **#46** and must be lifted before the directory is removed) —
+    and it carries its own lint gate where it is maintained. `ruff.toml` names
+    it in `extend-exclude` (not `exclude`, which
     would replace ruff's built-in exclusions and start linting virtualenvs and
     `dist/`). "All checks passed!" is therefore a statement about this
     repository only.
@@ -353,6 +356,7 @@ not boot. Two things to know before switching:
   - Adding a **new table row** for a file or a test you touched — the normal case — is a new line and is fine.
   - Anything else goes at the very end of the file, **below** the `<!-- CHANGE-NOTES: ... -->` comment: one line, `| date | task-id | note |`, appended after the last line. Nothing may follow it — no new heading, no trailing prose — or the next task's append lands inside your section instead of at the end of the ledger.
   - **Each of those lines has a hard length limit**, enforced by `autoloop/tests/test_docs_merge.py::test_every_change_note_line_is_short_enough_to_merge_by_line` over the WHOLE line — the `| date | task-id |` cells count, not just your sentence — so one over-long note fails validation and throws the round away (measured 2026-08-21: two full rounds, merge-04 and blk-02). The number lives in exactly one place, `autoloop/note_merge.MAX_NOTE_LINE_CHARS`, and is deliberately NOT copied here: a second copy would agree today and silently disagree the first time it moved. Read it there — the implementing agent is also told it directly, since `implement_executor._authoring_rules` renders it into every brief. If a note does not fit, append a second line.
+  - **Since port-05 (2026-08-26) that limit has a BACKSTOP in this repository — `.github/workflows/tests.yml`'s `docs` job — but it does not protect your round.** That job triggers on `main` only, and the loop merges into `autoloop/mainline`, so a note it would reject still reaches the loop's integration branch; and round validation is `ruff check .` plus `pytest tests/`, neither of which reads these files. Write the note correctly the first time: the harness rejecting it still throws the round away. The job also re-states the limit as a literal number, a deliberate second copy — the previous bullet's "one place" rule still names the authority, `note_merge.MAX_NOTE_LINE_CHARS` wins any disagreement, and a LAX mirror is the dangerous direction. Restoring these as real tests under `tests/` is docs/TODO.md **#45**; full accounting in `docs/TESTS.md` §"What the autoloop job used to guard".
   - Do **not** append a clause to an existing row, paragraph or note line to say what your task did — not even to the row for the file you changed. Split it into a second line instead (the four `state.py`, `transcript.py` rows in `SUMMARY.md` are the template: one dated note per line, same first cell).
   - Do not edit, delete or reorder a line someone else wrote. The resolver refuses the whole merge when a side does, and it is right to: a rewritten claim needs a human, and the sweep stopping is how you get one.
   - Since notes-04 (2026-08-23) that resolver fires in **both** merge directions, not only the one line 322 names: merging a task INTO the base branch (`auto_merge.AutoMerger._merge`) and merging the base branch's head INTO a task branch to refresh a stale base (`orchestrator._carry_reviewed_candidate_past`) both call `note_merge.combine_conflicted_notes`. Nothing you have to do differs — same four files, same one-line-at-the-end rule, same refusal for anything else. It means a change-note collision no longer parks a reviewed candidate as `task_base_behind_head`, which is what the rules above buy you. Read line 322's arrow as the first of two call sites.
