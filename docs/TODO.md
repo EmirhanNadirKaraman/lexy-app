@@ -797,6 +797,81 @@ Regression-guarded by 6 new tests in `tests/test_llm_cache_migration.py`: concur
 **Blocks:** learner correction layer; sentence-granularity reading SRS.
 **Relation:** supersedes the client-side `splitSentences()` in `BookReaderPage.tsx:24`.
 
+### 45. 🟡 Documentation guards that left with the loop harness — partially restored, remainder open
+
+**Opened 2026-08-26 by port-05.** The `autoloop/tests` CI job was removed
+because the harness is a separate project. Two of its files asserted things
+about **this repository's** `docs/`, and ran nowhere else:
+`test_docs_merge.py` (change-note tracker shape, the ≤700-character note line,
+plus content pins on `CLAUDE.md` and `.gitattributes`) and
+`test_audit_charters.py` (`docs/audit_charters.toml` parses to the six expected
+domains). Once the harness roots at its own checkout, none of that is about
+these files.
+
+**Partially restored** — `.github/workflows/tests.yml`'s `docs` job re-states the
+mechanical half: tracker section shape, exactly one CHANGE-NOTES marker, the
+≤700-character limit, and the charter file's six slugs and four required fields.
+It is a **backstop, not equivalent cover**: the workflow triggers on `main` only,
+and the loop merges into `autoloop/mainline`, so parallel task branches appending
+notes — the exact population these rules protect — land without passing it.
+
+**Still open — the reason this item exists:**
+1. Move that inline check into a real test under `tests/` so it runs in the
+   loop's own validation (`ruff check .` + `pytest tests/`), on every round and
+   on every branch, rather than only when work reaches `main`. This is the
+   substantive item: today an over-long change note still costs the round that
+   writes it, and the loop's own integration merges are ungated.
+1b. While `docs` is the only cover, list it as a **required check** in branch
+   protection. A job nobody requires blocks nothing when it goes red.
+2. Re-home the `CLAUDE.md` wording pin and the `docs/SUMMARY.md` split-row pin,
+   or record deliberately that this repository does not want them.
+3. Decide what owns `.gitattributes` staying rule-free. That file exists to stop
+   `merge=union` coming back; the test that enforced it is going.
+4. The 700 in the workflow is a **mirror** of the harness's
+   `note_merge.MAX_NOTE_LINE_CHARS`, which stays authoritative. A repo-side test
+   inherits the same duplication — decide whether the constant should be
+   published by the harness in a form this repository can read.
+
+**Not urgent, not free.** The failure mode is quiet: docs stay green while the
+rules that keep parallel branches merging are unenforced at round time.
+
+**Relation:** `docs/TESTS.md` §"What the autoloop job used to guard" holds the
+full preserved/not-preserved accounting.
+
+### 46. 🔴 `scripts/seed_validation_db.py` imports the loop harness and will break when it is removed
+
+**Opened 2026-08-26 by port-05.** `scripts/seed_validation_db.py:48`:
+
+```python
+from autoloop.validation_env import repo_declared_db_name  # noqa: E402
+```
+
+That is the **only** file outside `autoloop/` in this repository that imports
+the package. The script is ours, not the harness's — it seeds this repository's
+validation database with the synthetic corpus ~55 backend tests need in order to
+assert rather than skip. `git rm -r autoloop/` turns it into an `ImportError` at
+line 48, before it reads a single argument.
+
+**Neither validation command catches this.** `ruff check .` does not resolve
+imports, and nothing under `tests/` imports the script, so both stay green while
+the script is dead. The failure surfaces the next time someone rebuilds a
+validation database — which is exactly when they are least able to debug it.
+
+**Fix:** inline the one function. `repo_declared_db_name(repo_root)` reads
+`.env.example`'s `DB_NAME` and returns it; the script already computes
+`REPO_ROOT`. Lifting it removes the `sys.path.insert` and the `# noqa: E402`
+with it. The docstring's cross-reference to `autoloop/validation_env.py` should
+become a note that the two implement the same exact-match rule independently —
+the shared behaviour is a convention, not a shared import.
+
+**Do this BEFORE removing `autoloop/`, not after.** It is a self-contained
+change to one file and it makes the removal a clean subtraction.
+
+**Relation:** `docs/AUTOLOOP_REMOVAL.md` is the full removal manifest, and this
+item is its Step 0. That document is language-app's, not the harness's, and is
+deliberately absent from its own `git rm` list — it survives the removal and
+becomes the record of it.
+
 ---
 
 ## P4 — Polish. Pleasant to do, not load-bearing.

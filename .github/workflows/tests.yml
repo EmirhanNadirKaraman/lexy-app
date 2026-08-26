@@ -1,14 +1,13 @@
 name: Tests
 
 # The validation commands CLAUDE.md §11 and docs/TESTS.md already call mandatory
-# for a Python change, run as a gate instead of on trust. Three of the four run
+# for a Python change, run as a gate instead of on trust. Two of the three run
 # here, one per job so a failure names its own suite:
 #
 #   ruff check .                    -> lint
 #   python3 -m pytest tests/        -> pipeline   (root pipeline + subtitle-scraper)
-#   python3 -m pytest autoloop/tests -> autoloop  (loop harness, + the isolated test)
 #
-# THE FOURTH IS DELIBERATELY ABSENT: `cd lexy-app/backend && python3 -m pytest
+# THE THIRD IS DELIBERATELY ABSENT: `cd lexy-app/backend && python3 -m pytest
 # -n auto`. Every backend test pulls the autouse `cleanup` fixture
 # (lexy-app/backend/tests/conftest.py:67), which takes `db_pool`, so the suite
 # needs a live Postgres and there is no database-free subset to gate on. That
@@ -27,6 +26,26 @@ name: Tests
 #
 # Frontend vitest is out of scope for this workflow (it is not one of the Python
 # validation commands); `npm audit` and `pip-audit` live in dependency-audit.yml.
+#
+# A THIRD JOB, `docs`, guards this repository's own documentation trackers. It is
+# not one of the validation commands: it exists because the checks it performs
+# used to arrive from OUTSIDE this repository. `autoloop/tests/test_docs_merge.py`
+# and `autoloop/tests/test_audit_charters.py` assert things about `docs/` here —
+# tracker shape, change-note length, the charter file — and ran in the autoloop
+# job this workflow no longer has. Once that package is maintained elsewhere its
+# suite is rooted at ITS checkout, not this one, so those assertions stop being
+# about these files. Re-stating the mechanical half here puts them back in the
+# repository that owns the files.
+#
+# READ THIS BEFORE TREATING IT AS EQUIVALENT COVER. The `on:` block above is
+# `main` only, and the loop merges into `autoloop/mainline` — so the case these
+# rules exist for, two parallel task branches each appending a change note, is
+# NOT gated by this job; it is gated only when that work later reaches `main`.
+# Widening the trigger is not the fix: `on:` is workflow-level, so naming the
+# loop's branch would also run `lint` and `pipeline` on every loop merge. The
+# real restoration is a test under `tests/`, tracked as docs/TODO.md #45. See
+# docs/TESTS.md "What the autoloop job used to guard" for the full accounting of
+# what is preserved, what is not, and the branch-protection caveat.
 
 on:
   push:
@@ -108,42 +127,160 @@ jobs:
         # Root pytest.ini supplies `-p no:randomly -m "not isolated"`.
         run: python3 -m pytest tests/ -q
 
-  autoloop:
-    name: pytest autoloop/tests (loop harness)
+  docs:
+    name: docs guards (change-note trackers + audit charters)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # The suite shells out to real `git` and commits in throwaway repos under
-      # tmp_path. Most helpers set a per-repo identity, but a runner has no
-      # global one to fall back on, and the loop's own worker environment forces
-      # GIT_CONFIG_GLOBAL=/dev/null (autoloop/worker_env.py:94) — so `git config
-      # --global` would not reach those subprocesses. Identity via env does.
-      GIT_AUTHOR_NAME: CI
-      GIT_AUTHOR_EMAIL: ci@example.com
-      GIT_COMMITTER_NAME: CI
-      GIT_COMMITTER_EMAIL: ci@example.com
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            lexy-app/backend/requirements.txt
-      - name: Install dependencies
-        # Same superset as the pipeline job. autoloop/requirements.txt (playwright)
-        # is runtime-only — the browser session is imported lazily and mocked in
-        # tests — so it is not installed here.
-        run: pip install -r requirements.txt
-      - name: pytest autoloop/tests
-        # Hermetic: no database, no network, no real `claude` CLI. Every state
-        # dir, worker root and lock path is derived from tmp_path.
-        run: python3 -m pytest autoloop/tests -q
-      - name: pytest autoloop/tests -m isolated
-        # The default run inherits `-m "not isolated"` from root pytest.ini, whose
-        # comment justifies the exclusion by saying the coverage "is still
-        # enforced" because the loop runs it separately. If CI is the gate and CI
-        # skips it, that sentence stops being true — so the documented separate
-        # invocation runs here, verbatim and blocking.
-        run: python3 -m pytest autoloop/tests -q -m isolated -p no:cacheprovider
+      - name: Tracker sections, change-note length, charter file
+        # Stdlib only, no install step: `tomllib` is stdlib from 3.11 and the
+        # rest is pathlib. A guard that needs a dependency resolved is a guard
+        # that can be skipped by a broken index.
+        run: |
+          python3 - <<'PY'
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          # LITERAL paths, never a glob over docs/. A glob that matches nothing
+          # passes silently, and "the file was renamed" is exactly the state
+          # this job has to fail on rather than sail past.
+          TRACKERS = (
+              "docs/COMMON_ERRORS.md",
+              "docs/SECURITY.md",
+              "docs/SUMMARY.md",
+              "docs/TESTS.md",
+          )
+          MARKER = "<!-- CHANGE-NOTES:"
+
+          # A MIRROR of the harness's `note_merge.MAX_NOTE_LINE_CHARS`, which is
+          # the authority and lives with that package. Copying a constant is
+          # normally the wrong move (CLAUDE.md §12 says so about this exact
+          # number), but after the split there is no local source to read and the
+          # alternative is no check at all. The dangerous direction is a LAX
+          # copy: a note this job passes and the harness then refuses throws away
+          # the whole round. If the two ever disagree, the harness wins — raise
+          # this only after reading the constant there.
+          MAX_NOTE_LINE_CHARS = 700
+
+          CHARTERS = "docs/audit_charters.toml"
+          CHARTER_SLUGS = (
+              "docs_drift",
+              "tests_ci",
+              "repo_structure",
+              "security_paths",
+              "db_migrations",
+              "ingestion_pipeline",
+          )
+          CHARTER_FIELDS = {"slug", "title", "charter", "model"}
+          CHARTER_MODELS = {"haiku", "sonnet", ""}
+
+          problems = []
+          checked = 0
+
+          for rel in TRACKERS:
+              path = Path(rel)
+              if not path.is_file():
+                  problems.append(rel + ": missing, and every task is told to record its note here")
+                  continue
+              checked += 1
+              text = path.read_text(encoding="utf-8")
+              if not text.endswith("\n"):
+                  problems.append(rel + ": no trailing newline, so the next note continues the last line")
+              markers = text.count(MARKER)
+              if markers != 1:
+                  problems.append(
+                      rel + ": " + str(markers) + " CHANGE-NOTES markers, not 1. A second copy "
+                      "switches auto-resolution off for the whole file, silently; name the marker "
+                      "CHANGE-NOTES in prose instead of writing the comment out again."
+                  )
+                  continue
+              lines = text.split(MARKER, 1)[1].splitlines()[1:]
+              body = [ln for ln in lines if ln.strip()]
+              if not body:
+                  problems.append(rel + ": nothing after its CHANGE-NOTES marker")
+                  continue
+              if any(ln.startswith("#") for ln in lines):
+                  problems.append(rel + ": a heading after the marker, so later notes land inside it")
+              if not body[-1].startswith("| "):
+                  problems.append(rel + ": must end on a note row, not " + repr(body[-1][:60]))
+              if "| Date | Task | Note |" not in body:
+                  problems.append(rel + ": no note-table header below the marker")
+              for offset, line in enumerate(lines, 1):
+                  if len(line) > MAX_NOTE_LINE_CHARS:
+                      problems.append(
+                          rel + ": the note " + str(offset) + " lines below the marker is "
+                          + str(len(line)) + " characters, over the " + str(MAX_NOTE_LINE_CHARS)
+                          + "-character limit measured over the WHOLE line. Append a second line."
+                      )
+
+          # Fail closed on the SET, not only on the contents: a loop that checked
+          # nothing must not report success.
+          if checked != len(TRACKERS):
+              problems.append(
+                  "checked " + str(checked) + " of " + str(len(TRACKERS))
+                  + " trackers; an unchecked tracker is not a passing one"
+              )
+
+          charters = Path(CHARTERS)
+          parsed = None
+          if charters.exists() and not charters.is_file():
+              # A directory here is NOT absence, and saying "missing" would send
+              # the reader looking for a deleted file.
+              problems.append(CHARTERS + ": exists but is not a regular file")
+          elif not charters.is_file():
+              problems.append(
+                  CHARTERS + ": missing. Absence is a SUPPORTED state for the audit (it falls back "
+                  "to built-in domains), so losing this file is invisible from the harness side."
+              )
+          else:
+              try:
+                  parsed = tomllib.loads(charters.read_text(encoding="utf-8"))
+              except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+                  problems.append(CHARTERS + ": does not parse, which ABORTS an audit run: " + str(exc))
+
+          if parsed is not None:
+              domains = parsed.get("domain")
+              if not isinstance(domains, list) or not domains:
+                  problems.append(CHARTERS + ": no [[domain]] tables")
+              else:
+                  slugs = tuple(d.get("slug") for d in domains if isinstance(d, dict))
+                  if slugs != CHARTER_SLUGS:
+                      problems.append(
+                          CHARTERS + ": domains " + str(list(slugs)) + ", expected "
+                          + str(list(CHARTER_SLUGS)) + " in wave order"
+                      )
+                  for domain in domains:
+                      if not isinstance(domain, dict):
+                          problems.append(CHARTERS + ": a [[domain]] entry is not a table")
+                          continue
+                      slug = repr(domain.get("slug"))
+                      if set(domain) != CHARTER_FIELDS:
+                          problems.append(
+                              CHARTERS + ": " + slug + " has fields " + str(sorted(domain))
+                              + ", expected " + str(sorted(CHARTER_FIELDS))
+                          )
+                      if domain.get("model") not in CHARTER_MODELS:
+                          problems.append(
+                              CHARTERS + ": " + slug + " model " + repr(domain.get("model"))
+                              + " is not haiku, sonnet or empty"
+                          )
+                      if not str(domain.get("charter", "")).strip():
+                          problems.append(CHARTERS + ": " + slug + " has an empty charter")
+
+          if problems:
+              print("docs guards FAILED:")
+              for problem in problems:
+                  print("  - " + problem)
+              sys.exit(1)
+
+          print(
+              "ok: " + str(checked) + " change-note trackers well formed, every note line "
+              "<= " + str(MAX_NOTE_LINE_CHARS) + " chars, " + str(len(CHARTER_SLUGS))
+              + " audit charters parse."
+          )
+          PY

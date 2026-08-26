@@ -283,3 +283,22 @@ transport removes the tool you would use to fix the transport.
 
 Do this **after** the loop has completed real application work. Full circularity
 before that buys mainly a sophisticated way to break your own tooling.
+
+---
+
+## D1. Operator removal manifest — moved (port-05, 2026-08-26)
+
+The `git rm` list for taking `autoloop/` out of the language-app checkout lives
+in **`docs/AUTOLOOP_REMOVAL.md`**, not here.
+
+It was written here first and moved on review, for one reason: this file is on
+that list. A manifest that is deleted by the operation it describes cannot be
+the handoff — the operator would lose the instructions half way through. The
+new home is a language-app document that survives the removal and becomes the
+record of it, and two other surviving files point at it (`docs/TODO.md` **#46**
+and the measurement note in `docs/ROADMAP.md`).
+
+What port-05 itself did is unchanged and is stated there: this repository's
+tooling no longer references `autoloop/` — `pytest.ini` does not collect it,
+`ruff.toml` excludes it, the workflows do not run it — while the directory
+still sits on disk, untouched.
