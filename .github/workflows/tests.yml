@@ -1,14 +1,13 @@
 name: Tests
 
 # The validation commands CLAUDE.md §11 and docs/TESTS.md already call mandatory
-# for a Python change, run as a gate instead of on trust. Three of the four run
+# for a Python change, run as a gate instead of on trust. Two of the three run
 # here, one per job so a failure names its own suite:
 #
 #   ruff check .                    -> lint
 #   python3 -m pytest tests/        -> pipeline   (root pipeline + subtitle-scraper)
-#   python3 -m pytest autoloop/tests -> autoloop  (loop harness, + the isolated test)
 #
-# THE FOURTH IS DELIBERATELY ABSENT: `cd lexy-app/backend && python3 -m pytest
+# THE THIRD IS DELIBERATELY ABSENT: `cd lexy-app/backend && python3 -m pytest
 # -n auto`. Every backend test pulls the autouse `cleanup` fixture
 # (lexy-app/backend/tests/conftest.py:67), which takes `db_pool`, so the suite
 # needs a live Postgres and there is no database-free subset to gate on. That
@@ -107,43 +106,3 @@ jobs:
         # Same reason the backend command is written that way (docs/COMMON_ERRORS.md §2).
         # Root pytest.ini supplies `-p no:randomly -m "not isolated"`.
         run: python3 -m pytest tests/ -q
-
-  autoloop:
-    name: pytest autoloop/tests (loop harness)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # The suite shells out to real `git` and commits in throwaway repos under
-      # tmp_path. Most helpers set a per-repo identity, but a runner has no
-      # global one to fall back on, and the loop's own worker environment forces
-      # GIT_CONFIG_GLOBAL=/dev/null (autoloop/worker_env.py:94) — so `git config
-      # --global` would not reach those subprocesses. Identity via env does.
-      GIT_AUTHOR_NAME: CI
-      GIT_AUTHOR_EMAIL: ci@example.com
-      GIT_COMMITTER_NAME: CI
-      GIT_COMMITTER_EMAIL: ci@example.com
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            lexy-app/backend/requirements.txt
-      - name: Install dependencies
-        # Same superset as the pipeline job. autoloop/requirements.txt (playwright)
-        # is runtime-only — the browser session is imported lazily and mocked in
-        # tests — so it is not installed here.
-        run: pip install -r requirements.txt
-      - name: pytest autoloop/tests
-        # Hermetic: no database, no network, no real `claude` CLI. Every state
-        # dir, worker root and lock path is derived from tmp_path.
-        run: python3 -m pytest autoloop/tests -q
-      - name: pytest autoloop/tests -m isolated
-        # The default run inherits `-m "not isolated"` from root pytest.ini, whose
-        # comment justifies the exclusion by saying the coverage "is still
-        # enforced" because the loop runs it separately. If CI is the gate and CI
-        # skips it, that sentence stops being true — so the documented separate
-        # invocation runs here, verbatim and blocking.
-        run: python3 -m pytest autoloop/tests -q -m isolated -p no:cacheprovider

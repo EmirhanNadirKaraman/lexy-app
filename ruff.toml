@@ -12,6 +12,26 @@
 line-length = 100
 target-version = "py311"
 
+# `extend-exclude`, NOT `exclude`. Plain `exclude` REPLACES ruff's built-in
+# default exclusions (`.git`, `.venv`, `venv`, `build`, `dist`, `node_modules`,
+# `site-packages`, …), so writing `exclude = [...]` here would quietly start
+# linting a local virtualenv and `lexy-app/frontend/dist/`. `extend-exclude`
+# adds to that list instead of replacing it, which is the only correct spelling
+# for adding a single path.
+#
+# `autoloop/` is the loop harness. It is a separate project that happens to sit
+# in this checkout: nothing in this repository imports it, it imports nothing
+# from this repository, and it carries its own lint gate where it is maintained.
+# Linting it from here made this repository's baseline depend on a tree it does
+# not own — a finding in the harness turned `ruff check .` red for whoever was
+# working on the app, and, since the loop stops at the first failing validation
+# command, threw away rounds that had nothing to do with it.
+#
+# A pattern that matches nothing is not an error for ruff, so this line stays
+# correct once the directory is removed from the checkout; it is then dead and
+# can be deleted in that same commit.
+extend-exclude = ["autoloop"]
+
 [lint]
 # Broader than ruff's default: full E adds E1 (indentation), E2 (whitespace) and
 # E3 (blank lines) on top of the default E4/E7/E9. All three are already clean,

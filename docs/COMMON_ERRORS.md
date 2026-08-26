@@ -873,6 +873,16 @@ it's open" is not evidence.
 
 ## 6. Autoloop browser transport
 
+> **Sections 6 through 15 are about the loop harness, not about this
+> application.** `autoloop/` is a separate project that currently still sits in
+> this checkout; it is no longer part of this repository's tooling (`pytest.ini`
+> does not collect it, `ruff.toml` excludes it, the workflows do not run it).
+> The entries are kept because an operator running the loop against this
+> repository still meets these symptoms, and deleting a symptom-first log costs
+> more than it saves. Scattered entries in §1 and §2 concern the harness too.
+> Everything from here down moves to the harness's own error log when
+> `autoloop/` leaves the checkout. **Add a new harness entry there, not here.**
+
 Both entries below are from the same day of live bring-up (2026-07-29/30) and
 share one lesson: **a browser is not an API. What the DOM shows is not what the
 server did, and what the model wrote is not what `innerText` returns.**
@@ -3408,3 +3418,4 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-26 | abort-01 | Symptom: a validation run fails `test_apply_requests_is_the_single_merge_used_by_both_callers`, `test_the_middle_bucket_stays_one_bucket_both_callers_already_save_on` or `test_the_preemption_reuses_the_release_path_rather_than_repeating_it` — none of which you touched — and a re-run over the same tree is green. Cause: those are `inspect.getsource` STRUCTURAL tests over `cli.py` / `orchestrator.py`, and their code objects carry the line numbers from import time. |
 | 2026-08-26 | abort-01 | So editing either file WHILE a suite is running makes `getsource` re-read the changed file at the old offsets and assert about the wrong function body. Not a regression and not flake: it is the tree moving under a live run. Do not edit `cli.py` or `orchestrator.py` while an advisory validation run is in flight — wait for the `RESULT #n`, then edit, then ask again. Applies to any structural test, and this repo has several. |
 | 2026-08-26 | abort-01 | Test-authoring trap for any abort-aware validation test: arming the abort flag BEFORE `execute()` does not exercise the kill path. `abort_aware_command_runner`'s outer wrapper checks `abort_in_effect` ahead of each command and records "the round's remaining validation commands were refused before launching" — a different branch writing a different clause. To reach the KILL path the injected runner must itself arm the flag, record the ledger, clear the flag, then return `ABORT_RETURNCODE`. Assert the clause, or the test silently grades the wrong branch. |
+| 2026-08-26 | port-05 | §§6-15 (and scattered §1/§2 entries) document the loop harness, not this application. A banner at §6 now says so, and asks for new harness entries to be filed with the harness rather than here. Nothing was deleted: an operator running the loop against this repository still meets these symptoms, and excising ~2,400 lines here alongside the rest of the doc work would exceed the review packet cap. They move when `autoloop/` leaves the checkout. |

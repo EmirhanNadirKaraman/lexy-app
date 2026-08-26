@@ -63,6 +63,14 @@ out/eval/
 
 # Autoloop runtime state (state.json, transcript.jsonl, diagnostics/, PAUSE).
 # Config lives here too and may reference a private conversation URL.
+#
+# NOTE THE LEADING DOT. This is the loop's STATE AND CONFIG directory, not the
+# `autoloop/` package. The package is a separate project and is on its way out
+# of this checkout; this entry is NOT part of that removal and must outlive it.
+# The loop still runs against this repository as an external target and still
+# reads `.autoloop/config.toml` from here, so deleting this line would put a
+# private conversation URL and the loop's own state on the untracked list — and
+# would make the checkout read as dirty to the loop itself.
 .autoloop/
 
 # Deliberately-untracked vendored copy of the nlp-histo extraction stage —

@@ -285,9 +285,29 @@ tests targeting one — see TODO #17.
 
 ---
 
-## Autoloop — `autoloop/` (Fable ↔ ChatGPT orchestration)
+## Autoloop — `autoloop/` (a SEPARATE PROJECT, not part of this codebase)
 
-Infrastructure for the autonomous engineering loop — see `docs/AUTOLOOP.md`.
+> **This section indexes a directory this repository does not maintain.**
+> `autoloop/` is the autonomous engineering loop. It is a separate project that
+> currently still sits in this checkout: nothing here imports it, it imports
+> nothing from here, and the boundary has always been one-directional. What
+> bound the two was shared tooling, and that is now cut — `pytest.ini` does not
+> collect its tests (`testpaths = tests`), `ruff.toml` excludes it from
+> `ruff check .`, and `.github/workflows/tests.yml` has no job for it.
+>
+> The per-file table below is kept only because the files are still physically
+> present, so an index of this checkout would otherwise have a hole in it. It is
+> **frozen**: do not extend it when the harness changes, because that work does
+> not happen here and this table cannot be kept honest from this repository. It
+> is removed in the same commit that removes `autoloop/` from the checkout.
+>
+> Two neighbours are easy to confuse with it and are **staying**:
+> `.autoloop/` (leading dot) is the loop's gitignored runtime state and config
+> directory inside this checkout, not the package; and `docs/audit_charters.toml`
+> describes THIS repository to the loop's audit agents, so it belongs here and
+> is read from here.
+
+Infrastructure for the autonomous engineering loop.
 ChatGPT is driven through a real browser (Playwright over CDP against a
 dedicated, pre-logged-in Chrome profile), **never the OpenAI API**. Runtime
 state in `.autoloop/` (gitignored). **Autoloop v1 (2026-07-30):**
@@ -867,3 +887,4 @@ whatever came after it.
 | 2026-08-26 | abort-01 | Same revision, two report strings made to match that: `_abort_round`'s `stop_reason` and `cli._report_abort`'s first line both asserted a flat "the agent and its whole process group were killed" for every abort. Three things can end a round and only one of them is that, so both now say the round was STOPPED in flight and leave WHAT was killed to the measured `discarded_work` sentence each of them already carries — a fixed claim beside a measured one is the overstatement, not a second opinion. |
 | 2026-08-26 | abort-01 | REVISION: `_run_implementation` asks `abort_in_effect` a THIRD time — immediately after the authoritative `run_validation_commands`, ahead of `not passed`. The suite is a minutes-long window and was the only long one left unclassified: a flag arriving mid-suite killed the validation group and recorded the ledger, but a `resume` before classification made the round report the killed suite's `rc=-99` as "validation failed after implementation" — a `status="error"` round charging the task an attempt for a suite the operator stopped. |
 | 2026-08-26 | abort-01 | Same revision: `_aborted_outcome` gains `measured` and `validation`, both defaulting to the previous behaviour so the two pre-validation call sites are byte-identical. At the post-validation site the counts MUST be the pair measured before the suite launched — the run can write a `ruff` cache that a later tree read would attribute to the agent — and the validation account is the run's real per-command PASS/FAIL/NOT RUN summary, since a suite that launched and was killed is not one that never ran. Scoped deletes and reverts are disclosed there too. |
+| 2026-08-26 | port-05 | Tooling boundary only: `autoloop/` is now unreferenced by this repository's tooling — `pytest.ini` collects `tests` alone, `ruff.toml` adds `extend-exclude = ["autoloop"]`, and `tests.yml`'s autoloop job is gone. The directory and the 8,101-line `docs/AUTOLOOP.md` are UNTOUCHED on disk: deleting them exceeds the review packet cap, and is one operator `git rm`. The per-file table above is frozen rather than deleted, because those files are still present. `.autoloop/` (the state dir) and `docs/audit_charters.toml` describe THIS repository and stay. |

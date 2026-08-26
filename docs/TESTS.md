@@ -1151,7 +1151,25 @@ Backend suite baseline (W13, 2026-05-20): **521 passed / 2 skipped** (xdist para
 
 ---
 
-## Autoloop tests — `autoloop/tests/`
+## Autoloop tests — `autoloop/tests/` (NOT this repository's test surface)
+
+> **Read this banner before anything below it.** `autoloop/` is a separate
+> project that currently still sits in this checkout. Nothing in this repository
+> imports it and it imports nothing from this repository; it is developed,
+> linted and tested where it is maintained, not here.
+>
+> As of this change it is **out of this repository's tooling entirely**:
+> `pytest.ini` does not collect it (`testpaths = tests`), `ruff.toml` excludes
+> it, and `.github/workflows/tests.yml` no longer has a job for it. None of the
+> commands in "Validation commands" above run any of it, so **nothing recorded
+> below is evidence about a change made here**, and a green run here says
+> nothing about the harness.
+>
+> The rest of this section is retained only because the directory it describes
+> is still physically present. It is a historical record of a suite this
+> repository no longer owns; do not extend it, and do not cite its counts as
+> this repository's coverage. It is removed in the same commit that removes
+> `autoloop/` from the checkout.
 
 Added 2026-07-29 with the Fable ↔ ChatGPT orchestration infrastructure
 (`autoloop/`, see `docs/AUTOLOOP.md`); expanded the same day by Phase 2 (task
@@ -1974,14 +1992,20 @@ longer routes into the quarantine branch at all — the branch (and its
 candidate-sha fetch-source fix) is retained unchanged for preparations
 that did not pass the gate.
 
-Run: `pytest autoloop/tests` from the repo root to run only this tree.
+Run: `pytest autoloop/tests` from the repo root — naming the tree explicitly is
+now the ONLY way to run it from here, and it runs a project this repository does
+not maintain.
 
-**Included in a bare `pytest` since 2026-08-04 (rt-05).** Root `testpaths` is
-now `tests autoloop/tests`, so a bare root run collects both trees. It
-previously pointed at `tests/` alone, which meant a bare `pytest` reported a
-green root suite while this entire suite had silently not been collected — the
-default surface said nothing about what it was skipping, so nobody had to
-choose the exclusion for it to hold.
+**Included in a bare `pytest` from 2026-08-04 (rt-05) until this change; no
+longer.** Root `testpaths` was `tests autoloop/tests` for that period and is now
+`tests` alone. The reasoning that put it there was sound for as long as the two
+trees were one project — a bare `pytest` that quietly skipped this suite
+reported a green root run while saying nothing about what it had not collected.
+That argument does not survive the split: the harness is now gated where it is
+maintained, and collecting it here would make this repository's suite red for a
+regression in code nobody here can fix. **The failure mode the rt-05 note warns
+about is real and now lives in the other repository** — if this tree is not
+gated there, it is gated nowhere.
 
 Two properties made merging safe, and both are worth re-checking before adding
 any third tree: this suite imports only `pytest` and the stdlib (`playwright`
@@ -3032,38 +3056,30 @@ Run all three. The lint step is not optional.
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
 | Backend | `cd lexy-app/backend && python3 -m pytest -n auto` | **1,320 collected** (2026-08-25) |
-| Root (pipeline + autoloop) | `pytest` *(repo root)* | re-measure — see below |
-| ↳ pipeline only | `pytest tests/` *(repo root)* | 368 passed |
-| ↳ autoloop only | `pytest autoloop/tests` *(repo root)* | **3,672 collected**, 1 deselected (2026-08-25). This suite grows fast — re-measure rather than trusting any number here. |
+| Root pipeline | `pytest` *(repo root)* | 368 passed |
+| ↳ the same tree, named | `pytest tests/` *(repo root)* | 368 passed |
 
-> **The root command is now a bare `pytest`, not `pytest tests/` (rt-05,
-> 2026-08-04).** `testpaths = tests autoloop/tests`, so one command covers both
-> trees and the autoloop suite is no longer conditional on "only when touching
-> `autoloop/`" — that qualifier is what let a loop-harness regression ship
-> unnoticed by anyone who did not think to run it. The two split rows are kept
-> for narrowing a failure, not for validating a change.
+> **A bare root `pytest` covers the pipeline tree and nothing else.**
+> `testpaths = tests`, so the two rows above are the same run written two ways;
+> the second is kept only for symmetry with the backend row. Record what a real
+> run reports rather than trusting a number here.
 >
-> The combined expected count is deliberately left unmeasured rather than
-> guessed. The three figures on record disagree — the audit that filed this task
-> said 415, this file said 790 at 2026-08-01 and 869 in the row above — because
-> each was measured on a different date, and the change that merged the trees
-> was made without a shell to run them in. Record what a real run reports; do
-> not sum the rows above (the same idiom as the autoloop section's own note).
+> Between 2026-08-04 (rt-05) and this change, `testpaths` also named
+> `autoloop/tests` and a bare root `pytest` collected 4,040 tests across two
+> trees. That second tree is the loop harness, which is a separate project: it
+> is not imported by anything here, imports nothing from here, and is tested
+> where it is maintained. It is no longer part of this repository's test
+> surface, so a bare `pytest` no longer reports on it. **A bare `pytest` here
+> going from 4,040 collected to 368 is that change, not a regression** — but do
+> not read the smaller green run as covering what the larger one did.
 
-> **The loop runs the root trees in parallel; you can too (val-01, 2026-08-06).**
-> Post-commit validation re-runs the configured suites against a task's
-> committed worker repo on every round, revises included. Every pytest command
-> it runs gets `-n auto -p no:cacheprovider` — applied at run time by
-> `autoloop/validation.py`'s `effective_validation_commands`, not only written
-> into `autoloop/config.example.toml`, because nothing re-reads that template
-> after an operator copies it to `.autoloop/config.toml`. The `-m isolated`
-> command is exempted from `-n` and stays serial. The two flags are not
-> interchangeable with the plain command above: `-p no:cacheprovider` exists
-> because a failing test writes `.pytest_cache/` into the tree it is grading and
-> the gate after validation refuses a worktree validation dirtied. Adding `-n
-> auto` to your own run is safe; adding it to `pytest.ini`'s `addopts` is not —
-> it would reach the isolated run as well. Pinned by
-> `autoloop/tests/test_validation_parallelism.py`.
+> **Running the root suite in parallel.** Adding `-n auto` to your own
+> invocation is safe. Adding it to `pytest.ini`'s `addopts` is **not**: in
+> `addopts` it reaches every invocation, including any run whose whole purpose
+> is to give one test a process of its own. `-p no:cacheprovider` is the
+> companion flag worth knowing — a failing test writes `.pytest_cache/` into the
+> tree it is grading, which matters whenever something downstream refuses a
+> dirty tree.
 >
 > **Backend command reconciled 2026-07-29:** it must be `python3 -m pytest`,
 > NOT the bare `pytest` entrypoint. `python -m` puts the cwd on `sys.path`,
@@ -3087,20 +3103,20 @@ one job per command so a failure names its own suite:
 |---|---|---|
 | `lint` | `ruff check .` *(repo root)* | ruff installed at the pin read out of `lexy-app/backend/requirements.txt`, so a bump there moves CI with it instead of silently diverging |
 | `pipeline` | `python3 -m pytest tests/ -q` | installs the full backend requirement set, then downloads three spaCy models |
-| `autoloop` | `python3 -m pytest autoloop/tests -q`, then `python3 -m pytest autoloop/tests -q -m isolated -p no:cacheprovider` | both steps blocking |
 
 Deliberate choices, so they don't get "fixed" back:
 
-- **CI runs the two split rows, not the bare root `pytest`.** Same files and
-  the same `addopts` either way — `testpaths` is exactly those two trees — but
-  in separate processes, so the duplicate-module-basename collision
-  `pytest.ini` warns about cannot occur and a red job names the tree that
-  broke. Coverage identical, attribution better. The bare command remains the
-  right one to type locally.
-- **The `isolated` step is blocking, not decoration.** Root `pytest.ini`
-  justifies excluding that test from the shared run by saying the coverage "is
-  still enforced" because it runs separately. If CI is the gate and CI skips
-  it, that sentence stops being true.
+- **CI names `tests/` explicitly rather than typing a bare root `pytest`.**
+  Identical coverage — `testpaths` is exactly that tree — but naming it keeps
+  the job's own line self-describing, so a red job says which suite broke
+  without anyone opening `pytest.ini`. The bare command remains the right one
+  to type locally.
+- **There is no loop-harness job here any more.** `autoloop/tests` used to run
+  as a third job, including a separate blocking `-m isolated` step. The harness
+  is a separate project, tested where it is maintained, and this workflow gates
+  this repository only. Root `pytest.ini` still declares the `isolated` marker
+  and still deselects it, but nothing under `tests/` carries it, so there is no
+  coverage here for that step to protect.
 - **spaCy models are downloaded, not skipped.** `de_core_news_sm` is a hard
   requirement — `subtitle-scraper/phrase_finder.py:15` loads it at module
   scope, so its absence is a collection error, not a skip. `de_core_news_md`
@@ -3805,3 +3821,5 @@ whatever came after it.
 | 2026-08-26 | abort-01 | REVISION: the killed-suite regression now runs END TO END. `test_a_killed_suite_is_carried_end_to_end_without_charging_the_task` drives the real `ImplementExecutor` through the real dispatch path in ONE run — a real validation process group arms the abort from inside itself mid-suite, `killable_run` kills the group and records the ledger, `resume` unlinks the flag, and the round classifies from the ledger. The existing test replayed that executor's outcome through a scripted double, and the seam is exactly where the claim could still fail. |
 | 2026-08-26 | abort-01 | Same revision, the ECHO it removes: `a_round_whose_suite_was_killed` writes the kill clause into the ledger BY HAND, so `"validation subprocess" in outcome.summary` there reads back a string the test supplied. The new test never touches the ledger — `killable_run`'s own kill branch is the only writer on that path — so the clause, the group kill (asserted per pid, grandchild included) and the budgets all come from production code. Its `python3` is a symlink: `SAFE_VALIDATION_BINARIES` matches on basename and refuses `python3.13` unrun. |
 | 2026-08-26 | abort-01 | Same revision, the echo guard for the tests that still REPLAY that kill: the clause is now the module constant `VALIDATION_KILL_CLAUSE`, and `test_the_replayed_kill_clause_is_the_one_production_actually_writes` kills a real process group and compares the WHOLE string. Equality, not substring — `"validation subprocess" in reason` would still hold if `killable_run` wrapped a different sentence around those two words, and every replay assertion would stay green against a clause production no longer writes. |
+| 2026-08-26 | port-05 | No test added, removed or renamed. The test SURFACE narrowed: root `pytest.ini` drops `autoloop/tests` from `testpaths`, so a bare root `pytest` goes from 4,040 collected to 368. That is the intended change, not a regression — but it is a FAIL-OPEN one: the run stays GREEN while covering 3,672 fewer tests, so do not read a green root run here as evidence about the harness. `-p no:randomly` is unchanged and still load-bearing. `-m "not isolated"` and the `isolated` marker are KEPT although inert here — nothing under `tests/` carries that marker. |
+| 2026-08-26 | port-05 | `.github/workflows/tests.yml` loses its `autoloop` job, including the separate blocking `-m isolated` step; `lint` and `pipeline` remain. `ruff.toml` gains `extend-exclude = ["autoloop"]` — `extend-`, because a plain `exclude` REPLACES ruff's built-in exclusions and would start linting virtualenvs and `dist/`. "All checks passed!" is now a statement about this repository only. The autoloop-tests section above is banner-marked and frozen rather than deleted: excising it plus `docs/AUTOLOOP.md` would exceed the review packet cap. |

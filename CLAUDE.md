@@ -232,15 +232,17 @@ Ruff is **part of backend validation, not an optional extra** — run it alongsi
 `pytest` before calling any Python change done. Baseline as of 2026-07-27: zero
 findings (was 153; see the ruff entry in `docs/TESTS.md`).
 
-Since val-03 (2026-08-22) it is also the check the autoloop stops at: a loop
-validation run executes the configured commands **in order and stops at the
-first one that fails**, reporting the rest as `NOT RUN` (`docs/AUTOLOOP.md`
-§4h). So a ruff finding means no test suite ran that round — read `NOT RUN` as
-"no evidence either way", never as "passed" — and fixing lint first is how a
-round gets past it. Nothing about the verdict changed: a failing run still
-fails, and a passing run still runs every command.
+It is also the first command the automated task loop runs against this
+repository, and that loop executes its configured validation commands **in
+order, stopping at the first one that fails** and reporting the rest as
+`NOT RUN`. So a ruff finding means no test suite ran that round — read
+`NOT RUN` as "no evidence either way", never as "passed" — and fixing lint
+first is how a round gets past it. Nothing about the verdict changes: a failing
+run still fails, and a passing run still runs every command. That loop is a
+separate project maintained outside this repository; its behaviour is
+documented where it is maintained, not here.
 
-Two things to know before "fixing" what it reports:
+Three things to know before "fixing" what it reports:
   - **`# noqa: E402` on a sibling import is load-bearing.** `subtitle-scraper/`
     modules import each other after a `sys.path.insert` — the deliberate
     replacement for the old `os.chdir` hack (§10 / TODO #3). Hoisting those
@@ -249,10 +251,19 @@ Two things to know before "fixing" what it reports:
     `ignore = ["E501"]`) and ruff itself is pinned to `0.14.1` in
     `lexy-app/backend/requirements.txt`. Don't rely on ruff's built-in defaults
     — they're narrower (E4/E7/E9 + F) and shift between releases. **E501
-    (line-too-long) is off deliberately**: enabling it reports 530 pre-existing
-    violations (measured 2026-08-25; `ruff.toml`'s own comment still says the
-    older 405), i.e. a repo-wide reflow, not a lint fix. Import sorting (`I`) is
-    off for the same reason plus the E402 trap above.
+    (line-too-long) is off deliberately**: enabling it reports a repo-wide
+    reflow's worth of pre-existing violations (530 measured 2026-08-25, before
+    the exclusion in the next bullet narrowed what is linted; `ruff.toml`'s own
+    comment still says an older 405), i.e. a formatting decision, not a lint
+    fix. Import sorting (`I`) is off for the same reason plus the E402 trap
+    above.
+  - **`ruff check .` does not cover `autoloop/`.** That directory is a separate
+    project that happens to sit in this checkout — nothing here imports it and
+    it imports nothing from here — and it carries its own lint gate where it is
+    maintained. `ruff.toml` names it in `extend-exclude` (not `exclude`, which
+    would replace ruff's built-in exclusions and start linting virtualenvs and
+    `dist/`). "All checks passed!" is therefore a statement about this
+    repository only.
 
 ### Backend tests
 ```bash
@@ -280,18 +291,18 @@ Never clean it by `prompt_key` — `item_gloss` is a real production key.
 
 ### Root tests — what a bare `pytest` actually covers
 ```bash
-pytest                              # root pipeline modules + autoloop (testpaths)
-pytest tests/                       # just the root pipeline modules
-pytest autoloop/tests               # just the autoloop loop harness
+pytest                              # root pipeline modules (testpaths)
+pytest tests/                       # the same tree, named explicitly
 ```
-Root `pytest.ini` sets `testpaths = tests autoloop/tests`, so a bare `pytest`
-at the repo root runs **both** trees: **4,040 tests collected** — 368 from
-`tests/`, 3,672 from `autoloop/tests` (counted 2026-08-25).
-Expect minutes, not seconds — the
-autoloop suite shells out to real `git` and spawns real subprocesses. It is
-still hermetic (no database, no network, no real `claude` CLI) and derives
-every state dir, worker root and lock path from `tmp_path`, so running it
-cannot disturb a live loop's `~/.autoloop`.
+Root `pytest.ini` sets `testpaths = tests`, so a bare `pytest` at the repo root
+runs the root pipeline suite and nothing else: **368 tests collected** (counted
+2026-08-25).
+
+`addopts` there is `-p no:randomly -m "not isolated"`. **The `-p no:randomly`
+half is load-bearing** — see the seed conflict under "Backend tests" above, and
+never drop it while editing the line it shares. The `-m "not isolated"` half is
+inert today (no test under `tests/` carries that marker) and is kept
+deliberately; `pytest.ini`'s own comment says why.
 
 **The two suites a bare root `pytest` does NOT run**, because each needs its
 own runner and environment:
