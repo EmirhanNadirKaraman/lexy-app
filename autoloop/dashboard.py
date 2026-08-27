@@ -2327,10 +2327,13 @@ def shipped_report(
     in either direction" — and a caller able to render one without the other
     would rebuild exactly the blind spot this report exists to close.
 
-    Since witness-01 (2026-08-27) a completed task no commit subject names is
-    decided by its EXECUTION RECORD's ancestry before it is called a
-    disagreement — see `registry_disagreements`, which states what that proves
-    and what it does not. `executions_dir` is where those records are read from:
+    Since witness-01 (2026-08-27) a completed task the SEARCH did not place in
+    the base — no subject naming it, or naming subjects that are all outside the
+    base — is decided by its EXECUTION RECORD's ancestry before it is called a
+    disagreement. `rows` still carries the search's own verdict, unrewritten:
+    the record decides the disagreement list, not this half. See
+    `registry_disagreements`, which states what that proves and what it does
+    not. `executions_dir` is where those records are read from:
     a caller that has already resolved the state directory hands it over (the
     live page has, once, for every panel), and anything else leaves it unset and
     this resolves it through `_state_dir_or_note` — the LOOP's own rule, so the
@@ -2359,13 +2362,15 @@ def shipped_report(
     )
     # The row a RECORD cleared says so in its own detail, because that row is
     # the only one whose record evidence would otherwise appear nowhere an
-    # operator reads: it prints as NO MENTION (the search really did find
-    # nothing, and that state is not rewritten here — the counts and the exit
-    # code are the search's answer, unchanged), and it is absent from the
-    # disagreements below precisely because the record settled it. Printing the
-    # absence and nothing else is how "shipped, under a subject that never named
-    # it" and "we stopped looking" would read identically. `state` is untouched:
-    # this is the SEARCH's row, annotated with the other evidence source.
+    # operator reads: it prints as NO MENTION or NOT IN BASE (whichever the
+    # search actually concluded — that state is not rewritten here, and the
+    # counts and the exit code stay the search's answer), and it is absent from
+    # the disagreements below precisely because the record settled it. Printing
+    # that row and nothing else is how "shipped, under a subject that never
+    # named it" and "we stopped looking" would read identically — and a NOT IN
+    # BASE row beside a clean disagreement count needs the reason MORE, not
+    # less. `state` is untouched: this is the SEARCH's row, annotated with the
+    # other evidence source, both halves of the sentence kept.
     cleared = {row["id"]: row["detail"] for row in disagreements["witnessed"]}
     for row in rows:
         if row["id"] in cleared:
@@ -2616,12 +2621,24 @@ def registry_disagreements(
 
     **A COMPLETED TASK IS JUDGED BY ANCESTRY, NOT BY WHETHER A COMMIT SUBJECT
     NAMES IT** (witness-01, 2026-08-27). Subject matching is corroboration; the
-    deciding test for a row no subject names is the task's own execution record,
-    live if there is one and otherwise the newest archived generation, asked of
-    git through the loop's own reader. Measured 2026-08-25: of seven
-    `completed_unwitnessed` rows, dash-02 and scope-02 had shipped — their
-    subjects simply never named them — and nothing in the report could tell the
-    operator which five of the seven were real.
+    deciding test for EVERY row the search did not place in the base — whether
+    no subject named it or the subjects that did are all outside the base — is
+    the task's own execution record, live if there is one and otherwise the
+    newest archived generation, asked of git through the loop's own reader.
+    Measured 2026-08-25: of seven `completed_unwitnessed` rows, dash-02 and
+    scope-02 had shipped — their subjects simply never named them — and nothing
+    in the report could tell the operator which five of the seven were real.
+
+    **`in-base` is the only record verdict that overrides the search; every
+    other one defers to it.** That one sentence decides all four states. A
+    record proving ancestry takes the row off the list whatever the search said,
+    because it is the stronger evidence and it is the point of this change. In
+    the other direction the record only ADDS: it can turn "no subject names it"
+    into the definite `completed_not_in_base`, and it can never soften a
+    refutation the search already made, nor be consulted at all for a row the
+    search settled — `shipped` needs no second opinion, and `unverified` means
+    the search could not look, which a record cannot repair (the two answer
+    different questions, and the weaker state wins).
 
     What that verdict PROVES is bounded, and the bound is stated rather than
     papered over: an ancestral candidate means the branch is ACCOUNTED FOR in
@@ -2650,8 +2667,10 @@ def registry_disagreements(
         undo work that did land.
 
     A record that exists and cannot be judged — torn, unorderable, or naming a
-    sha git will not resolve — is neither: it joins `unverified`, because "I
-    could not look" must never render as either verdict.
+    sha git will not resolve — is neither: for a row no subject named, it joins
+    `unverified`, because "I could not look" must never render as either
+    verdict. For a row the search already REFUTED it changes nothing, and the
+    finding stands: an unreadable file may not retract evidence git supplied.
     """
     rows: list[dict] = []
     unverified: list[dict] = []
@@ -2666,12 +2685,15 @@ def registry_disagreements(
             unverified.append({**base, "record": "shipped_elsewhere"})
     for row in shipped_rows:
         base = {"id": row["id"], "title": row["title"], "detail": row["detail"]}
-        if row["state"] == "not-in-base":
-            rows.append({**base, "kind": "completed_not_in_base", "proven": True})
-        elif row["state"] == "unknown":
-            # No subject names it. The record is the deciding test; with no
-            # reader injected there is nothing to ask, and the row reads exactly
-            # as it did before witness-01.
+        if row["state"] in ("not-in-base", "unknown"):
+            # EVERY completed row the search could judge and did not place in
+            # the base is asked about its record — not only the rows no subject
+            # names. A subject that names the id and sits outside the base is
+            # the weaker evidence of the two, and letting it hold a row on the
+            # list that the record proves is accounted for would be the same
+            # judging-by-subject this change exists to end. With no reader
+            # injected there is nothing to ask, and both rows read exactly as
+            # they did before witness-01.
             answer = record(row["id"]) if record is not None else None
             verdict = answer.verdict if answer is not None else RECORD_ABSENT
             detail = base["detail"]
@@ -2680,7 +2702,14 @@ def registry_disagreements(
             found = {**base, "detail": detail}
             if verdict == RECORD_IN_BASE:
                 witnessed.append(found)
-            elif verdict == RECORD_NOT_IN_BASE:
+            elif row["state"] == "not-in-base" or verdict == RECORD_NOT_IN_BASE:
+                # The search's own refutation SURVIVES every record verdict but
+                # `in-base`. A torn record or an unorderable archive must not
+                # move a row git already refuted into `unverified`: that would
+                # take it out of `rows`, drop `proven` to zero and hand
+                # `shipped-report` an exit 0 — an unreadable file silencing a
+                # finding, which is the fail-open this section is written
+                # against.
                 rows.append({**found, "kind": "completed_not_in_base", "proven": True})
             elif verdict == RECORD_UNVERIFIED:
                 unverified.append({**found, "record": "completed"})
@@ -2688,6 +2717,12 @@ def registry_disagreements(
                 rows.append({**found, "kind": "completed_unwitnessed", "proven": False})
         elif row["state"] == "unverified":
             unverified.append({**base, "record": "completed"})
+        # `shipped` rows are NOT consulted, and that is not an oversight: the
+        # search already found a commit naming the id IN the base, and a record
+        # naming a superseded or abandoned candidate would then manufacture a
+        # `completed_not_in_base` out of the weaker evidence of the two. The
+        # record overrides the search in one direction only — towards the base
+        # containing more, never less.
     # Proven first, then by kind order, then by id: the definite findings are
     # what an operator acts on, and a list that opened with twelve "no commit
     # names this" rows would bury the one that git actually refuted.

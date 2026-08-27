@@ -16,8 +16,10 @@ instead of reading subjects, and answers all seven correctly.
 The claim under test, in both halves:
 
   * a completed task whose record (live, or the newest archived generation)
-    names an ancestor of the base head leaves the disagreement list; one whose
-    record names a sha the base does not contain is the DEFINITE
+    names an ancestor of the base head leaves the disagreement list WHATEVER
+    THE COMMIT SUBJECTS SAID — including when the subjects that name it are all
+    outside the base, since that is the weaker of the two evidence sources; one
+    whose record names a sha the base does not contain is the DEFINITE
     `completed_not_in_base`; and `completed_unwitnessed` is reachable only when
     nothing anywhere names a candidate;
   * the archive-generation rules exist in exactly ONE place —
@@ -261,9 +263,10 @@ def test_a_record_that_names_NO_candidate_is_unwitnessed_too(tmp_path):
     assert "names no candidate" in finding["detail"]
 
 
-def test_a_subject_that_names_it_and_is_outside_the_base_is_untouched(tmp_path):
-    """The `not-in-base` branch is not re-decided by this change: it was already
-    the definite verdict, reached from evidence of its own."""
+def test_a_subject_outside_the_base_stays_a_finding_when_NO_record_answers(tmp_path):
+    """The `not-in-base` verdict survives on its own evidence when the record
+    has nothing to add: git was asked about the commit that names the id and
+    said no, and there is no record naming anything else."""
     repo = make_repo(tmp_path)
     commit(repo, "init")
     side_commit(repo, "bind-01: the work nobody merged", "side")
@@ -273,7 +276,130 @@ def test_a_subject_that_names_it_and_is_outside_the_base_is_untouched(tmp_path):
     out = report(repo, executions, "bind-01")
 
     assert findings(out)["bind-01"]["kind"] == "completed_not_in_base"
+    assert findings(out)["bind-01"]["proven"] is True
     assert out["rows"][0]["state"] == "not-in-base"
+
+
+def test_an_ancestral_record_clears_a_row_whose_SUBJECT_is_outside_the_base(tmp_path):
+    """EVERY judgeable completed row is asked about its record, not only the
+    rows no subject names.
+
+    A commit naming the id and sitting on a branch is the WEAKER of the two
+    evidence sources — one subject line — and the record names a commit git
+    confirms is in the base. Leaving the row on the disagreement list because a
+    subject said so is the judging-by-subject this change exists to end, so the
+    row leaves the list exactly as an unnamed one does.
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init")
+    side_commit(repo, "cross-01: an earlier attempt, still on its branch", "side")
+    carrier = commit(repo, "the work landed under a subject naming nothing")
+    executions = tmp_path / "state" / "executions"
+    write_record(executions, "cross-01", carrier)
+
+    out = report(repo, executions, "cross-01")
+
+    assert out["rows"][0]["state"] == "not-in-base", (
+        "the SEARCH's own answer is not rewritten — subject matching became "
+        "corroboration, not a thing that was made to agree"
+    )
+    assert out["disagreements"]["rows"] == []
+    assert [r["id"] for r in out["disagreements"]["witnessed"]] == ["cross-01"]
+    assert out["disagreements"]["proven"] == 0
+    assert out["disagreements"]["unverified"] == []
+
+
+def test_a_TORN_record_never_SOFTENS_a_refutation_the_search_already_made(tmp_path):
+    """The fail-open that would undo the point of the previous test.
+
+    `in-base` is the only record verdict allowed to override the search. A live
+    record nobody can read is `unverified`, and routing THIS row there would
+    take a finding git had already made out of `rows`, drop `proven` to zero and
+    hand `shipped-report` an exit 0 — an unreadable file silencing an alarm.
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init")
+    side_commit(repo, "torn-live-01: the work nobody merged", "side")
+    executions = tmp_path / "state" / "executions"
+    executions.mkdir(parents=True)
+    (executions / "torn-live-01.json").write_text("{not json", encoding="utf-8")
+
+    out = report(repo, executions, "torn-live-01")
+
+    finding = findings(out)["torn-live-01"]
+    assert finding["kind"] == "completed_not_in_base"
+    assert finding["proven"] is True
+    assert out["disagreements"]["proven"] == 1
+    assert out["disagreements"]["unverified"] == []
+    assert "could not be read" in finding["detail"], (
+        "and the operator is told the record could not be consulted"
+    )
+
+
+def test_a_record_naming_an_outstanding_sha_JOINS_the_subjects_refutation(tmp_path):
+    """Both evidence sources refuting: one finding, carrying both halves. The
+    record cannot make the row worse than `completed_not_in_base` — there is no
+    stronger kind — so what it adds is the second sha an operator has to chase.
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init")
+    named = side_commit(repo, "both-out-01: an attempt on its own branch", "side")
+    other = side_commit(repo, "the retry, also outstanding", "autoloop/both-out-01")
+    executions = tmp_path / "state" / "executions"
+    write_record(executions, "both-out-01", other)
+
+    finding = findings(report(repo, executions, "both-out-01"))["both-out-01"]
+
+    assert finding["kind"] == "completed_not_in_base"
+    assert finding["proven"] is True
+    assert "none of them an ancestor" in finding["detail"]
+    assert other[:12] in finding["detail"] and named[:12] not in finding["detail"]
+
+
+def test_a_row_the_search_placed_IN_the_base_is_never_re_decided(tmp_path):
+    """The one row deliberately NOT consulted, and why it would be wrong to.
+
+    A retried task's record can name a superseded candidate that was abandoned
+    on its branch. Consulting it for a row whose naming commit is already an
+    ancestor would manufacture a `completed_not_in_base` out of the weaker
+    evidence — the record overrides the search towards the base containing
+    MORE, never less.
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init")
+    commit(repo, "landed-01: the work, merged")
+    abandoned = side_commit(repo, "the superseded attempt", "autoloop/landed-01")
+    executions = tmp_path / "state" / "executions"
+    write_record(executions, "landed-01", abandoned)
+
+    out = report(repo, executions, "landed-01")
+
+    assert out["rows"][0]["state"] == "shipped"
+    assert out["disagreements"]["rows"] == []
+    assert out["disagreements"]["unverified"] == []
+    assert out["disagreements"]["witnessed"] == [], (
+        "it never joined the disagreement list, so it did not LEAVE one either"
+    )
+
+
+def test_with_no_reader_injected_every_row_reads_as_it_did_before(tmp_path):
+    """The backward-compatible contract `registry_disagreements` keeps for a
+    caller that passes no record reader at all (`test_shipped_elsewhere.py` has
+    several): both judgeable states classify exactly as they always did."""
+    shipped = [
+        {"id": "n-1", "title": "", "state": "not-in-base", "detail": "not an ancestor"},
+        {"id": "u-1", "title": "", "state": "unknown", "detail": "no mention"},
+        {"id": "s-1", "title": "", "state": "shipped", "detail": "an ancestor"},
+        {"id": "v-1", "title": "", "state": "unverified", "detail": "could not look"},
+    ]
+
+    out = dashboard.registry_disagreements(shipped, [])
+
+    assert {r["id"]: r["kind"] for r in out["rows"]} == {
+        "n-1": "completed_not_in_base", "u-1": "completed_unwitnessed",
+    }
+    assert [r["id"] for r in out["unverified"]] == ["v-1"]
+    assert out["witnessed"] == []
 
 
 # --- 3. the generation rules, reached through the report ----------------------
@@ -419,6 +545,39 @@ def test_an_INDETERMINATE_ancestry_check_is_unchecked(tmp_path, monkeypatch):
     assert out["disagreements"]["rows"] == []
     assert out["disagreements"]["witnessed"] == []
     assert [r["id"] for r in out["disagreements"]["unverified"]] == ["murk-02"]
+
+
+def test_a_search_that_could_not_RESOLVE_its_match_stays_unchecked(tmp_path,
+                                                                   monkeypatch):
+    """The other half of "the record decides": it decides only for a row the
+    SEARCH could judge.
+
+    Here a commit names the id and git will not say where it is, so the search
+    state is `unverified` — "could not look". The record would clear this row,
+    and it is deliberately not asked: the two sources answer different
+    questions, and a poll that could not resolve its own evidence must not be
+    promoted to a verdict behind that. `test_a_poll_that_did_not_search…` pins
+    the same rule for the search never running at all.
+    """
+    repo = make_repo(tmp_path)
+    commit(repo, "init")
+    named = side_commit(repo, "murk-03: an attempt on its branch", "side")
+    carrier = commit(repo, "the work landed, naming nothing")
+    executions = tmp_path / "state" / "executions"
+    write_record(executions, "murk-03", carrier)
+    monkeypatch.setattr(
+        dashboard, "is_ancestor",
+        lambda _repo, sha, _head: "unknown" if sha == named else "yes",
+    )
+
+    out = report(repo, executions, "murk-03")
+
+    assert out["rows"][0]["state"] == "unverified"
+    assert out["disagreements"]["rows"] == []
+    assert out["disagreements"]["witnessed"] == [], (
+        "the record WOULD have cleared it, and the weaker state wins"
+    )
+    assert [r["id"] for r in out["disagreements"]["unverified"]] == ["murk-03"]
 
 
 def test_an_id_no_registry_could_have_issued_reads_no_file_at_all(tmp_path):
@@ -710,6 +869,30 @@ def test_the_PRINTED_row_says_the_record_is_what_cleared_it(tmp_path):
     assert out["counts"]["unknown"] == 1 and out["counts"]["shipped"] == 0
     assert "NO MENTION" in text and "scope-02" in text
     assert "accounted for in the base" in text
+    assert "registry / code disagreements: 0 (0 proven)" in text
+
+
+def test_the_PRINTED_row_for_a_cleared_NOT_IN_BASE_row_carries_BOTH_halves(tmp_path):
+    """The output that would otherwise read as a contradiction: the label says
+    NOT IN BASE, the block below says zero disagreements, and the command exits
+    0. What makes those three legible together is the row's own detail carrying
+    both evidence sources — what the search found, and what the record settled
+    it with. One uniform code path, so this row is annotated exactly as an
+    unnamed one is."""
+    repo = make_repo(tmp_path)
+    commit(repo, "init")
+    side_commit(repo, "cross-02: an earlier attempt on its branch", "side")
+    carrier = commit(repo, "the work landed, naming nothing")
+    executions = tmp_path / "state" / "executions"
+    write_record(executions, "cross-02", carrier)
+
+    out = report(repo, executions, "cross-02")
+    text = "\n".join(cli._format_shipped(out))
+
+    assert "NOT IN BASE" in text and "cross-02" in text
+    assert out["counts"]["not-in-base"] == 1 and out["counts"]["shipped"] == 0
+    assert "none of them an ancestor" in text, "the search's half is still printed"
+    assert "accounted for in the base" in text, "and the record's half is beside it"
     assert "registry / code disagreements: 0 (0 proven)" in text
 
 
