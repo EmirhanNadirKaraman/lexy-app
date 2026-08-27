@@ -349,13 +349,16 @@ from .blockers import (
     BlockerStore,
     autonomous_recovery,
 )
-from .browser.chatgpt import SubmitResult
-from .browser.observation import SendOutcome
 from .browser.playwright_session import attachable_page_targets
 from .changeset_review import ChangesetBinding, build_changeset_packet
 from .config import AutoloopConfig
 from .context import build_context, render_context
-from .conversation import transport_is_browser_backed, transport_remedy
+from .conversation import (
+    SendOutcome,
+    SubmitResult,
+    transport_is_browser_backed,
+    transport_remedy,
+)
 from .contract import (
     AUDIT_TASK_ID,
     COMMIT_DECISIONS,

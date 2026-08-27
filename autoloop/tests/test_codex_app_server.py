@@ -40,7 +40,6 @@ from pathlib import Path
 
 import pytest
 
-from autoloop.browser.chatgpt import SubmitResult
 from autoloop.codex import wire
 from autoloop.codex.app_server import (
     AppServerClient,
@@ -72,7 +71,11 @@ from autoloop.config import (
     ConversationConfig,
     load_config,
 )
-from autoloop.conversation import available_providers, create_conversation
+from autoloop.conversation import (
+    SubmitResult,
+    available_providers,
+    create_conversation,
+)
 from autoloop.errors import BrowserError, QuotaExhaustedError, ResponseTimeoutError
 from autoloop.packet import diff_part_id
 from autoloop.policy import PolicyConfig

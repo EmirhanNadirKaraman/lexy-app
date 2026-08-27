@@ -220,7 +220,7 @@ class FakeClient:
         self.send_attempted = True
         self.submitted.append((request_id, prompt))
         self.persisted.add(request_id)
-        from autoloop.browser.chatgpt import SubmitResult
+        from autoloop.conversation import SubmitResult
 
         return SubmitResult.CONFIRMED
 

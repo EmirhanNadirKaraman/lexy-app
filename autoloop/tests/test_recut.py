@@ -146,7 +146,7 @@ class FakeClient:
         return request_id in self.persisted
 
     def submit(self, request_id, prompt):
-        from autoloop.browser.chatgpt import SubmitResult
+        from autoloop.conversation import SubmitResult
 
         self.send_attempted = True
         self.submitted.append((request_id, prompt))

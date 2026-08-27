@@ -350,7 +350,7 @@ class _ScriptedClient:
         return request_id in self.persisted
 
     def submit(self, request_id, prompt):
-        from autoloop.browser.chatgpt import SubmitResult
+        from autoloop.conversation import SubmitResult
 
         self.submitted.append((request_id, prompt))
         self.persisted.add(request_id)

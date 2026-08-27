@@ -82,10 +82,10 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
+from ..conversation import SubmitResult
 from ..errors import (
     BrowserError,
     ConversationSearchInconclusive,
@@ -101,20 +101,12 @@ from .selectors import ChatGPTSelectors
 from .session import BrowserSession, Message
 
 
-class SubmitResult(str, Enum):
-    #: The request id was already in persisted history; nothing was sent.
-    ALREADY_PERSISTED = "already_persisted"
-    #: Sent, and the server demonstrably accepted the turn.
-    CONFIRMED = "confirmed"
-    #: A send was attempted, but acceptance could not be established. The
-    #: caller must reconcile; it must NOT resend on its own.
-    UNCONFIRMED = "unconfirmed"
-    #: A send was attempted and the browser's own request to the conversation
-    #: endpoint demonstrably failed. Acceptance is DISPROVEN, not merely
-    #: unknown. Still not self-authorizing: the caller confirms absence by
-    #: reconciliation before it may resend. Only ever produced when the
-    #: session implements the optional send-observation capability.
-    REJECTED = "rejected"
+#: `SubmitResult` is re-exported here, not defined here. It moved to
+#: `autoloop/conversation.py` in brw-17 (2026-08-27) because every provider
+#: speaks it and this transport is retired (brw-16); the name stays importable
+#: from this module so the codex adapters and the browser tests that already
+#: point at it keep working, and so the move changed no object identity — an
+#: `is` comparison against either import path is the same enum member.
 
 
 @dataclass(frozen=True)
