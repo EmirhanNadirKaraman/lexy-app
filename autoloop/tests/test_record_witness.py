@@ -849,6 +849,69 @@ def test_shipped_report_reads_the_records_of_the_checkout_it_is_pointed_at(tmp_p
     }
 
 
+def test_a_record_only_UNCHECKED_row_makes_the_COMMAND_exit_1(tmp_path, capsys):
+    """The fail-open this classification opened in the command's exit code.
+
+    Since witness-01 a completed task NO SUBJECT NAMES is decided by its
+    execution record, so a record that is torn — or an archive nobody can put in
+    generation order — takes the row out of `rows` and into
+    `disagreements["unverified"]`. Nothing `_cmd_shipped_report` counted saw it:
+    `counts["unverified"]` is the SEARCH's tally and both rows searched fine,
+    `proven` counts findings and there are none, and neither row is a
+    shipped-elsewhere record. So the command printed UNCHECKED and exited 0 —
+    "I could not read the evidence" rendering as a clean bill of health, which
+    is the exact shape every other branch of that expression exists to refuse.
+
+    Every other term is asserted FALSY on purpose: that is what makes this a
+    regression for the record-only gap rather than a test the old code would
+    also pass. The third record shape that lands in the same list — a candidate
+    git will not resolve — is pinned at the payload level by
+    `test_an_INDETERMINATE_ancestry_check_is_unchecked` and exits through this
+    same term.
+    """
+    repo = make_repo(tmp_path, "checkout")
+    commit(repo, "init")
+    carrier = commit(repo, "a subject naming no task at all")
+    state_dir = tmp_path / "state"
+    config_path = _configure(repo, state_dir, tmp_path / "outside" / "workers")
+    executions = state_dir / "executions"
+    executions.mkdir(parents=True, exist_ok=True)
+    (executions / "torn-02.json").write_text("{not json", encoding="utf-8")
+    write_record(executions, "murky-04", carrier, archive_as="released-by-operator")
+    write_record(executions, "murky-04", carrier,
+                 archive_as="published-20260810T000000Z")
+    registry = TaskRegistry([
+        Task(id=tid, title=f"Title {tid}", description="d",
+             approved_paths=("docs/A.md",))
+        for tid in ("torn-02", "murky-04")
+    ])
+    for tid in ("torn-02", "murky-04"):
+        registry.mark_completed(tid)
+    TaskStore(state_dir / "tasks.json").save(registry)
+
+    code = cli._cmd_shipped_report(argparse.Namespace(
+        config=config_path, repo=repo, base=head_of(repo)
+    ))
+    printed = capsys.readouterr().out
+
+    assert code == 1, "an unreadable record may not exit 0"
+    out = report(repo, executions, "torn-02", "murky-04")
+    assert [r["id"] for r in out["disagreements"]["unverified"]] == [
+        "murky-04", "torn-02"
+    ]
+    assert out["counts"]["unverified"] == 0, "the SEARCH judged both rows"
+    assert out["disagreements"]["proven"] == 0 and out["disagreements"]["rows"] == []
+    assert out["searched"] is True and out["elsewhere"] == [], (
+        "every other reason this command exits 1 is absent, so the unchecked "
+        "rows are the only thing that can be carrying it"
+    )
+    assert "UNCHECKED completed  torn-02" in printed
+    assert "UNCHECKED completed  murky-04" in printed
+    assert "could not be read" in printed and "cannot be put in order" in printed, (
+        "and a non-zero exit says WHICH evidence could not be read"
+    )
+
+
 def test_the_PRINTED_row_says_the_record_is_what_cleared_it(tmp_path):
     """A row the record cleared leaves the disagreement list — and that is the
     one row whose evidence would otherwise appear NOWHERE an operator reads: it
