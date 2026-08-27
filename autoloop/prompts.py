@@ -159,6 +159,46 @@ TEMPLATES: dict[str, PromptTemplate] = {
                 "revision round is allowed for this task)."
             ),
         ),
+        # The ask a candidate too large to RENDER gets instead of a park
+        # (split-05). Deliberately a separate template from `postcommit_review`
+        # above rather than a variant of it: that one ends by offering `push`,
+        # and the whole point here is that there is nothing to approve. The two
+        # bodies must never converge.
+        PromptTemplate(
+            name="postcommit_split_review",
+            body=(
+                "The executor committed task {task_id} ({task_title}) to its own "
+                "branch and the commit PASSED structural post-commit review "
+                "(ancestry from the task base, path ownership, a clean worktree, "
+                "and a re-run of validation against the committed tree). Nothing "
+                "has been pushed — and nothing can be, because its patch is too "
+                "large to render, so you are NOT being shown it.\n\n{packet}\n\n"
+                "ONE QUESTION, and the file list and per-file line counts above "
+                "are what answers it: is this ONE claim, or several?\n\n"
+                "  A. SEVERAL — reply `split` with this task_id and at least "
+                "{min_successors} successors in `tasks`, each with its own "
+                "`approved_paths` and each independently reviewable. The "
+                "successor list is FLAT: a successor cannot itself carry a "
+                "split, and none of them may be split again afterwards. Each "
+                "inherits the {inherited_attempts} attempt(s) already spent "
+                "here, so this refunds no budget.\n\n"
+                "  B. ONE CLAIM — this work genuinely cannot be cut smaller. "
+                "Reply anything else and the task parks for a human operator, "
+                "with your reason recorded. That park is the correct answer "
+                "sometimes and it is always available.\n\n"
+                "THE COMMITTED WORK IS DISCARDED EITHER WAY BY A SPLIT. A split "
+                "retires this task into its successors: the commit above is "
+                "never published, its execution record is archived and its "
+                "worker repository quarantined (nothing is deleted), and the "
+                "successors redo the work in pieces from the current base. It "
+                "passed validation and post-commit review; it is thrown away "
+                "because it cannot be reviewed, not because it is wrong.\n\n"
+                "Every other answer parks — including `revise` (it orders the "
+                "same size again), `recut` (the same task from a clean base is "
+                "the same size), and an approval (you have not read this "
+                "change). Answer A, or accept the park."
+            ),
+        ),
         PromptTemplate(
             name="changeset_review",
             body=(

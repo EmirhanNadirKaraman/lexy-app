@@ -313,6 +313,104 @@ def build_review_packet_with_diff(
     return "\n".join(sections), diff
 
 
+#: The banner a stat-only packet carries — at the TOP, and again where the
+#: patch would have been. It is the reviewer-facing half of requirement 2: a
+#: stat is not a truncated diff, it is a different and COMPLETE artifact, and a
+#: reviewer must never be able to mistake one for the other.
+#:
+#: It is deliberately NOT what any gate keys on. The bypass gates live in
+#: `orchestrator` and read the DURABLE ledger entry the ask wrote
+#: (`REASON_SENT_FOR_SPLIT_REVIEW`), never this text: a candidate that edits
+#: this very file carries these bytes inside its own patch, so a substring
+#: search over the payload would answer "stat-only" for an ordinary full packet
+#: and refuse a legitimate approval. Text is for the reader; the record decides.
+STAT_ONLY_PACKET_BANNER = "STAT-ONLY PACKET — NO PATCH WAS RENDERED"
+
+
+def build_stat_only_review_packet(
+    execution: TaskExecution, worktree_git: GitGateway, task: Task
+) -> str:
+    """The packet for a candidate whose PATCH busts `RANGE_DIFF_MAX_BYTES`:
+    every section the full packet has except the diff, plus a banner saying so
+    in as many words.
+
+    THE POINT IS THAT THIS IS NOT A REVIEW PACKET. It cannot be approved and it
+    is not offered for approval — it exists so a reviewer can answer ONE
+    question that needs only the file list and the per-file line counts: is this
+    one claim, or is it several? A `--stat` of ~40 files is about 2 KB, so it
+    renders precisely where the patch does not.
+
+    Nothing is truncated to fit. The stat is the whole stat, the changed-path
+    list is the whole list, and if `range_diff_stat` itself exceeds the cap this
+    raises rather than shortening anything — the caller parks, exactly as it
+    does today. "A truncated diff can hide exactly the change a reviewer needs
+    to see" is why the cap refuses, and a shortened stat would hide a file the
+    same way.
+
+    Returns the text only, with no companion patch: there is no patch. The
+    signature difference from `build_review_packet_with_diff` is deliberate —
+    a caller cannot accidentally treat this as the reviewed diff.
+    """
+    base_sha = execution.task_base_sha
+    candidate_sha = execution.candidate_sha
+
+    commits = worktree_git.commit_list(base_sha, candidate_sha)
+    changed = worktree_git.commit_range_paths(base_sha, candidate_sha)
+    base_entries = worktree_git.tree_entries(worktree_git.tree_of(base_sha))
+    candidate_entries = worktree_git.tree_entries(worktree_git.tree_of(candidate_sha))
+    stat = worktree_git.range_diff_stat(base_sha, candidate_sha)
+
+    sections = [
+        STAT_ONLY_PACKET_BANNER,
+        "",
+        "This candidate's patch is over the "
+        f"{worktree_git.RANGE_DIFF_MAX_BYTES}-byte render cap, so NO PATCH WAS",
+        "SHOWN TO YOU and none is available further down — the sections below end",
+        "at the diff stat. This is not a shortened diff and not a sample: it is a",
+        "different, COMPLETE artifact (the whole file list, the whole stat), and",
+        "the cap exists precisely so that a truncated patch is never put in front",
+        "of you as if it were the change.",
+        "",
+        "NOTHING HERE CAN BE APPROVED. `push` publishes a candidate you have read;",
+        "you have not read this one, and the loop refuses a `push` answering this",
+        "packet whatever you reply. Everything else in this packet is read from",
+        "immutable git objects in the range shown, except the one section",
+        "explicitly labelled as the executor's own claims.",
+        "",
+        f"task_id: {task.id}",
+        f"task_title: {task.title}",
+        f"branch: {execution.task_branch}",
+        f"base_sha: {base_sha}",
+        f"candidate_sha: {candidate_sha}",
+        f"review_round: {execution.review_round}",
+        "",
+        f"Commits ({base_sha[:12]}..{candidate_sha[:12]}, oldest first):",
+        _format_commit_list(commits),
+        "",
+        f"Changed paths ({len(changed)}):",
+        _format_changed_paths(changed, base_entries, candidate_entries),
+    ]
+
+    out_of_scope = _format_out_of_scope(changed, execution.allowed_paths)
+    if out_of_scope:
+        sections += ["", out_of_scope]
+
+    sections += [
+        "",
+        "Diff stat:",
+        stat.strip() or "  (empty)",
+        "",
+        _format_executor_report(execution),
+        "",
+        # Repeated at the bottom on purpose: the executor report above is long,
+        # and a reviewer who scrolled past the top banner must not reach the end
+        # of this packet still expecting a patch below it.
+        STAT_ONLY_PACKET_BANNER,
+        "  (the section that would hold the patch ends here — there is none)",
+    ]
+    return "\n".join(sections)
+
+
 def _format_executor_report(execution: TaskExecution) -> str:
     """The executor's own account of the round — the ONLY unread section.
 

@@ -64,7 +64,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from .errors import EnvironmentDriftError, GitCommandError, GitError, GitOperationDenied
+from .errors import (
+    DiffTooLargeError,
+    EnvironmentDriftError,
+    GitCommandError,
+    GitError,
+    GitOperationDenied,
+)
 from .policy import PolicyEngine
 from .worktask import CommitIntent, IntentStore
 
@@ -428,6 +434,12 @@ class GitGateway:
     #: Above this many bytes, `range_diff`/`range_diff_stat` refuse outright
     #: rather than truncate. A truncated diff can hide exactly the change a
     #: reviewer needs to see, which would be worse than an explicit refusal.
+    #:
+    #: The refusal is a `DiffTooLargeError` (a `GitCommandError` subclass, so
+    #: every existing handler still catches it): "this is too big to render" is
+    #: the one failure here that says nothing is wrong with the repository, and
+    #: a caller that wants to act on THAT — rather than on a torn repo or an
+    #: unresolvable sha — has to be able to tell the two apart.
     RANGE_DIFF_MAX_BYTES = 400_000
 
     #: Flags common to `range_diff` and `range_diff_stat`: no external diff
@@ -446,14 +458,14 @@ class GitGateway:
         external diff driver or textconv filter can execute and no rename
         heuristic can hide a path's real diff.
 
-        Refuses (raises `GitCommandError`) above `RANGE_DIFF_MAX_BYTES`
-        rather than truncating.
+        Refuses (raises `DiffTooLargeError`, a `GitCommandError`) above
+        `RANGE_DIFF_MAX_BYTES` rather than truncating.
         """
         raw = self._git_bytes(
             "diff-tree", "-r", "-p", *self._RANGE_DIFF_SAFETY_FLAGS, base_sha, candidate_sha
         )
         if len(raw) > self.RANGE_DIFF_MAX_BYTES:
-            raise GitCommandError(
+            raise DiffTooLargeError(
                 f"range diff {base_sha[:12]}..{candidate_sha[:12]} is {len(raw)} "
                 f"bytes, over the {self.RANGE_DIFF_MAX_BYTES}-byte cap — refusing "
                 "rather than truncating a diff a reviewer must see in full"
@@ -462,12 +474,21 @@ class GitGateway:
 
     def range_diff_stat(self, base_sha: str, candidate_sha: str) -> str:
         """Like `range_diff` but the `--stat` summary only, same safety
-        flags and the same refuse-rather-than-truncate cap."""
+        flags and the same refuse-rather-than-truncate cap — and the same
+        `DiffTooLargeError` when it is exceeded.
+
+        In practice a stat of the same range is orders of magnitude smaller
+        (one line per file), which is what makes it a usable artifact for a
+        candidate whose patch the cap refuses. That is a size relationship, not
+        a guarantee: a commit touching tens of thousands of paths busts this cap
+        too, and it raises here exactly as the patch does rather than pretending
+        a smaller artifact always exists.
+        """
         raw = self._git_bytes(
             "diff-tree", "-r", "--stat", *self._RANGE_DIFF_SAFETY_FLAGS, base_sha, candidate_sha
         )
         if len(raw) > self.RANGE_DIFF_MAX_BYTES:
-            raise GitCommandError(
+            raise DiffTooLargeError(
                 f"range diff stat {base_sha[:12]}..{candidate_sha[:12]} is "
                 f"{len(raw)} bytes, over the {self.RANGE_DIFF_MAX_BYTES}-byte cap "
                 "— refusing rather than truncating"

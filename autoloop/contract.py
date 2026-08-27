@@ -113,6 +113,16 @@ class Decision(str, Enum):
     #: ceiling decomposition has used since ceil-01 (marker, `add_many`,
     #: `retire(superseded_by=...)`, `release_task_to_pending`) with a different
     #: label on it.
+    #:
+    #: THE LOOP CAN ALSO ASK FOR IT (split-05, 2026-08-27), and that closed the
+    #: gap this verb was built for and could not reach. A candidate whose patch
+    #: busts `GitGateway.RANGE_DIFF_MAX_BYTES` parked before any packet reached a
+    #: reviewer, so the one situation the verb exists to answer was the one
+    #: situation in which nobody could issue it. Such a candidate is now
+    #: presented as a STAT-ONLY packet — the whole file list and the whole diff
+    #: stat, no patch, saying so — and the reply is constrained to this verb or
+    #: the same park as before. The stat is a different COMPLETE artifact, never
+    #: a truncated diff, and no approval can bind to it.
     SPLIT = "split"
     STOP = "stop"
     #: RETIRED — no longer offered by CONTRACT_INSTRUCTIONS, still parsed. A
