@@ -79,8 +79,10 @@ very likely a branch out there, and this module cannot name it:
   work landed** — including when the archived copies cannot be put in
   generation order at all, or the newest of them will not load.
   `_retired_publication_is_integrated` explains why the archive is read here
-  when the merge window deliberately ignores it, and why only its newest
-  generation is allowed to answer.
+  when the merge window deliberately ignores it; the reading itself is
+  `execution_record_ancestry`, which since witness-01 (2026-08-27) is shared
+  with `dashboard.registry_disagreements` so the report and the sweep cannot
+  reach different verdicts about the same record.
 * **The record loads but names no candidate.** Completion implies a candidate,
   so such a record cannot be describing the publication completion implies.
 
@@ -867,6 +869,14 @@ class BacklogSweeper:
         """A COMPLETED task with no live execution record: is its work provably
         in the base already? `(True, "")` only when it demonstrably is.
 
+        The reading itself — which archived generation answers, whose copies are
+        dropped, and what an unorderable or unreadable archive does — is
+        `execution_record_ancestry`, shared with `dashboard.registry_
+        disagreements` since witness-01 (2026-08-27). This method is the sweep's
+        side of it and nothing else: the verdict collapsed to the `(bool, why)`
+        `_backlog` records, with the ancestry question answered by
+        `_is_integrated` and the reason phrased against `head`.
+
         Why the archive is read here at all, when `cli._merge_window_blockers`
         deliberately does NOT recurse into it: the two ask different questions.
         The gate asks "could moving the base strand this?", and a retired record
@@ -878,109 +888,27 @@ class BacklogSweeper:
         every such branch becomes invisible again, which is the whole failure
         this module exists to end.
 
-        Read as raw JSON rather than through `TaskExecutionStore.load`: an
-        archived record can predate any field this dataclass now requires, and
-        `TaskExecution(**data)` would raise on it.
-
-        **ANCESTRY decides, exactly as it does for a live record.** Either sha
-        the record names being in the base answers the question, because git is
-        authoritative about what is in the base and needs no second opinion.
-        `published_sha` is CORROBORATION — it is the one field meaning "the
-        remote confirmed this", written by `_dispatch_task_push` from an
-        `ls-remote` — but requiring it would be a stricter rule than the live
-        path applies, and a stricter rule with a date on it: the field only
-        exists from 2026-08-15, so every archive written before then would be
-        permanently unresolved with no action an operator could take, even with
-        its candidate demonstrably merged. Wolf-crying, on exactly the records
-        this branch exists to stop wolf-crying about.
-
-        **Only the NEWEST retirement answers, and it answers alone.**
-        `TaskExecutionStore.archive` preserves one file per retirement and
-        refuses to clobber an earlier one, so a single task legitimately has
-        several generations on disk — a `release`, a later retry, the
-        `published-<sha>` retirement that produced the state being judged here.
-        Those generations describe DIFFERENT commits. An earlier one is very
-        often integrated precisely because it was superseded and its work
-        reached the base another way, so "any archived copy names an ancestor"
-        clears a task whose newest publication is still outstanding — the
-        invisibility this module exists to end, granted by its own reconciler.
-        The newest generation is the one whose publication produced the task's
-        current COMPLETED state, so it is the only one asked.
-
-        Superseded generations are not required to be integrated, and must not
-        be: a released attempt's candidate is usually abandoned and never
-        merged, so demanding it would report every retried task unresolved
-        forever — the same wolf-crying, from the opposite direction.
-
-        Generation comes from the archive FILENAME, not from the record inside
-        it: `retire_execution` appends a fixed-width UTC instant to every label
-        (`<task_id>-<reason>-<stamp>.json`, stamp `YYYYMMDDTHHMMSSZ`), and while
-        whole labels do not order across differing reasons, that trailing
-        component does. When it cannot be read — an unstamped label, a
-        hand-made file — the generations cannot be ordered, and an unorderable
-        archive is unresolved rather than guessed at. A task with exactly ONE
-        archived record needs no ordering and is judged directly, which is what
-        keeps records written before the stamp existed answerable.
-
-        **The glob matches by filename PREFIX, so it can land on another task's
-        record.** Task ids may contain `-` (`TaskRegistry`'s rule admits it) and
-        so may labels, so `rt-1-*.json` matches `rt-1-b-published-<stamp>.json`.
-        That was a latent fail-open under any "some copy names an ancestor" rule
-        and is a sharper one under this one: a sibling's copy carrying the newest
-        stamp would BECOME the newest generation, and this task's own newest
-        archive would never be consulted — another task's commit standing in for
-        this task's completed publication. Each copy is therefore checked against
-        the `task_id` it carries (a required field on every record this store has
-        ever written) and dropped only when it PROVES it belongs to someone else.
-        A copy that cannot be read, or one carrying no owner at all, is kept: not
-        provably foreign is not foreign, and keeping it can only make the answer
-        more conservative.
+        The ancestry callable answers `"yes"`/`"no"` and never `"unknown"`,
+        because `_is_integrated` already collapses a git failure to "not
+        integrated here" — an object this checkout cannot resolve cannot be an
+        ancestor of its own HEAD, and `attempt` fetches it before deciding
+        anything. So the shared helper's `unverified` verdict is unreachable
+        from this caller, and every other verdict maps to the same
+        report-and-do-not-merge answer it always did.
 
         Nothing here is ever merged FROM: an archived record is not a merge
         source, because `AutoMerger.attempt` reads the LIVE record and would
         skip the task anyway. The honest report is the output.
         """
-        archive = Path(self._execution_store.directory) / "archive"
-        try:
-            paths = sorted(archive.glob(f"{task_id}-*.json"))
-        except OSError as exc:
-            return False, f"its execution archive could not be listed ({exc})"
-        copies = [
-            copy
-            for copy in (_read_archived(path) for path in paths)
-            if not _is_another_tasks_copy(copy, task_id)
-        ]
-        if not copies:
-            # Either the glob found nothing, or everything it found proved to
-            # belong to another task — which is the same answer: nothing here
-            # names the branch this task's completion says was published.
-            return False, (
-                "it has no execution record, live or archived — nothing names "
-                "the candidate its completion says was published"
-            )
-        newest, why_not = _newest_generation(copies)
-        if not newest:
-            return False, why_not
-        unreadable = [f"{c.name} ({c.error})" for c in newest if c.data is None]
-        if unreadable:
-            return False, (
-                "its record was retired and the newest archived copy could not "
-                "be read: " + "; ".join(unreadable)
-            )
-        integrated = all(
-            any(
-                sha and self._is_integrated(head, str(sha))
-                for sha in (c.data.get("candidate_sha"), c.data.get("published_sha"))
-            )
-            for c in newest
+        answer = execution_record_ancestry(
+            self._execution_store.directory,
+            task_id,
+            lambda sha: "yes" if self._is_integrated(head, sha) else "no",
+            base_label=head[:12],
         )
-        if integrated:
+        if answer.verdict == RECORD_IN_BASE:
             return True, ""
-        return False, (
-            "its record was retired and no sha its newest archived copy "
-            f"({', '.join(c.name for c in newest)}) names is an ancestor of "
-            f"{head[:12]} — the branch may still be outstanding; merge it by hand"
-        )
+        return False, answer.detail
 
     def _is_integrated(self, head: str, candidate_sha: str) -> bool:
         """Is `candidate_sha` already in the base? An object git cannot resolve
@@ -1135,9 +1063,301 @@ def _as_record_dict(record) -> dict:
     )
 
 
+# ---- one task's execution record, asked about ancestry -----------------------
+#
+# witness-01, 2026-08-27. ONE implementation, TWO callers. It began as
+# `_retired_publication_is_integrated`'s body — the sweep's rule for judging a
+# task whose live record has been retired — and moved here when the second
+# caller arrived: `dashboard.registry_disagreements`, which asks exactly this
+# question of exactly these records before deciding that a completed task no
+# commit subject names is unaccounted for.
+#
+# MEASURED 2026-08-25. `shipped-report` returned seven `completed_unwitnessed`
+# rows and two of them (dash-02, scope-02) had shipped — their commit subjects
+# simply never named them, while the execution record on disk named a candidate
+# that git will confirm is in the base. The evidence was already here and
+# already trusted by the sweep; the report reached a weaker conclusion from data
+# it already had.
+#
+# A SECOND COPY OF THE GENERATION RULES WOULD BE WORSE THAN THAT BUG. They are
+# the part nobody reconstructs correctly twice: newest generation only, ordered
+# by the filename stamp, another task's copies dropped by the id they carry, an
+# unorderable archive refused rather than guessed at. So the rules live here and
+# both callers call them; neither is allowed a variant.
+
+#: What consulting one task's execution record can conclude about its candidate.
+#: The last two are as deliberately distinct as `dashboard.SHIPPED_STATES`' last
+#: two: `RECORD_UNVERIFIED` means a record exists and could not be judged,
+#: `RECORD_ABSENT` means nothing on disk names a candidate at all. Collapsing
+#: them turns "I could not look" into "there is nothing to see", which is the
+#: fail-open every reader of these records is written against.
+RECORD_IN_BASE = "in-base"
+RECORD_NOT_IN_BASE = "not-in-base"
+RECORD_UNVERIFIED = "unverified"
+RECORD_ABSENT = "absent"
+
+#: Every verdict `execution_record_ancestry` can return. Pinned as a tuple so a
+#: caller can assert it knows all of them rather than growing a silent `else`.
+RECORD_VERDICTS = (
+    RECORD_IN_BASE,
+    RECORD_NOT_IN_BASE,
+    RECORD_UNVERIFIED,
+    RECORD_ABSENT,
+)
+
+
+@dataclass(frozen=True)
+class RecordAncestry:
+    """Where one task's execution record says its candidate is, and how sure.
+
+    **WHAT `in-base` PROVES, AND WHAT IT DOES NOT.** It proves the BRANCH is
+    accounted for in the base — the commit the record names is reachable from
+    the base head. It does NOT prove this task's content is present. On
+    2026-08-25 bind-01, dash-17 and split-01 were each recorded as superseded
+    with `git merge -s ours`, which makes the candidate a genuine ancestor while
+    taking none of its content: for bind-01 and dash-17 the work really is in
+    the base (under bind-02's and dash-19's commits), and for split-01 it was
+    discarded and split-04 redoes it. Ancestry cannot tell those apart and does
+    not claim to.
+
+    That is still strictly better than matching commit subjects, which gets the
+    same three wrong for a worse reason — the `-s ours` subjects DO name the
+    task ids, so a subject-only reading calls them shipped on the strength of a
+    commit whose own body says it took no content. Read a verdict here as "is
+    this branch accounted for in the base", never as "is this task's code
+    present".
+
+    `detail` is a sentence for an operator, carried on EVERY verdict including
+    `in-base` — a reader that only phrases its bad news cannot say why a row
+    left a list. `source` names the file(s) the answer came from (empty when no
+    file was reached at all), and `shas` are the candidate/published shas the
+    record named.
+    """
+
+    verdict: str
+    detail: str = ""
+    source: str = ""
+    shas: tuple[str, ...] = ()
+
+
+def execution_record_ancestry(
+    executions_dir,
+    task_id: str,
+    ancestry,
+    *,
+    base_label: str = "the base head",
+) -> RecordAncestry:
+    """Is the candidate `task_id`'s execution record names in the base?
+
+    The record is the LIVE one when there is one, and otherwise the NEWEST
+    archived generation. `ancestry(sha) -> "yes" | "no" | "unknown"` is injected
+    — `dashboard.is_ancestor` on one side, `BacklogSweeper._is_integrated` on
+    the other — so this function reads files and decides, and asks git nothing
+    itself. It never raises: every unreadable, unlistable and unorderable state
+    comes back as a verdict with a reason.
+
+    Records are read as raw JSON rather than through `TaskExecutionStore.load`:
+    an archived record can predate any field that dataclass now requires, and
+    `TaskExecution(**data)` would raise on it. The live record's path comes from
+    the store itself (`path_for`), so the on-disk layout is spelled once.
+
+    **ANCESTRY decides, and either sha the record names answers.**
+    `published_sha` is CORROBORATION — the one field meaning "the remote
+    confirmed this", written by `_dispatch_task_push` from an `ls-remote` — but
+    requiring it would be a stricter rule with a date on it: the field only
+    exists from 2026-08-15, so every record written before then would be
+    permanently unjudgeable with no action an operator could take, even with its
+    candidate demonstrably merged. Git is authoritative about what is in the
+    base and needs no second opinion.
+
+    **Only the NEWEST retirement answers, and it answers alone.**
+    `TaskExecutionStore.archive` preserves one file per retirement and refuses
+    to clobber an earlier one, so a single task legitimately has several
+    generations on disk — a `release`, a later retry, the `published-<sha>`
+    retirement that produced the state being judged. Those generations describe
+    DIFFERENT commits. An earlier one is very often integrated precisely because
+    it was superseded and its work reached the base another way, so "any
+    archived copy names an ancestor" clears a task whose newest publication is
+    still outstanding. Superseded generations are not required to be integrated,
+    and must not be: a released attempt's candidate is usually abandoned, so
+    demanding it would report every retried task unresolved forever — the same
+    wolf-crying from the opposite direction.
+
+    Generation comes from the archive FILENAME, not from the record inside it:
+    `retire_execution` appends a fixed-width UTC instant to every label
+    (`<task_id>-<reason>-<stamp>.json`, stamp `YYYYMMDDTHHMMSSZ`), and while
+    whole labels do not order across differing reasons, that trailing component
+    does. When it cannot be read — an unstamped label, a hand-made file — the
+    generations cannot be ordered, and an unorderable archive is `unverified`
+    rather than guessed at. A task with exactly ONE archived record needs no
+    ordering and is judged directly, which is what keeps records written before
+    the stamp existed answerable.
+
+    **The glob matches by filename PREFIX, so it can land on another task's
+    record.** Task ids may contain `-` (`TaskRegistry`'s rule admits it) and so
+    may labels, so `rt-1-*.json` matches `rt-1-b-published-<stamp>.json`. A
+    sibling's copy carrying the newest stamp would BECOME the newest generation
+    and answer for a task it says nothing about, so each copy is checked against
+    the `task_id` it carries and dropped only when it PROVES it belongs to
+    someone else — see `_is_another_tasks_copy` for why "cannot tell" is kept.
+
+    A record that names NO candidate at all is `absent`, not `not-in-base`:
+    there is no claim to refute. That is the same answer as "no file anywhere",
+    and both mean the base cannot be asked about this task through its record.
+
+    See `RecordAncestry` for the limit on what an `in-base` verdict proves — it
+    is about the branch being accounted for, never about its content surviving.
+    """
+    if not task_id or "/" in task_id or "\\" in task_id or task_id.startswith("."):
+        # Not an id `TaskRegistry` could ever have issued
+        # (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`), so no record was ever written
+        # under it — and both reads below build a PATH out of this string, so a
+        # separator or a leading dot would send the glob somewhere else
+        # entirely. The sweep only ever passes registry ids; the page reads the
+        # task file tolerantly and can hand over whatever is in it.
+        return RecordAncestry(
+            RECORD_ABSENT,
+            f"no execution record could be read: {task_id!r} is not a task id "
+            "this store can name",
+        )
+    store = TaskExecutionStore(executions_dir)
+    live = store.path_for(task_id)
+    if live.is_file():
+        copy = _read_record(live)
+        if copy.data is None:
+            # Fail-CLOSED, exactly like the sweep's own live-record branch: a
+            # record that will not load names a candidate nobody can read, and
+            # calling that "nothing names a candidate" is the shape that made a
+            # torn record exit 0 on 2026-08-15.
+            return RecordAncestry(
+                RECORD_UNVERIFIED,
+                f"its live execution record could not be read ({copy.error})",
+                source=copy.name,
+            )
+        return _record_verdict([copy], ancestry, base_label, retired=False)
+    archive = Path(executions_dir) / "archive"
+    try:
+        paths = sorted(archive.glob(f"{task_id}-*.json"))
+    except OSError as exc:
+        return RecordAncestry(
+            RECORD_UNVERIFIED, f"its execution archive could not be listed ({exc})"
+        )
+    copies = [
+        copy
+        for copy in (_read_record(path) for path in paths)
+        if not _is_another_tasks_copy(copy, task_id)
+    ]
+    if not copies:
+        # Either the glob found nothing, or everything it found proved to
+        # belong to another task — which is the same answer: nothing here
+        # names the branch this task's completion says was published.
+        return RecordAncestry(
+            RECORD_ABSENT,
+            "it has no execution record, live or archived — nothing names "
+            "the candidate its completion says was published",
+        )
+    newest, why_not = _newest_generation(copies)
+    if not newest:
+        return RecordAncestry(
+            RECORD_UNVERIFIED, why_not, source=", ".join(c.name for c in copies)
+        )
+    unreadable = [f"{c.name} ({c.error})" for c in newest if c.data is None]
+    if unreadable:
+        return RecordAncestry(
+            RECORD_UNVERIFIED,
+            "its record was retired and the newest archived copy could not "
+            "be read: " + "; ".join(unreadable),
+            source=", ".join(c.name for c in newest),
+        )
+    return _record_verdict(newest, ancestry, base_label, retired=True)
+
+
+def _record_verdict(
+    copies: list, ancestry, base_label: str, *, retired: bool
+) -> RecordAncestry:
+    """The ancestry verdict over the copies that get to answer — one live
+    record, or one archived generation (which is several files only when two
+    retirements share a second).
+
+    Aggregation is per COPY and then ALL, which is what makes a tie
+    conservative: with no way to tell which of two same-second retirements came
+    last, both must be integrated before the task is clear. Inside one copy the
+    two shas are ANY, because `candidate_sha` and `published_sha` describe the
+    same publication and either one being in the base settles it.
+
+    A copy naming no sha counts as not-integrated in a mixed group, and a group
+    naming none at all is `absent` — see `execution_record_ancestry`.
+    """
+    source = ", ".join(c.name for c in copies)
+    named: list[str] = []
+    per_copy: list[str] = []
+    for copy in copies:
+        shas = [
+            str(sha)
+            for sha in (copy.data.get("candidate_sha"), copy.data.get("published_sha"))
+            if sha
+        ]
+        named.extend(sha for sha in shas if sha not in named)
+        verdicts = [ancestry(sha) for sha in shas]
+        if "yes" in verdicts:
+            per_copy.append("yes")
+        elif "unknown" in verdicts:
+            # Never rounded either way: an indeterminate check may not become a
+            # clearance, and may not become a disagreement either.
+            per_copy.append("unknown")
+        else:
+            per_copy.append("no")
+    where = (
+        f"its newest archived execution record ({source})"
+        if retired
+        else "its live execution record"
+    )
+    if not named:
+        return RecordAncestry(
+            RECORD_ABSENT,
+            f"{where} names no candidate, though completion means one was "
+            "published — nothing here names a branch to look for",
+            source=source,
+        )
+    if all(verdict == "yes" for verdict in per_copy):
+        return RecordAncestry(
+            RECORD_IN_BASE,
+            f"{where} names {named[0][:12]}, which is an ancestor of "
+            f"{base_label} — the branch is accounted for in the base",
+            source=source,
+            shas=tuple(named),
+        )
+    if "unknown" in per_copy:
+        return RecordAncestry(
+            RECORD_UNVERIFIED,
+            f"{where} names {len(named)} sha(s) and git could not resolve them "
+            f"against {base_label} — no evidence either way",
+            source=source,
+            shas=tuple(named),
+        )
+    if retired:
+        # The sweep's own wording, unchanged: `test_merge_sweep.py` reads these
+        # reasons back, and an operator greps them.
+        detail = (
+            "its record was retired and no sha its newest archived copy "
+            f"({source}) names is an ancestor of {base_label} — the branch may "
+            "still be outstanding; merge it by hand"
+        )
+    else:
+        detail = (
+            f"its live execution record names {named[0][:12]} and no sha it "
+            f"names is an ancestor of {base_label} — the branch may still be "
+            "outstanding; merge it by hand"
+        )
+    return RecordAncestry(
+        RECORD_NOT_IN_BASE, detail, source=source, shas=tuple(named)
+    )
+
+
 @dataclass(frozen=True)
 class _ArchivedCopy:
-    """One file in `executions/archive/`, read exactly once.
+    """One execution record on disk, read exactly once — a file in
+    `executions/archive/`, or (since witness-01) the live record beside it.
 
     Read up front rather than on demand because the owner check and the
     ancestry check both need the contents, and a file that will not load has to
@@ -1156,8 +1376,8 @@ class _ArchivedCopy:
         return self.path.name
 
 
-def _read_archived(path: Path) -> _ArchivedCopy:
-    """Load one archived record as raw JSON. Never raises: an unreadable copy
+def _read_record(path: Path) -> _ArchivedCopy:
+    """Load one execution record as raw JSON. Never raises: an unreadable copy
     is a fact about the archive, and the caller reports it rather than crashing
     a sweep that runs before the loop starts."""
     try:
@@ -1193,7 +1413,7 @@ def _newest_generation(copies: list[_ArchivedCopy]) -> tuple[list[_ArchivedCopy]
 
     One archived file is one retirement; several are several attempts at the
     same task, describing different commits (see
-    `_retired_publication_is_integrated`). Ordering them is therefore the whole
+    `execution_record_ancestry`). Ordering them is therefore the whole
     question, and it is answered from the filename rather than the contents —
     the record inside carries no field that is written per-retirement.
 

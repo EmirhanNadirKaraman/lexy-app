@@ -6009,6 +6009,12 @@ def _format_disagreements(report: dict) -> list[str]:
     "I could not look" reading as "there is nothing to see". An empty findings
     list with four unchecked rows above it must not print as a clean bill of
     health, so it does not.
+
+    Each unchecked row carries its own REASON on a continuation line, exactly as
+    a finding does. Every one of them makes `_cmd_shipped_report` exit 1, and a
+    non-zero exit beside a line that will not say what could not be read (a torn
+    record, an archive nobody can order, a sha git would not resolve) is a stop
+    an operator cannot act on.
     """
     disagreements = report.get("disagreements") or {}
     rows = disagreements.get("rows") or []
@@ -6026,6 +6032,7 @@ def _format_disagreements(report: dict) -> list[str]:
             f"  UNCHECKED {row.get('record')}  {row.get('id')} — "
             "no evidence either way, and never counted as agreeing"
         )
+        lines.append(f"               {row.get('detail')}")
     lines.append(
         "  Nothing here is converted automatically: a disagreement is reported "
         "for a human, never resolved by changing the record that made it."
@@ -6066,11 +6073,27 @@ def _cmd_shipped_report(args: argparse.Namespace) -> int:
     an exit code that treated it as proof would be a licence to undo work that
     landed. Exit 1 means either something could not be judged (the search
     failed, git could not resolve a commit, a shipped-elsewhere record could not
-    be checked) or the registry PROVABLY disagrees with the base — a recorded
-    carrying commit that is not an ancestor, a shipped-elsewhere row naming no
-    commits, or a completed task whose naming commits are all outside the base.
+    be checked, or a completed task's EXECUTION RECORD could not be) or the
+    registry PROVABLY disagrees with the base — a recorded carrying commit that
+    is not an ancestor, a shipped-elsewhere row naming no commits, or a completed
+    task whose naming commits, or whose record's candidate, are outside the base.
     "I could not look" and "I looked, and it does not hold" are both reasons to
     stop; only the second is a claim about the code.
+
+    THE RECORD HALF OF "COULD NOT JUDGE" IS COUNTED HERE TOO, and it is the one
+    the counts cannot see. Since witness-01 (2026-08-27) a completed task no
+    subject names is decided by its execution record, so a row whose record is
+    torn, whose archive cannot be ordered, or whose candidate git will not
+    resolve leaves `rows` entirely and lands in `disagreements["unverified"]`.
+    `counts` is the SEARCH's tally and holds no such row, and `proven` counts
+    findings rather than unchecked rows, so before that list was read here an
+    unreadable record printed as UNCHECKED and exited 0 — an alarm switching
+    itself off exactly when it could not see, which is the fail-open every other
+    branch of this expression exists to refuse. The whole list is read rather
+    than the record-only part of it: its other two members (a shipped-elsewhere
+    row that could not be checked, a completed row whose SEARCH could not be
+    judged) already force 1 through the terms beside it, so reading all three
+    keeps one rule where three would have to agree.
     """
     from . import dashboard
 
@@ -6113,6 +6136,10 @@ def _cmd_shipped_report(args: argparse.Namespace) -> int:
         if unjudged
         or not report.get("searched")
         or disagreements.get("proven")
+        # Every row nothing could judge, including the ones only the RECORD
+        # left unjudged — see the docstring: `unjudged` above is the search's
+        # tally and never holds them.
+        or disagreements.get("unverified")
         or unsettled_records
         else 0
     )
