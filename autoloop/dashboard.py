@@ -247,6 +247,15 @@ _SUBJECT_CACHE: dict = {}
 #: to search" indistinguishable from "no caller has decided anything yet".
 _UNREAD = object()
 
+#: "the caller did not hand me a resolved state directory, resolve one yourself"
+#: — the default of `shipped_report` / `disagreement_report`'s `executions_dir`.
+#: A sentinel rather than `None` for the same reason as `_UNREAD` above: `None`
+#: is a REAL value here, meaning "there is no state directory to read execution
+#: records from" (`_under(None, ...)`), and collapsing the two would make a
+#: caller that resolved the directory and found none indistinguishable from one
+#: that never asked.
+_UNGIVEN = object()
+
 
 def _run_status(args, cwd=None, timeout=8):
     """`(returncode, stdout)`. -1 on a launch failure or timeout.
@@ -2287,7 +2296,13 @@ def resolve_commit(repo: Path, rev: str) -> str:
     return (out or "").strip()
 
 
-def shipped_report(repo: Path, roadmap: list[dict], head: str, branch: str = "") -> dict:
+def shipped_report(
+    repo: Path,
+    roadmap: list[dict],
+    head: str,
+    branch: str = "",
+    executions_dir=_UNGIVEN,
+) -> dict:
     """The read-only payload: every COMPLETED task, the commits whose subjects
     name it, and whether any of them is in the base.
 
@@ -2311,10 +2326,24 @@ def shipped_report(repo: Path, roadmap: list[dict], head: str, branch: str = "")
     are the same claim — "the registry must not claim what the code cannot show,
     in either direction" — and a caller able to render one without the other
     would rebuild exactly the blind spot this report exists to close.
+
+    Since witness-01 (2026-08-27) a completed task no commit subject names is
+    decided by its EXECUTION RECORD's ancestry before it is called a
+    disagreement — see `registry_disagreements`, which states what that proves
+    and what it does not. `executions_dir` is where those records are read from:
+    a caller that has already resolved the state directory hands it over (the
+    live page has, once, for every panel), and anything else leaves it unset and
+    this resolves it through `_state_dir_or_note` — the LOOP's own rule, so the
+    report reads the directory the loop writes. `None` is a real value meaning
+    "there is none", which is why the default is a sentinel; an unresolvable
+    directory is reported in the row's own detail rather than silently reading
+    as "nothing names a candidate".
     """
     completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
     recorded = [t for t in roadmap if (t.get("status") or "") == "shipped_elsewhere"]
     commits = commit_subjects(repo)
+    if executions_dir is _UNGIVEN:
+        executions_dir = _under(_state_dir_or_note(repo)[0], "executions")
 
     def ancestor(sha: str) -> str:
         return is_ancestor(repo, sha, head)
@@ -2325,6 +2354,22 @@ def shipped_report(repo: Path, roadmap: list[dict], head: str, branch: str = "")
     # which is the case the completed half reports as `unverified` for every row
     # at once.
     elsewhere = shipped_elsewhere_states(recorded, ancestor)
+    disagreements = registry_disagreements(
+        rows, elsewhere, _record_witness(executions_dir, ancestor)
+    )
+    # The row a RECORD cleared says so in its own detail, because that row is
+    # the only one whose record evidence would otherwise appear nowhere an
+    # operator reads: it prints as NO MENTION (the search really did find
+    # nothing, and that state is not rewritten here — the counts and the exit
+    # code are the search's answer, unchanged), and it is absent from the
+    # disagreements below precisely because the record settled it. Printing the
+    # absence and nothing else is how "shipped, under a subject that never named
+    # it" and "we stopped looking" would read identically. `state` is untouched:
+    # this is the SEARCH's row, annotated with the other evidence source.
+    cleared = {row["id"]: row["detail"] for row in disagreements["witnessed"]}
+    for row in rows:
+        if row["id"] in cleared:
+            row["detail"] = cleared[row["id"]]
     return {
         "base_branch": branch or "HEAD",
         "base_head": head[:12],
@@ -2339,7 +2384,7 @@ def shipped_report(repo: Path, roadmap: list[dict], head: str, branch: str = "")
         # ancestry check and returned in the same payload so no caller can read
         # one without the other. See `registry_disagreements`.
         "elsewhere": elsewhere,
-        "disagreements": registry_disagreements(rows, elsewhere),
+        "disagreements": disagreements,
     }
 
 
@@ -2386,15 +2431,83 @@ SHIPPED_ELSEWHERE_STATES = ("verified", "invalidated", "unverified", "unsupporte
 #: The kinds of disagreement between what the registry says and what the base
 #: shows. `proven` on each row is what separates them: the first three are
 #: definite (git said no, or there is nothing to ask), the last is NOT — a task
-#: id that appears in no commit subject may have shipped under a subject that
-#: never named it, and reporting that as proof of absence is the exact
-#: fail-open `shipped_states` refuses to make.
+#: no commit subject names AND no execution record names a candidate for may
+#: still have shipped under a subject that never mentioned it, and reporting
+#: that as proof of absence is the exact fail-open `shipped_states` refuses to
+#: make. Since witness-01 the record is consulted first, so the unproven kind is
+#: reached far less often and says something narrower when it is.
 DISAGREEMENT_KINDS = (
     "shipped_evidence_absent",
     "shipped_evidence_missing",
     "completed_not_in_base",
     "completed_unwitnessed",
 )
+
+#: The four answers `merge_sweep.execution_record_ancestry` can give about one
+#: task's execution record, mirrored here so this section stays readable without
+#: importing the sweep at module load (that module pulls in the git gateway, the
+#: policy engine and the execution store; this page must not).
+#:
+#: MIRRORED, NOT REDEFINED. `test_record_witness.py` pins these against
+#: `merge_sweep.RECORD_VERDICTS` value for value, so a rename there fails a test
+#: here instead of silently sending every completed row down the `else` branch —
+#: which would be the alarm switching itself off, the exact failure this whole
+#: section is written against.
+RECORD_IN_BASE = "in-base"
+RECORD_NOT_IN_BASE = "not-in-base"
+RECORD_UNVERIFIED = "unverified"
+RECORD_ABSENT = "absent"
+
+
+def _record_witness(executions_dir, ancestor):
+    """`task_id -> merge_sweep.RecordAncestry` for this base head.
+
+    The loop's OWN reader, called rather than re-implemented: which record
+    answers (live, else the newest archived generation), how generations are
+    ordered, whose copies are dropped and what an unorderable archive does are
+    all `merge_sweep.execution_record_ancestry`, and a second copy of those
+    rules here is a worse outcome than the bug this closes. See that function
+    and `RecordAncestry` — in particular the limit on what an `in-base` verdict
+    proves.
+
+    Imported lazily, like `lock` / `inbox` / `TaskStore`: `merge_sweep` reaches
+    the git gateway, the policy engine and the execution store, and none of that
+    belongs in this page's import graph.
+
+    With no state directory to read (`executions_dir is None`) it still returns
+    a callable, and that callable answers `absent` WITH THE REASON rather than
+    the caller skipping the consultation. Both roads lead to
+    `completed_unwitnessed`, and the difference is whether the operator is told
+    that no record was read at all — a row that says "nothing names a candidate"
+    when nothing was even looked at is the fail-open this section exists to
+    refuse.
+    """
+    from .merge_sweep import RecordAncestry, execution_record_ancestry
+
+    if executions_dir is None:
+        absent = RecordAncestry(
+            RECORD_ABSENT,
+            "no execution record could be consulted — this checkout's state "
+            "directory could not be resolved, so nothing on disk was asked",
+        )
+        return lambda _task_id: absent
+
+    def witness(task_id: str):
+        try:
+            return execution_record_ancestry(executions_dir, task_id, ancestor)
+        except Exception as exc:  # noqa: BLE001 — a page that 500s says nothing
+            # `execution_record_ancestry` is written not to raise, and this is
+            # the belt: the live page polls this every 2 seconds and a tracker
+            # that dies over one half-written record tells the operator less
+            # than nothing (`_executions` makes the same bargain). UNVERIFIED
+            # rather than absent, so a crash can never clear a row or invent a
+            # disagreement — it can only say "could not look".
+            return RecordAncestry(
+                RECORD_UNVERIFIED,
+                f"its execution record could not be consulted ({exc})",
+            )
+
+    return witness
 
 
 def shipped_elsewhere_states(recorded: list[dict], ancestor) -> list[dict]:
@@ -2478,36 +2591,71 @@ def shipped_elsewhere_states(recorded: list[dict], ancestor) -> list[dict]:
     return rows
 
 
-def registry_disagreements(shipped_rows: list[dict], elsewhere_rows: list[dict]) -> dict:
+def registry_disagreements(
+    shipped_rows: list[dict], elsewhere_rows: list[dict], record=None
+) -> dict:
     """Where the registry and the base disagree, in both directions, plus what
     could not be judged.
 
     Pure: it re-reads rows the two resolvers above already produced, so there is
     exactly one ancestry implementation on the page and this cannot reach a
-    different verdict from the panel beside it.
+    different verdict from the panel beside it. `record(task_id) ->
+    merge_sweep.RecordAncestry` is injected for the same reason `ancestor` is —
+    the file reading lives in `_record_witness`, and every classification here
+    stays decidable without a repository or a state directory.
 
-    Returns `{"rows": [...], "unverified": [...], "counts": {...}}`. The
-    `unverified` half travels IN the same dict rather than being computed
-    separately, so a caller cannot render the disagreements and quietly drop
-    "and there are four more I could not look at" — the collapse this whole
-    section is written against.
+    Returns `{"rows": [...], "unverified": [...], "witnessed": [...],
+    "counts": {...}}`. The `unverified` half travels IN the same dict rather
+    than being computed separately, so a caller cannot render the disagreements
+    and quietly drop "and there are four more I could not look at" — the
+    collapse this whole section is written against. `witnessed` is the same
+    discipline applied to the other end: a completed task that LEAVES this list
+    because its execution record proved ancestry is listed there rather than
+    vanishing, so "no disagreement" and "resolved by the record" stay
+    distinguishable.
+
+    **A COMPLETED TASK IS JUDGED BY ANCESTRY, NOT BY WHETHER A COMMIT SUBJECT
+    NAMES IT** (witness-01, 2026-08-27). Subject matching is corroboration; the
+    deciding test for a row no subject names is the task's own execution record,
+    live if there is one and otherwise the newest archived generation, asked of
+    git through the loop's own reader. Measured 2026-08-25: of seven
+    `completed_unwitnessed` rows, dash-02 and scope-02 had shipped — their
+    subjects simply never named them — and nothing in the report could tell the
+    operator which five of the seven were real.
+
+    What that verdict PROVES is bounded, and the bound is stated rather than
+    papered over: an ancestral candidate means the branch is ACCOUNTED FOR in
+    the base, not that this task's content is present. A `git merge -s ours`
+    supersede makes a candidate a genuine ancestor while taking none of its
+    content (bind-01, dash-17, split-01 on 2026-08-25 — the work really is in
+    the base for the first two, and was discarded for the third). It is still
+    strictly better than subject matching, which calls those same three shipped
+    on the strength of a commit whose own body says it took no content. See
+    `merge_sweep.RecordAncestry`.
 
     `proven` distinguishes the two strengths of finding, and the report must
     keep them apart:
 
       * `shipped_evidence_absent`, `shipped_evidence_missing` and
         `completed_not_in_base` are DEFINITE. Git was asked and said no, or
-        there was nothing to ask.
-      * `completed_unwitnessed` is NOT. No commit subject names the id, and
-        absence of a mention is absence of evidence — the work may have shipped
-        under a subject that never named the task. It is still a disagreement
-        worth a human's eye (a completed task the base cannot witness at all is
-        how bind-01, split-01 and dash-17 read), but it is not proof, and a
-        report that presented it as proof would be a licence to undo work that
-        did land.
+        there was nothing to ask. A completed task whose record names a sha the
+        base does not contain now reaches this kind, which is what it has always
+        meant.
+      * `completed_unwitnessed` is NOT, and since witness-01 it says something
+        narrower and truer: no commit subject names the id AND no record, live
+        or archived, names any candidate at all. Absence of a mention is still
+        absence of evidence — the work may have shipped under a subject that
+        never named the task — so it is a disagreement worth a human's eye and
+        not proof, and a report that presented it as proof would be a licence to
+        undo work that did land.
+
+    A record that exists and cannot be judged — torn, unorderable, or naming a
+    sha git will not resolve — is neither: it joins `unverified`, because "I
+    could not look" must never render as either verdict.
     """
     rows: list[dict] = []
     unverified: list[dict] = []
+    witnessed: list[dict] = []
     for row in elsewhere_rows:
         base = {"id": row["id"], "title": row["title"], "detail": row["detail"]}
         if row["state"] == "invalidated":
@@ -2521,7 +2669,23 @@ def registry_disagreements(shipped_rows: list[dict], elsewhere_rows: list[dict])
         if row["state"] == "not-in-base":
             rows.append({**base, "kind": "completed_not_in_base", "proven": True})
         elif row["state"] == "unknown":
-            rows.append({**base, "kind": "completed_unwitnessed", "proven": False})
+            # No subject names it. The record is the deciding test; with no
+            # reader injected there is nothing to ask, and the row reads exactly
+            # as it did before witness-01.
+            answer = record(row["id"]) if record is not None else None
+            verdict = answer.verdict if answer is not None else RECORD_ABSENT
+            detail = base["detail"]
+            if answer is not None and answer.detail:
+                detail = f"{detail}; {answer.detail}"
+            found = {**base, "detail": detail}
+            if verdict == RECORD_IN_BASE:
+                witnessed.append(found)
+            elif verdict == RECORD_NOT_IN_BASE:
+                rows.append({**found, "kind": "completed_not_in_base", "proven": True})
+            elif verdict == RECORD_UNVERIFIED:
+                unverified.append({**found, "record": "completed"})
+            else:
+                rows.append({**found, "kind": "completed_unwitnessed", "proven": False})
         elif row["state"] == "unverified":
             unverified.append({**base, "record": "completed"})
     # Proven first, then by kind order, then by id: the definite findings are
@@ -2532,6 +2696,7 @@ def registry_disagreements(shipped_rows: list[dict], elsewhere_rows: list[dict])
     return {
         "rows": rows,
         "unverified": sorted(unverified, key=lambda r: r["id"]),
+        "witnessed": sorted(witnessed, key=lambda r: r["id"]),
         "counts": {
             kind: sum(1 for r in rows if r["kind"] == kind) for kind in DISAGREEMENT_KINDS
         },
@@ -2540,7 +2705,8 @@ def registry_disagreements(shipped_rows: list[dict], elsewhere_rows: list[dict])
 
 
 def disagreement_report(
-    repo: Path, roadmap: list[dict], head: str, commits=_UNREAD
+    repo: Path, roadmap: list[dict], head: str, commits=_UNREAD,
+    executions_dir=_UNGIVEN,
 ) -> dict:
     """`registry_disagreements` for the live page, on the CACHED commit search.
 
@@ -2577,20 +2743,33 @@ def disagreement_report(
     `unverified` for one shared reason, which the page must be able to say once
     rather than per row.
 
+    `executions_dir` is the same hand-over `shipped_report` takes and for a
+    sharper version of the same reason: `collect` has ALREADY resolved the state
+    directory once for the whole page (port-06), so passing it here is what
+    stops this panel answering about a different directory from the two above
+    it. Left unset it resolves the loop's own answer itself, exactly as the
+    report does.
+
     Read-only, like everything in this section. It runs no git that writes and
-    it touches neither the registry nor an execution record.
+    it READS an execution record — the live one, or the newest archived copy —
+    without touching it: `merge_sweep.execution_record_ancestry` opens those
+    files for reading and nothing on this path writes, moves or retires one.
     """
     completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
     recorded = [t for t in roadmap if (t.get("status") or "") == "shipped_elsewhere"]
     if commits is _UNREAD:
         commits = _cached_commit_subjects(repo)
+    if executions_dir is _UNGIVEN:
+        executions_dir = _under(_state_dir_or_note(repo)[0], "executions")
 
     def ancestor(sha: str) -> str:
         return is_ancestor(repo, sha, head)
 
     elsewhere = shipped_elsewhere_states(recorded, ancestor)
     report = registry_disagreements(
-        shipped_states(completed, commits, ancestor), elsewhere
+        shipped_states(completed, commits, ancestor),
+        elsewhere,
+        _record_witness(executions_dir, ancestor),
     )
     report["elsewhere"] = elsewhere
     report["searched"] = commits is not None
@@ -3992,7 +4171,13 @@ def collect(repo: Path) -> dict:
         # completed task the base cannot show. Re-derived on every poll rather
         # than stored, so a record that was true when it was written and is not
         # now stops reading as done the moment the base moves.
-        "disagreements": disagreement_report(repo, roadmap, head, subjects),
+        # `_under(sd, ...)` rather than a second resolution: the execution
+        # records this reads are the ones `executions` above was globbed from,
+        # and two resolutions of one directory are how a page starts disagreeing
+        # with itself (port-06).
+        "disagreements": disagreement_report(
+            repo, roadmap, head, subjects, _under(sd, "executions")
+        ),
         "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": remote_refs},
         "served_at": time.strftime("%H:%M:%S"),
         # `stale` means THIS FILE on disk has changed since this process
