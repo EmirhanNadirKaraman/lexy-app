@@ -143,6 +143,14 @@ def test_scanning_leaves_the_repo_byte_identical(repo):
 # --- the endpoint proposes; it never authorizes -------------------------------
 
 
+#: Loopback, and it must stay loopback. `urlopen`'s default opener is built from
+#: `http_proxy`/`HTTP_PROXY`, so with a proxy configured — and a `no_proxy` that
+#: does not spell out `127.0.0.1` — these requests would leave the machine and
+#: reach a host this test does not own. An explicit empty `ProxyHandler` is the
+#: stdlib's way of saying "no proxy, ever".
+_LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 @contextlib.contextmanager
 def serving(repo_path, inbox_dir, monkeypatch):
     import autoloop.dashboard as dash
@@ -168,7 +176,7 @@ def post(base, path, payload, headers=None):
                  **({"X-Autoloop": "1"} if headers is None else headers)},
         method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _LOOPBACK.open(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
