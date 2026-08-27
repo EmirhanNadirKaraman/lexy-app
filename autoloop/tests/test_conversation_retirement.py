@@ -45,6 +45,8 @@ the operator did on the day.
 
 import pytest
 
+from autoloop.browser.chatgpt import BrowserChatGPT
+from autoloop.browser.selectors import ChatGPTSelectors
 from autoloop.errors import (
     ConversationUnusableError,
     RateLimitedError,
@@ -53,15 +55,6 @@ from autoloop.errors import (
 )
 from autoloop.state import LoopState, Phase, StateStore
 
-from test_chatgpt_client import (  # noqa: E402 - see conftest sys.path
-    RID,
-    SEL,
-    FakeClock,
-    diagnostics,
-    make_client,
-    read_meta,
-)
-from test_chatgpt_client import CONV_URL as CLIENT_CONV_URL  # noqa: E402
 from test_transport_recovery import (  # noqa: E402 - see conftest sys.path
     CONV_URL,
     PROJECT_URL,
@@ -78,6 +71,75 @@ from test_transport_recovery import (  # noqa: E402 - see conftest sys.path
 # test below would route through `_handle_transport_failure` and the
 # `browser_error`/`browser_restarted` assertions would pass vacuously.
 from test_transport_recovery import _browser_backed_provider  # noqa: E402,F401
+
+# ---- client helpers, relocated here by brw-18 (2026-08-27) ------------------
+#
+# These six names used to be imported from `test_chatgpt_client.py`, which
+# tested the browser transport itself and was deleted with the rest of that
+# suite. Only what this module actually uses came across, verbatim except for
+# ONE rename: the client's conversation URL is spelled `CLIENT_CONV_URL` here,
+# because `test_transport_recovery` exports a DIFFERENT conversation URL under
+# the bare name `CONV_URL` and section 4 asserts the orchestrator's state
+# against that one. `make_client` builds its client on `CLIENT_CONV_URL` for
+# the same reason: it must match the page the fake session serves.
+#
+# The `BrowserChatGPT` import above is deliberate and is NOT residue of the
+# deleted suite: sections 1, 1b, 2 and 3 run the REAL `await_response`
+# classification over a scripted page, which is the whole reason this file
+# proves anything a stand-in raising the right error by fiat would not.
+
+SEL = ChatGPTSelectors()
+CLIENT_CONV_URL = "https://chatgpt.com/g/g-p-project123/c/conv456"
+RID = "alr-abcd1234-0001"
+
+
+class FakeClock:
+    """Virtual time: sleep() advances it and fires scripted events by call count."""
+
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = 0
+        self.events: dict[int, object] = {}
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
+        self.sleeps += 1
+        event = self.events.pop(self.sleeps, None)
+        if event:
+            event()
+
+
+def make_client(session, clock, tmp_path, **overrides) -> BrowserChatGPT:
+    kwargs = dict(
+        response_timeout=30.0,
+        response_start_timeout=20.0,
+        submit_timeout=10.0,
+        composer_timeout=10.0,
+        input_sync_timeout=10.0,
+        send_ready_timeout=10.0,
+        reconcile_timeout=10.0,
+        poll_interval=1.0,
+        stability_seconds=2.0,
+        diagnostics_dir=tmp_path / "diag",
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    kwargs.update(overrides)
+    return BrowserChatGPT(session, CLIENT_CONV_URL, **kwargs)
+
+
+def diagnostics(tmp_path):
+    diag = tmp_path / "diag"
+    return sorted(diag.iterdir()) if diag.exists() else []
+
+
+def read_meta(folder):
+    import json
+
+    return json.loads((folder / "meta.json").read_text())
 
 
 def _filler(count, marker="earlier"):
