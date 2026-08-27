@@ -206,6 +206,27 @@ class GitCommandError(GitError):
     """A whitelisted git command ran but exited non-zero."""
 
 
+class DiffTooLargeError(GitCommandError):
+    """A diff render was REFUSED for exceeding `GitGateway.RANGE_DIFF_MAX_BYTES`
+    — the one `GitCommandError` that says nothing is wrong with the repository.
+
+    A subclass rather than a sibling, deliberately: every existing
+    `except GitCommandError` (`changeset_review`, `_finish_postcommit`'s park,
+    the CLI's rebuild paths) keeps catching it unchanged, so adding this widens
+    nothing on its own. What it buys is the ability to catch the cap refusal
+    SPECIFICALLY, ahead of the broad clause, and route it somewhere a torn repo
+    must never go — see `orchestrator._finish_postcommit`, where a cap refusal
+    asks the reviewer for a split plan while every other `GitCommandError` still
+    parks. Clause ORDER is therefore load-bearing wherever both are caught: the
+    narrow one first, or it is never reached.
+
+    Raised by both `GitGateway.range_diff` and `GitGateway.range_diff_stat`, so
+    "the stat busted the cap too" is the same type and is handled by the same
+    reading: a stat that cannot be rendered is not a smaller artifact to fall
+    back to, it is nothing to show.
+    """
+
+
 class GitOperationDenied(GitError):
     """The policy layer refused to run a git command (defense in depth)."""
 

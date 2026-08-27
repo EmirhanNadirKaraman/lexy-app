@@ -8592,6 +8592,63 @@ saying beside the subsection above: it was found by an operator writing the same
 workaround five times in one day, which is the slow way that subsection already
 documents. The tally stays a measurement and is never acted on.
 
+### 9i. The loop asks for a split when it cannot render the patch (split-05, 2026-08-27)
+
+**The verb above could not be issued by the failure it was built for.** `split`
+requires a reviewer that has SEEN a candidate; the oversized-diff park happens
+strictly BEFORE any packet reaches one. Three occurrences in under a week, all on
+the same code — port-01 at 414,596 bytes, brw-14 at 416,193, brw-18 (2026-08-27)
+at 683,693 — each cost a full executor round (brw-18's was 74 minutes) plus an
+attempt and ended in `needs_user` on `review_packet_build_failed`. brw-18 was
+split by hand from outside the loop; that operator workaround is what this
+removes.
+
+**What happens instead.** When — and only when — `build_review_packet_with_diff`
+fails because of the SIZE CAP, an eligible candidate is presented as a
+**stat-only packet**: every section the review packet has (commits, changed paths
+with modes and object types, any out-of-scope finding, the whole diff stat, the
+executor's report) except the patch, under a banner saying twice that no patch
+was rendered and that nothing in it can be approved. `range_diff_stat` carries
+the same 400,000-byte cap, but a stat is one line per file — ~2 KB for ~40 files
+— so it renders precisely where the patch does not. Nothing is shortened to fit:
+a stat that busts the cap parks, exactly like a patch that does.
+
+**The reply is constrained to two outcomes**, and the request says so:
+
+| Reply | What happens |
+|---|---|
+| `split` naming that task | Routed to `_dispatch_split` → `_apply_split` — every existing bound applies unchanged (≥2 successors, no published candidate, no outstanding verdict, no stranding dependency). |
+| anything else | Parks on `review_packet_build_failed`, the same code as before, with the reviewer's own decision and reason recorded. |
+
+The park is a CORRECT outcome, not a fallback: some oversized changes really are
+one claim, and cutting one of those up is worse than parking it. What split-05
+removed is the case where the park was the ONLY outcome.
+
+**Five things hold, and each has a check.**
+
+| Property | How |
+|---|---|
+| **Only the size failure routes here** | `errors.DiffTooLargeError`, a `GitCommandError` SUBCLASS raised by both `range_diff` and `range_diff_stat`. Every existing broad handler still catches it, so nothing widened; the narrow clause sits ABOVE the broad one in `_finish_postcommit`, which is why that order is load-bearing. A torn repo, an unresolvable sha or any other git failure parks on the same code with the same message as it always did. |
+| **No review bypass** | TWO independent gates, both reading the durable ledger entry the ask writes (`REASON_SENT_FOR_SPLIT_REVIEW`), never the packet's text — a candidate that edits `packet.py` carries that module's banner inside its own diff, so a substring gate would refuse a legitimate full packet. `_current_pending_postcommit` binds NOTHING while the ask is outstanding, so no approval has a candidate to resolve to; and `_dispatch` refuses every non-`split` reply before the push binding is even looked at. |
+| **"This is one claim" stays available** | `_park_stat_only_split_declined`, on the same `review_packet_build_failed` code, quoting the reviewer's reason. It CLEARS `state.task_execution`, which is what arms the gate — without that, the first directive after an operator answered the blocker would re-park forever. |
+| **Depth is one, and a successor parks** | `MAX_SPLIT_DEPTH` is read FAIL-CLOSED (a value that is not a non-negative int refuses) before anything is asked. A successor of an earlier split has no second split available, so it parks with a note saying why no split was offered — asking anyway would have built a loop with no park in it. |
+| **The discarded work is stated** | A split throws away a commit that PASSED validation and post-commit review. `_reviewer_split_report` says so in as many words, and the `task_reviewer_split` event carries `discarded_candidate_note` beside the sha, because a field name is not a statement. |
+
+**Attempt budget.** The ask is stamped `ATTEMPT_TASK`, the same one attempt
+today's park charges — asking is never cheaper than parking, so a task producing
+unshowable candidates still walks into `MAX_TASK_ATTEMPTS` and from there into
+the ceiling classification (§9). It consumes NO review round: `review_round`
+counts reviews of a diff, and no diff was shown. A split's successors inherit the
+parent's spend at `split_depth + 1`, so the one level is spent and a successor's
+own oversized candidate parks on the depth check rather than asking again.
+
+**It is also refused before asking** when there is nothing to act on: an audit
+unit (no registry row to retire), a loop with no execution store or
+worker-repository manager (a split of it could only ever be half-applied), a task
+absent from the registry, and a stat that cannot be built. Each parks with a
+`No split was offered: …` sentence appended to the unchanged park, so an operator
+is told why rather than left to infer it.
+
 ---
 
 ## 10. Recovery procedures

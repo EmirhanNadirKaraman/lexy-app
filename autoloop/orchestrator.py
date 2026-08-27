@@ -377,6 +377,7 @@ from .errors import (
     ContractError,
     ConversationSearchInconclusive,
     ConversationUnusableError,
+    DiffTooLargeError,
     ExecutorError,
     EnvironmentDriftError,
     GitCommandError,
@@ -413,6 +414,7 @@ from .packet import (
     DIFF_INCLUDE_MAX_CHARS,
     attached_payload,
     build_review_packet_with_diff,
+    build_stat_only_review_packet,
     omission_payload,
     payload_carries_diff,
     plan_chunked_delivery,
@@ -708,6 +710,31 @@ CEILING_SPLIT_RETIREMENT_REASON = "split-at-attempt-ceiling"
 #: the reviewer judged undeliverable in a single piece. The mechanism they share
 #: is the same; the evidence they were reached on is not.
 REVIEWER_SPLIT_RETIREMENT_REASON = "split-by-reviewer"
+
+#: The `attempt_ledger` outcome slug a round ends with when its candidate's
+#: PATCH busted the render cap and the loop asked the reviewer for a split plan
+#: against a stat-only packet instead of parking (split-05).
+#:
+#: THE MARKER, and it is durable on purpose. The ask and the reply are two
+#: dispatches with a whole conversation round trip between them, and by the time
+#: the reply lands `state.outbox` has moved into the request, `pending_request`
+#: is gone and `LastResponse` carries no payload — so nothing in `LoopState`
+#: still says which question was asked. The execution record does: this entry is
+#: written by `_finalise_attempt`, which persists it, and it is what the two
+#: gates below read — `_current_pending_postcommit` (bind nothing, so no
+#: approval can ever resolve to a candidate nobody was shown) and `_dispatch`
+#: (only `split` for this task proceeds; everything else parks).
+#:
+#: Deliberately NOT a search for text in the packet. A candidate that edits
+#: `packet.py` carries that module's banner constant inside its own diff, so a
+#: substring gate would answer "stat-only" for an ordinary full packet and
+#: refuse a legitimate approval. The ledger records what the loop DID.
+#:
+#: It costs exactly one attempt — the same one today's park charges, settled the
+#: same way through `ATTEMPT_TASK` — so asking is never cheaper than parking and
+#: a task that keeps producing unshowable candidates still walks into
+#: `MAX_TASK_ATTEMPTS`.
+REASON_SENT_FOR_SPLIT_REVIEW = "sent_for_split_review"
 
 
 @dataclass(frozen=True)
@@ -3718,6 +3745,19 @@ class Orchestrator:
         execution = self._execution_store.load(task_id)
         if execution is None or execution.candidate_sha != candidate_sha:
             return None
+        if self._stat_only_split_review_pending(execution):
+            # THE REVIEW-BYPASS GATE (split-05). This candidate's patch was over
+            # the render cap and the loop asked for a split against a STAT-ONLY
+            # packet, which carries the four identifiers below for the same
+            # reason every packet does — so without this the payload would bind,
+            # and an approval answering it would publish a change the reviewer
+            # was never shown. A stat is a complete artifact, but it is not the
+            # diff, and nothing that binds an approval may be built from it.
+            #
+            # Read from the RECORD, never from the packet's text: a candidate
+            # that edits `packet.py` carries that module's banner inside its own
+            # patch, so a substring gate would refuse a legitimate full packet.
+            return None
         worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
         candidate_tree_sha = worktree_git.tree_of(candidate_sha)
         return PostcommitBinding(
@@ -4578,6 +4618,25 @@ class Orchestrator:
     def _dispatch(self, directive: Directive) -> None:
         state = self.state
         decision = directive.decision
+        # THE STAT-ONLY ASK IS ANSWERED HERE, and it is answered before anything
+        # else can act on this reply (split-05). The loop showed the reviewer a
+        # stat and no patch, so exactly one answer may proceed — `split`, naming
+        # the task that was asked about — and every other reply parks on the
+        # `review_packet_build_failed` code this candidate would have parked on
+        # anyway, with the reviewer's own words recorded.
+        #
+        # FIRST, above the `push` binding resolution below, because that is the
+        # answer this must never let through: an approval of a change nobody was
+        # shown is the review bypass the render cap exists to prevent. It is not
+        # the only guard on that — `_current_pending_postcommit` binds nothing
+        # while the ask is outstanding, so the approval has no candidate to
+        # resolve to either — but it is the one that says so out loud.
+        pending_split_ask = self._stat_only_split_review_task()
+        if pending_split_ask and not (
+            decision is Decision.SPLIT and directive.task_id == pending_split_ask
+        ):
+            self._park_stat_only_split_declined(directive, pending_split_ask)
+            return
         # Resolved ONCE, here, so the branch condition and the argument passed
         # to `_dispatch_task_push` cannot disagree about which candidate this
         # approval publishes. `None` for every decision that is not a `push`.
@@ -9052,6 +9111,17 @@ class Orchestrator:
                 "child_attempt_cap": self._attempt_cap_for(children[0]),
                 "parent_attempt_count": execution.attempt_count,
                 "discarded_candidate": execution.candidate_sha,
+                # A key is not a statement, and this one is easy to read as
+                # "here is the sha we filed away". Said in words instead: a
+                # committed candidate is being thrown away to be redone in
+                # pieces, and an operator reading `split` in the transcript must
+                # not have to infer that from a field name.
+                "discarded_candidate_note": (
+                    "this committed candidate is DISCARDED — never published, "
+                    "archived and quarantined, and the successors redo the work"
+                    if execution.candidate_sha
+                    else ""
+                ),
                 "label": retirement.label if retirement is not None else "",
                 "archived_record": (
                     str(retirement.record_path)
@@ -9268,7 +9338,17 @@ class Orchestrator:
             f"SPLIT APPLIED — task {parent.id} is retired into "
             f"{', '.join(child_ids)}.\n\n"
             f"Your reason: {directive.reason}\n\n"
-            f"Its candidate {execution.candidate_sha[:12] or '(none committed)'} "
+            + (
+                "THE COMMITTED WORK IS DISCARDED. Candidate "
+                f"{execution.candidate_sha[:12]} passed validation and "
+                "post-commit review; it will never be published, and the "
+                "successors redo the work in pieces from the current base. That "
+                "is the trade a split makes and it is worth stating plainly: "
+                "what was thrown away was not wrong, it was unreviewable.\n\n"
+                if execution.candidate_sha
+                else ""
+            )
+            + f"Its candidate {execution.candidate_sha[:12] or '(none committed)'} "
             f"on {execution.task_branch} was NOT deleted: the execution record "
             "was archived to "
             f"{retirement.record_path if retirement and retirement.record_path else '(no record on disk)'} "
@@ -9875,29 +9955,36 @@ class Orchestrator:
                 detail="; ".join(failures),
             )
             return
-        # A packet that exceeds `range_diff`'s byte cap (or any other git
-        # failure while rendering it) parks here, not via the generic
-        # GitError/budget path: the commit already exists, nothing here can
-        # roll it back, and no amount of re-prompting ChatGPT changes that —
+        # A git failure while rendering the packet parks here, not via the
+        # generic GitError/budget path: the commit already exists, nothing here
+        # can roll it back, and no amount of re-prompting ChatGPT changes that —
         # the same "park and report, never undo" rule as every other refusal
         # in this method.
+        #
+        # ONE failure is different and is caught FIRST, which is why the clause
+        # order below is load-bearing (`DiffTooLargeError` IS a
+        # `GitCommandError`). "This patch is over the render cap" is the only
+        # one of these that says nothing is wrong with the repository: the
+        # candidate passed post-commit review and is undeliverable purely for
+        # its size, which is exactly what the reviewer's `split` verb exists to
+        # answer — and it could not be issued, because the verb needs a reviewer
+        # who has SEEN a candidate and this park happens before any packet
+        # reaches one. A torn repo, an unresolvable sha or any other genuine git
+        # failure must NEVER take that route: "this repository is damaged" is not
+        # "chop the task up", so every other `GitCommandError` parks below on the
+        # same code, with the same message, exactly as it always has.
         try:
             packet_text, packet_diff = build_review_packet_with_diff(
                 execution, worktree_git, task
             )
+        except DiffTooLargeError as exc:
+            blocked = self._ask_reviewer_to_split(execution, worktree_git, state, task, exc)
+            if blocked is None:
+                return  # the ask went out; the reply is judged by `_dispatch`
+            self._park_review_packet_build_failed(execution, task, exc, note=blocked)
+            return
         except GitCommandError as exc:
-            self._finalise_attempt(execution, ATTEMPT_TASK, "review_packet_build_failed")
-            self._to_needs_user(
-                f"task {task.id}: commit {execution.candidate_sha[:12]} on "
-                f"{execution.task_branch} (round {execution.review_round + 1}) "
-                "passed post-commit review, but the review packet could not be "
-                f"built — {exc}. The commit is NOT rolled back and NOT pushed; "
-                "nothing was sent to ChatGPT.",
-                kind="task_fatal",
-                code="review_packet_build_failed",
-                task_id=task.id,
-                detail=str(exc),
-            )
+            self._park_review_packet_build_failed(execution, task, exc)
             return
         # Only here — a packet exists and is about to become `outbox`. A packet
         # that could not be built consumed no review round either.
@@ -9925,6 +10012,291 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
+
+    def _park_review_packet_build_failed(
+        self, execution: TaskExecution, task: Task, exc: Exception, note: str = ""
+    ) -> None:
+        """THE park for a candidate that cannot be presented — the one code and
+        the one message every such failure has always used.
+
+        Extracted (split-05) so the size failure, when it cannot be handed to the
+        reviewer, ends up on exactly the same code path rather than on a copy of
+        it that could drift. `note` is appended and nothing else changes, so the
+        non-size case renders byte-for-byte what it rendered before: an operator's
+        greps, `cli._RESOLUTION_PRECONDITIONS` and the blocker store all key off
+        `review_packet_build_failed`, and a candidate refused for a torn repo is
+        refused for the same reason it always was.
+        """
+        self._finalise_attempt(execution, ATTEMPT_TASK, "review_packet_build_failed")
+        self._to_needs_user(
+            f"task {task.id}: commit {execution.candidate_sha[:12]} on "
+            f"{execution.task_branch} (round {execution.review_round + 1}) "
+            "passed post-commit review, but the review packet could not be "
+            f"built — {exc}. The commit is NOT rolled back and NOT pushed; "
+            "nothing was sent to ChatGPT." + (f"\n\n{note}" if note else ""),
+            kind="task_fatal",
+            code="review_packet_build_failed",
+            task_id=task.id,
+            detail=str(exc),
+        )
+
+    def _ask_reviewer_to_split(
+        self,
+        execution: TaskExecution,
+        worktree_git: GitGateway,
+        state: LoopState,
+        task: Task,
+        exc: DiffTooLargeError,
+    ) -> str | None:
+        """Ask the reviewer to split `task`, showing it a STAT-ONLY packet.
+
+        Returns `None` once the ask is queued — the caller is done. Returns a
+        NOTE (never empty) when this candidate may not be asked about, and the
+        caller then parks on the unchanged `review_packet_build_failed` code with
+        that note appended, so an operator is told why no split was offered
+        rather than left to infer it.
+
+        THE ORDER IS THE POINT, and every refusal here is "do not ask a question
+        nobody could act on":
+
+          * an AUDIT unit has no registry row to retire and no successors to be
+            retired into — refused by NAME, exactly as `_dispatch_split` refuses
+            it, because most audit units are not in the registry at all;
+          * a task with no execution store or worker-repository manager cannot
+            have its record archived or its worker quarantined, so a split of it
+            could only ever be half-applied;
+          * A SUCCESSOR OF AN EARLIER SPLIT MUST PARK. `MAX_SPLIT_DEPTH` is 1,
+            so there is no second split to ask for, and asking anyway would build
+            a loop with no park in it — strictly worse than the park it replaces.
+            This is the edge case the whole feature turns on;
+          * and the STAT ITSELF CAN FAIL. A stat of ~40 files is about 2 KB, but
+            tens of thousands of paths bust the same cap, and a torn repo fails
+            here as readily as it would have failed the patch. Caught BROADLY
+            (`GitError`, not the size subclass): whatever stopped the stat, there
+            is nothing to show, and the answer is the park.
+
+        Everything the reviewer's own `split` already checks — a published
+        candidate, an outstanding verdict, fewer than `MIN_CEILING_SPLIT_TASKS`
+        successors, a stranding dependency — is deliberately NOT re-checked here.
+        Those live in `_dispatch_split`/`_apply_split` and the reply routes
+        through them; a second copy is how two answers to one question start
+        disagreeing.
+        """
+        if task.id == AUDIT_TASK_ID or task.id.startswith("audit-"):
+            return (
+                "No split was offered: an audit unit is not a roadmap task — "
+                "there is no registry row to retire and nothing to retire it "
+                "into. Narrow the next audit with `scope` instead."
+            )
+        if self._execution_store is None or self._worker_repos is None:
+            return (
+                "No split was offered: this loop has no execution store and "
+                "worker-repository manager configured, so a split could only "
+                "ever be half-applied — the successors would exist while the "
+                "parent kept its record and its worker."
+            )
+        if not self._registry.has(task.id):
+            return (
+                f"No split was offered: '{task.id}' is not in the task registry, "
+                "so there is no row to retire and no successors to retire it into."
+            )
+        # FAIL-CLOSED, on the same reading `_dispatch_split` documents: a depth
+        # this cannot read must not be treated as 0, because 0 means "may be
+        # split" and that is the one-level bound switching itself off exactly
+        # where it does its work.
+        raw_depth = getattr(task, "split_depth", 0)
+        if isinstance(raw_depth, bool) or not isinstance(raw_depth, int) or raw_depth < 0:
+            return (
+                f"No split was offered: task '{task.id}' carries a split depth "
+                f"this loop cannot read ({raw_depth!r}), so whether it is already "
+                "a successor of an earlier split cannot be established. An "
+                "operator has to look at its row."
+            )
+        if raw_depth >= MAX_SPLIT_DEPTH:
+            return (
+                f"No split was offered: task '{task.id}' is ALREADY a successor "
+                f"of an earlier split, at split depth {raw_depth} (cap "
+                f"{MAX_SPLIT_DEPTH}), so it cannot be split again — one level is "
+                "the whole bound, and a mechanism that could subdivide forever "
+                "would defer the work rather than deliver it. A successor that "
+                "still cannot be shown in one piece is a specification problem: "
+                "rewrite it smaller, or retire it."
+            )
+        try:
+            packet_text = build_stat_only_review_packet(execution, worktree_git, task)
+        except GitError as stat_exc:
+            return (
+                "No split was offered: the stat-only packet could not be built "
+                f"either ({stat_exc}). A stat is normally orders of magnitude "
+                "smaller than the patch — one line per file — so either this "
+                "commit touches an extraordinary number of paths or the "
+                "repository cannot be read. Nothing was shortened to manufacture "
+                "something to show."
+            )
+        # Charged and STAMPED before anything is queued. Same one attempt the
+        # park charges (`ATTEMPT_TASK`) — asking is never cheaper than parking —
+        # and `_finalise_attempt` persists the record, which is what makes this
+        # entry readable by the two gates when the reply arrives a round trip
+        # later.
+        self._finalise_attempt(execution, ATTEMPT_TASK, REASON_SENT_FOR_SPLIT_REVIEW)
+        # `review_round` is NOT incremented, on the same rule as the park it
+        # replaces: it counts REVIEWS OF A DIFF, and no diff was shown. Charging
+        # a review round here would spend the revision budget of a candidate
+        # nobody reviewed.
+        state.task_execution = asdict(execution)
+        self._log(
+            "review_packet_too_large_split_requested",
+            data={
+                "task_id": task.id,
+                "candidate_sha": execution.candidate_sha,
+                "review_round": execution.review_round,
+                "attempt_count": execution.attempt_count,
+                "split_depth": self._nonneg_int(task.split_depth),
+                "min_successors": MIN_CEILING_SPLIT_TASKS,
+                "packet_chars": len(packet_text),
+                "error": str(exc),
+                # Said as a STATEMENT, not left to be inferred from the sha
+                # above: what is being offered up is a commit that passed
+                # validation and post-commit review.
+                "note": (
+                    "the candidate PASSED validation and post-commit review; a "
+                    "split discards it unpublished, to be redone in pieces"
+                ),
+            },
+        )
+        self._replace_outbox(
+            state,
+            TEMPLATES["postcommit_split_review"].render(
+                task_id=task.id,
+                task_title=task.title,
+                packet=packet_text,
+                min_successors=str(MIN_CEILING_SPLIT_TASKS),
+                inherited_attempts=str(self._nonneg_int(execution.attempt_count)),
+            ),
+        )
+        state.last_response = None
+        state.consecutive_failures = 0
+        state.phase = Phase.READY.value
+        self._execution_store.save(execution)
+        self._store.save(state)
+        return None
+
+    @staticmethod
+    def _stat_only_split_review_pending(execution: TaskExecution | None) -> bool:
+        """Is `execution`'s last recorded round the stat-only split ask?
+
+        The durable read behind both gates. Deliberately keyed on the ledger's
+        OUTCOME slug alone rather than also requiring the entry to be settled:
+        the two directions are not symmetric. Answering "no" when the ask really
+        is outstanding would let an approval bind to a candidate nobody was
+        shown; answering "yes" when it is not merely parks a round loudly. Only
+        `_ask_reviewer_to_split` ever writes this slug, so the permissive
+        direction is the safe one.
+        """
+        if execution is None or not execution.attempt_ledger:
+            return False
+        _ordinal, _budget, reason = split_attempt(execution.attempt_ledger[-1])
+        return attempt_outcome(reason) == REASON_SENT_FOR_SPLIT_REVIEW
+
+    def _stat_only_split_review_task(self) -> str:
+        """The task id this session is holding a stat-only split ask for, or "".
+
+        Read from `state.task_execution` (which names the candidate this session
+        most recently produced) and confirmed against that task's own execution
+        record on disk. BOTH, deliberately: the state pointer is what makes the
+        gate consumable — `_apply_split` and the reply-time park each clear it,
+        so an answered ask cannot re-fire and park an operator's resumed session
+        forever — and the record is what makes it TRUE, since a state file that
+        outlived its record must not be able to invent an outstanding ask.
+        """
+        task_exec = self.state.task_execution
+        if not isinstance(task_exec, dict):
+            return ""
+        task_id = str(task_exec.get("task_id") or "")
+        if not task_id or self._execution_store is None:
+            return ""
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateError, OSError) as exc:
+            # An unreadable record answers NOTHING, and this is the one place
+            # where saying "outstanding" would be the worse guess rather than
+            # the safe one: it would park every subsequent directive with a
+            # message about a candidate this loop cannot even read, including
+            # for a task that never asked anything.
+            #
+            # It is safe because THE APPROVAL GATE DOES NOT REST ON THIS READ.
+            # The stat-only request bound no approval when it was sent
+            # (`_current_pending_postcommit` refused it, and `sent_postcommits`
+            # therefore holds no entry naming it), and `_dispatch_task_push`
+            # re-reads the record itself and refuses `push_candidate_stale`
+            # unless it can confirm the binding's candidate is still current. So
+            # no reply reaching this branch can publish an unshown change; what
+            # is lost is only the routing, and it is lost LOUDLY.
+            self._log(
+                "stat_only_split_review_record_unreadable",
+                data={"task_id": task_id, "error": str(exc)},
+            )
+            return ""
+        return task_id if self._stat_only_split_review_pending(execution) else ""
+
+    def _park_stat_only_split_declined(self, directive: Directive, task_id: str) -> None:
+        """The reviewer was shown a stat-only packet and did not answer `split`
+        for the task it asked about, so the candidate parks — on the same
+        `review_packet_build_failed` code it would have parked on before this
+        mechanism existed.
+
+        THIS PARK IS A CORRECT OUTCOME, not a failure of the ask. Some oversized
+        changes really are one claim, and splitting one of those is worse than
+        parking it; what split-05 removed is the case where the park was the ONLY
+        outcome, not the park itself. The reviewer's own decision and reason are
+        recorded, because that judgement is the reason this ended here.
+
+        `state.task_execution` is CLEARED, and that is not tidying. The gate in
+        `_dispatch` is armed by exactly that pointer, so leaving it standing
+        would re-park the very next directive after an operator answered the
+        blocker and resumed — a park with no way out, which is the shape this
+        whole feature exists to remove. Clearing it is the same consumption
+        `_apply_split` and a completed push perform, and it disarms nothing else:
+        the candidate is on disk, its execution record is untouched and unbound,
+        and no approval can publish it because none was ever bound to it.
+        """
+        state = self.state
+        state.task_execution = None
+        state.last_response = None
+        self._log(
+            "stat_only_split_review_declined",
+            data={
+                "task_id": task_id,
+                "decision": directive.decision.value,
+                "reason": directive.reason,
+                "named_task": directive.task_id or "",
+            },
+        )
+        self._to_needs_user(
+            f"task {task_id}: its committed candidate is too large to render as "
+            "a patch, so the loop showed the reviewer a STAT-ONLY packet and "
+            "asked for a split plan. The reply was "
+            f"`{directive.decision.value}`"
+            + (
+                f" naming '{directive.task_id}'"
+                if directive.task_id and directive.task_id != task_id
+                else ""
+            )
+            + ", not a split of this task, so the task parks here exactly as it "
+            "would have before that ask existed. This is a legitimate answer: "
+            "an oversized change that is genuinely ONE claim should not be cut "
+            "up. The commit is NOT rolled back and NOT pushed, nothing was "
+            "published, and no approval was ever bound to it — the reviewer was "
+            "never shown the change itself.\n\n"
+            f"Reviewer's reason: {directive.reason}",
+            kind="task_fatal",
+            code="review_packet_build_failed",
+            task_id=task_id,
+            detail=(
+                f"stat_only_split_declined decision={directive.decision.value} "
+                f"named_task={directive.task_id or ''}"
+            ),
+        )
 
     @staticmethod
     def _candidate_is_on_task_line(

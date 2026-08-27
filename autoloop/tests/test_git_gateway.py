@@ -12,7 +12,7 @@ import subprocess
 
 import pytest
 
-from autoloop.errors import GitCommandError, GitOperationDenied
+from autoloop.errors import DiffTooLargeError, GitCommandError, GitOperationDenied
 from autoloop.git_gateway import GitGateway
 from autoloop.policy import PolicyConfig, PolicyEngine
 
@@ -82,6 +82,46 @@ def test_object_exists_admits_only_the_existence_flag():
     assert engine.validate_git_command(("cat-file", "commit", "a" * 40)).allowed
     assert not engine.validate_git_command(("cat-file", "-p", "a" * 40)).allowed
     assert not engine.validate_git_command(("cat-file", "--batch")).allowed
+
+
+def test_the_size_cap_refusal_is_its_own_exception_type(repo):
+    """"Too big to render" is the ONE `GitCommandError` here that says nothing
+    is wrong with the repository, and a caller has to be able to act on that
+    without also catching a torn repo (split-05).
+
+    Both halves are asserted because both matter: it IS a `GitCommandError`, so
+    every existing broad handler keeps catching it and nothing widened; and it
+    is a distinct type, so a narrow clause placed ABOVE the broad one can route
+    the cap refusal — and only the cap refusal — somewhere else.
+    """
+    gw = gateway(repo)
+    base = gw.head_sha()
+    (repo / "a.txt").write_text("two\n" * 200)
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "grow a")
+    sha = gw.head_sha()
+
+    gw.RANGE_DIFF_MAX_BYTES = 10  # instance override; the real diff dwarfs it
+    with pytest.raises(DiffTooLargeError) as excinfo:
+        gw.range_diff(base, sha)
+    assert "byte cap" in str(excinfo.value)
+    assert isinstance(excinfo.value, GitCommandError), "existing handlers must still catch it"
+    # The stat carries the SAME cap and the SAME type: a stat is usually orders
+    # of magnitude smaller, but that is a size relationship, not a guarantee,
+    # and a caller falling back to it must be able to see it refuse the same way.
+    with pytest.raises(DiffTooLargeError):
+        gw.range_diff_stat(base, sha)
+
+
+def test_a_git_failure_that_is_not_about_size_is_not_the_size_exception(repo):
+    """The distinction is only worth anything if it excludes something. An
+    unresolvable sha is a genuine git failure: it raises `GitCommandError` and
+    must NOT satisfy `except DiffTooLargeError`, or "this repository is damaged"
+    would be routed as "this change is too big"."""
+    gw = gateway(repo)
+    with pytest.raises(GitCommandError) as excinfo:
+        gw.range_diff("c" * 40, gw.head_sha())
+    assert not isinstance(excinfo.value, DiffTooLargeError)
 
 
 def test_gateway_has_no_ambient_push_method(repo):
