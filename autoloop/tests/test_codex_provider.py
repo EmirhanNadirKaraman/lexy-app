@@ -34,7 +34,6 @@ import textwrap
 
 import pytest
 
-from autoloop.browser.chatgpt import SubmitResult
 from autoloop.codex.conversation import (
     CodexConversation,
     CodexResult,
@@ -57,7 +56,11 @@ from autoloop.codex.quota import (
     strip_echoed_prompt,
 )
 from autoloop.config import AutoloopConfig, BrowserConfig, CodexConfig, ConversationConfig
-from autoloop.conversation import available_providers, create_conversation
+from autoloop.conversation import (
+    SubmitResult,
+    available_providers,
+    create_conversation,
+)
 from autoloop.errors import QuotaExhaustedError, ResponseTimeoutError
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import Orchestrator

@@ -32,8 +32,9 @@ to a verdict — see `classify_submission`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from urllib.parse import urlsplit
+
+from ..conversation import SendOutcome
 
 #: Paths whose responses report whether a *new turn* was accepted. Deliberately
 #: an allowlist and deliberately narrow: the web client fires a crowd of other
@@ -57,13 +58,12 @@ NOT_A_SEND_SUFFIXES: tuple[str, ...] = (
 )
 
 
-class SendOutcome(str, Enum):
-    #: The backend demonstrably accepted the turn.
-    ACCEPTED = "accepted"
-    #: The backend demonstrably refused it, or the request never completed.
-    REJECTED = "rejected"
-    #: Evidence is missing, partial or self-contradictory. Never actionable.
-    UNKNOWN = "unknown"
+#: `SendOutcome` is re-exported here, not defined here: it moved to
+#: `autoloop/conversation.py` in brw-17 (2026-08-27), because the orchestrator
+#: reads it on the codex path and PERSISTS `.value` in `state.json`, so it
+#: cannot live inside a transport that is being retired. Importing it from this
+#: module still works and still yields the same object — this is a re-export,
+#: not a second enum, so `is` comparisons hold across both paths.
 
 
 @dataclass(frozen=True)

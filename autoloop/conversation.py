@@ -12,8 +12,12 @@ none of them about review quality. The registry, the protocol and the
 `browser_backed=True` declaration below are all UNCHANGED and still work: an
 adapter that drives a browser can register itself and get every recovery the
 orchestrator has for one (`_BROWSER_BACKED`). What is gone is the one
-registration, not the mechanism. `autoloop/browser/` is still on disk and its
-`SubmitResult` is still the shared vocabulary imported below.
+registration, not the mechanism. `autoloop/browser/` is still on disk, but the
+shared vocabulary it used to hold — `SubmitResult` and `SendOutcome` — is
+DEFINED HERE since brw-17 (2026-08-27), because neither is a browser concept:
+every provider speaks them, and the orchestrator checks them on the codex path.
+`autoloop/browser/` imports them back from this module, so the dependency points
+transport → vocabulary and retiring that transport takes nothing live with it.
 
 Contract every implementation must honor:
 
@@ -81,10 +85,10 @@ restart a browser it does not use.
 
 from __future__ import annotations
 
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol
 
-from .browser.chatgpt import SubmitResult
 from .errors import ConfigError
 
 if TYPE_CHECKING:
@@ -92,6 +96,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "LLMConversation",
+    "SendOutcome",
     "SubmitResult",
     "available_providers",
     "browser_backed_providers",
@@ -100,6 +105,51 @@ __all__ = [
     "transport_is_browser_backed",
     "transport_remedy",
 ]
+
+
+class SubmitResult(str, Enum):
+    """What one `submit` established about the turn it was asked to send.
+
+    Transport-neutral: defined here rather than beside any one adapter because
+    it is part of the `LLMConversation` contract below, and the orchestrator
+    branches on it (`_submit_request`) without knowing which transport answered.
+    Lived in `browser/chatgpt.py` until brw-17 (2026-08-27); the members and
+    their values are unchanged by that move.
+    """
+
+    #: The request id was already in persisted history; nothing was sent.
+    ALREADY_PERSISTED = "already_persisted"
+    #: Sent, and the server demonstrably accepted the turn.
+    CONFIRMED = "confirmed"
+    #: A send was attempted, but acceptance could not be established. The
+    #: caller must reconcile; it must NOT resend on its own.
+    UNCONFIRMED = "unconfirmed"
+    #: A send was attempted and the browser's own request to the conversation
+    #: endpoint demonstrably failed. Acceptance is DISPROVEN, not merely
+    #: unknown. Still not self-authorizing: the caller confirms absence by
+    #: reconciliation before it may resend. Only ever produced when the
+    #: session implements the optional send-observation capability.
+    REJECTED = "rejected"
+
+
+class SendOutcome(str, Enum):
+    """The optional send-observation verdict, folded to one of three readings.
+
+    Transport-neutral for the same reason as `SubmitResult`, plus a harder one:
+    **`.value` is PERSISTED.** `Orchestrator._submit_request` writes it to
+    `PendingRequest.last_send_outcome`, which lands in `state.json` and is read
+    back on the next start. These three strings are therefore a storage format —
+    renaming one silently misreads a resumed run whose state predates the
+    rename. Lived in `browser/observation.py` until brw-17 (2026-08-27), which
+    changed WHERE it lives and nothing else: names and values are byte-identical.
+    """
+
+    #: The backend demonstrably accepted the turn.
+    ACCEPTED = "accepted"
+    #: The backend demonstrably refused it, or the request never completed.
+    REJECTED = "rejected"
+    #: Evidence is missing, partial or self-contradictory. Never actionable.
+    UNKNOWN = "unknown"
 
 
 class LLMConversation(Protocol):

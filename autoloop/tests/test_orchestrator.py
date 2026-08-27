@@ -24,8 +24,7 @@ from pathlib import Path
 import pytest
 
 from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
-from autoloop.conversation import register_provider
-from autoloop.browser.chatgpt import SubmitResult
+from autoloop.conversation import SubmitResult, register_provider
 from autoloop.contract import Decision, Directive
 from autoloop.errors import (
     GitCommandError,

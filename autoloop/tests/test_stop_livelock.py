@@ -31,9 +31,9 @@ import pytest
 
 from autoloop import cli, health
 from autoloop.blockers import NO_TASK, BlockerStore
-from autoloop.browser.chatgpt import SubmitResult
 from autoloop.config import AutoloopConfig, BrowserConfig, load_config
 from autoloop.contract import Decision, Directive, parse_response
+from autoloop.conversation import SubmitResult
 from autoloop.errors import ContractError, StateCorruptError, StateError
 from autoloop.lock import LoopLock
 from autoloop.manifest import ManifestStore

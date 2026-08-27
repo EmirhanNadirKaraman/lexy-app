@@ -46,11 +46,11 @@ import subprocess
 import pytest
 
 from autoloop import orchestrator as orchestrator_module
-from autoloop.browser.chatgpt import SubmitResult
 from autoloop.codex.conversation import CodexConversation, CodexResult
 from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
 from autoloop.conversation import (
     _BROWSER_BACKED,
+    SubmitResult,
     browser_backed_providers,
     register_provider,
     transport_is_browser_backed,

@@ -32,10 +32,8 @@ import subprocess
 
 import pytest
 
-from autoloop.browser.chatgpt import SubmitResult
 from autoloop.browser.observation import (
     SendObservation,
-    SendOutcome,
     classify_submission,
     is_send_path,
     scrub_path,
@@ -47,6 +45,7 @@ from autoloop.config_writer import (
     replace_conversation_url,
     update_conversation_url,
 )
+from autoloop.conversation import SendOutcome, SubmitResult
 from autoloop.errors import (
     BrowserError,
     ConfigError,

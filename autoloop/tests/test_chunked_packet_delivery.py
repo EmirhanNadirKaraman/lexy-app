@@ -36,9 +36,9 @@ import pytest
 
 from autoloop import packet as packet_mod
 from autoloop.errors import ConversationUnusableError, LoginExpiredError, StateError
-from autoloop.browser.chatgpt import SubmitResult
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Directive
+from autoloop.conversation import SubmitResult
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore

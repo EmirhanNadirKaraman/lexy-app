@@ -29,9 +29,9 @@ import pytest
 
 from autoloop import cli
 from autoloop.audit.agents import ClaudeCliRunner
-from autoloop.browser.chatgpt import SubmitResult
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision
+from autoloop.conversation import SubmitResult
 from autoloop.doctor import DoctorProbes, run_doctor
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
