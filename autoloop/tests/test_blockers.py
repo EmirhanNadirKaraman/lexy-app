@@ -751,6 +751,176 @@ def test_answer_refuses_unknown_and_already_resolved(tmp_path, monkeypatch):
 
 
 # =============================================================================
+# 7b. the browser precondition, exercised WITHOUT a browser (test-02)
+#
+# `_precondition_browser` is the one recheck in `_RESOLUTION_PRECONDITIONS` that
+# senses the machine: it calls `doctor.run_doctor` with the DEFAULT
+# `DoctorProbes`, whose `probe_cdp` really dials `browser.cdp_url` over HTTP.
+# THREE codes route to it — `login_expired`, `submission_ambiguous` and
+# `git_failure_budget_exhausted` — and until now only the third was exercised
+# anywhere, by the test above, which neutralises the entry by name. So the
+# other two answered no question at all: whether the CLI honours the recheck
+# was untested, and any test that reached them would have dialled
+# 127.0.0.1:9222 for real and passed or failed on whether the operator's Chrome
+# happened to be up.
+#
+# The seam patched here is `doctor.run_doctor` itself, NOT `DoctorProbes`.
+# Stubbing the probes leaves the sweep real, and a real sweep resolves its
+# repo_root as `Path.cwd()` and clones a throwaway probe worker repo — trading
+# an HTTP dial for a slower reach at a checkout these tests do not own.
+# `_precondition_browser` does its `from .doctor import ...` INSIDE the
+# function, so the module attribute is re-read on every call and the patch is
+# seen. Pattern borrowed from `test_playwright_driver.py`'s `_urlopen` stub.
+# =============================================================================
+
+
+def _stub_doctor(monkeypatch, results):
+    """Replace the doctor sweep with a fixed verdict and record every call.
+
+    Returns the call list so a test can assert the precondition was CONSULTED.
+    Without that assertion the all-ok case below would still pass if the
+    `_RESOLUTION_PRECONDITIONS` entry were deleted outright — the fail-open
+    this section exists to pin.
+    """
+    import autoloop.doctor as doctor
+
+    calls = []
+
+    def fake_run_doctor(config, repo_root, probes=None):
+        calls.append((config, repo_root, probes))
+        return [doctor.CheckResult(name=n, status=s, detail=d) for n, s, d in results]
+
+    monkeypatch.setattr(doctor, "run_doctor", fake_run_doctor)
+    return calls
+
+
+def _browser_blocker(store, code, task_id="t1"):
+    blocker = Blocker(
+        id=store.next_id(task_id),
+        task_id=task_id,
+        kind="loop_fatal",
+        code=code,
+        question=f"{task_id} parked with {code}",
+        detail="",
+        phase="submitting",
+        created_at=utcnow_iso(),
+    )
+    store.save(blocker)
+    return blocker
+
+
+_CDP_DOWN = (
+    ("cdp", "fail", "http://127.0.0.1:9222/json/version unreachable (connection refused)"),
+    ("playwright", "ok", "importable"),
+    ("provider", "ok", "codex_cli"),
+)
+_BROWSER_UP = (
+    ("cdp", "ok", "http://127.0.0.1:9222/json/version reachable"),
+    ("playwright", "ok", "importable"),
+    ("provider", "ok", "codex_cli"),
+)
+
+
+@pytest.mark.parametrize("code", ["login_expired", "submission_ambiguous"])
+def test_a_browser_backed_blocker_refuses_an_answer_while_the_browser_is_down(
+    tmp_path, monkeypatch, capsys, code
+):
+    """Answer text is not evidence. With the CDP endpoint down the answer must
+    be refused, the record must stay OPEN and unanswered, and the operator must
+    be told WHICH check failed — a bare refusal reads as the tool being broken.
+    """
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _browser_blocker(store, code)
+    calls = _stub_doctor(monkeypatch, _CDP_DOWN)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="I logged back in")
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert "NOT resolved" in out
+    assert "cdp" in out, "the refusal must name the check that is still failing"
+    assert "connection refused" in out
+    assert len(calls) == 1, "the precondition really ran the doctor sweep"
+    # ...and it handed doctor a probe bundle rather than quietly checking nothing.
+    assert calls[0][2] is not None
+    still_open = store.load(blocker.id)
+    assert still_open.resolved_at is None and still_open.answer is None
+    assert [b.id for b in store.open_blockers()] == [blocker.id]
+
+
+@pytest.mark.parametrize("code", ["login_expired", "submission_ambiguous"])
+def test_a_browser_backed_blocker_resolves_once_the_browser_is_back(
+    tmp_path, monkeypatch, capsys, code
+):
+    """The other direction, and the one that catches a precondition being
+    dropped: a clean sweep clears the blocker AND the sweep is proven to have
+    happened, so "it resolved" cannot mean "nothing was checked"."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _browser_blocker(store, code)
+    calls = _stub_doctor(monkeypatch, _BROWSER_UP)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="chrome is up again")
+    ) == 0
+
+    out = capsys.readouterr().out
+    # The success line specifically: "resolved" alone also matches the refusal
+    # message ("NOT resolved"), so it would pass on the branch this test denies.
+    assert f"blocker {blocker.id} resolved." in out
+    assert "NOT resolved" not in out
+    assert len(calls) == 1, "resolving without consulting the environment is the bug"
+    answered = store.load(blocker.id)
+    assert answered.resolved_at is not None
+    assert answered.answer == "chrome is up again"
+
+
+@pytest.mark.parametrize(
+    "failing,expected_rc",
+    [
+        # OUTSIDE the whitelist: a stale lock says nothing about the browser.
+        (("lock", "fail", "stale lock"), 0),
+        # INSIDE it, and deliberately NOT `cdp` — the check covered by the two
+        # tests above. A second whitelist member has to refuse too.
+        (("playwright", "fail", "not installed"), 1),
+    ],
+)
+def test_only_a_browser_check_holds_a_browser_blocker_shut(
+    tmp_path, monkeypatch, failing, expected_rc
+):
+    """The filter is a whitelist of names, and BOTH arms are needed to say so.
+
+    One arm alone is not a test: an unrelated failing check resolving is also
+    what a filter that had been inverted, widened to every check, or deleted
+    outright would produce on some input. The pair discriminates — same
+    command, same blocker, same otherwise-clean sweep, one failing check each,
+    opposite outcomes — so a filter that stopped distinguishing the two fails
+    here whichever way it broke.
+    """
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+    store = BlockerStore(config.blockers_dir)
+    blocker = _browser_blocker(store, "login_expired")
+    # `_BROWSER_UP` minus the check this arm is failing, plus the failure —
+    # otherwise the same name would appear twice with two statuses.
+    clean = tuple(r for r in _BROWSER_UP if r[0] != failing[0])
+    _stub_doctor(monkeypatch, (*clean, failing))
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="chrome is up again")
+    ) == expected_rc
+    resolved = store.load(blocker.id).resolved_at is not None
+    assert resolved is (expected_rc == 0)
+
+
+# =============================================================================
 # 8. exhaustion: no ready task + unchanged fingerprint + open blocker(s) ->
 #    prints all open blockers, exits 0
 # =============================================================================

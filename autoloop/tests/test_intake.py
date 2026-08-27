@@ -207,14 +207,35 @@ def test_a_file_with_no_marker_is_read_as_all_idea(intake_dir):
 # ---- three entry points, one path -------------------------------------------
 
 
+#: These calls are loopback and must stay loopback. `urlopen`'s default opener
+#: is built from `http_proxy`/`HTTP_PROXY`, so with a proxy configured and a
+#: `no_proxy` that does not spell out `127.0.0.1` they would leave the machine
+#: and reach a host this test does not own. An explicit empty `ProxyHandler` is
+#: the stdlib's way of saying "no proxy, ever" — `build_opener` drops its own
+#: default handler of that class when it is handed one.
+_LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 @contextlib.contextmanager
 def serving(repo, monkeypatch, intake_dir=None, inbox_dir=None):
+    """The dashboard on an ephemeral port, with BOTH operator directories
+    redirected under this test's `tmp_path`.
+
+    Neither redirect is optional any more. `_inbox_dir` falls back to
+    `~/.autoloop/inbox` for a checkout with no `[paths].workers_root` — which
+    the `repo` fixture deliberately has none of — and `_intake_dir` is its
+    sibling, so a `serving()` that left either unstated pointed the handler at
+    the operator's OWN queue. The routes exercised below happen not to reach
+    the unstated one today, which is precisely the kind of accident that stops
+    being true the first time a route grows a second write.
+    """
     import autoloop.dashboard as dash
 
-    if intake_dir is not None:
-        monkeypatch.setattr(dash, "_intake_dir", lambda _repo: intake_dir)
-    if inbox_dir is not None:
-        monkeypatch.setattr(dash, "_inbox_dir", lambda _repo: inbox_dir)
+    fallback = repo.parent / "unowned-by-this-test"
+    resolved_intake = fallback / "intake" if intake_dir is None else intake_dir
+    resolved_inbox = fallback / "inbox" if inbox_dir is None else inbox_dir
+    monkeypatch.setattr(dash, "_intake_dir", lambda _repo: resolved_intake)
+    monkeypatch.setattr(dash, "_inbox_dir", lambda _repo: resolved_inbox)
     monkeypatch.setattr(dash.Handler, "repo", repo)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), dash.Handler)
     srv.daemon_threads = True
@@ -236,14 +257,14 @@ def post(base, path, payload):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _LOOPBACK.open(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
 
 
 def get(base, path):
-    with urllib.request.urlopen(base + path, timeout=10) as resp:
+    with _LOOPBACK.open(base + path, timeout=10) as resp:
         return resp.status, json.loads(resp.read() or b"{}")
 
 
@@ -877,7 +898,11 @@ def test_the_dashboard_ask_route_refuses_mid_round(tmp_path, monkeypatch):
     write_lock(state_dir, pid=os.getpid())
 
     monkeypatch.setattr(dash.Handler, "repo", repo)
-    with serving(repo, monkeypatch) as base:
+    # Stated, not inferred: `serving` now redirects both operator directories
+    # by default (see its docstring), so the draft above has to be pointed at
+    # or this would refuse a slug whose file the handler could not have found —
+    # the right answer for the wrong reason.
+    with serving(repo, monkeypatch, intake_dir=intake_dir) as base:
         status, body = post(base, "/api/intake/ask", {"id": "reader"})
     assert status == 400
     assert "ask_user" in body["error"]

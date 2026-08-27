@@ -116,6 +116,39 @@ def no_process_replacement(monkeypatch):
     monkeypatch.setattr(os, "execv", refuse)
 
 
+@pytest.fixture(autouse=True)
+def _inbox_never_the_operators_own(tmp_path, monkeypatch):
+    """`collect()` globs `_inbox_dir(repo)`, and `_inbox_dir` resolves from
+    `[paths].workers_root` with `~/.autoloop/inbox` as its fallback — which
+    `make_repo` does not configure. So every `collect(repo)` and every request
+    served below read the OPERATOR'S OWN inbox: a host resource no test here
+    owns, whose contents decide what lands in `payload["inbox"]`.
+
+    Read-only, so it was never a corruption; it is a hermeticity hole, and the
+    reason `inbox` had to be excluded from `_NOT_STATE_DIR_DERIVED`'s blanket
+    assertion. Pointed at `tmp_path` the panel is this test's own again.
+
+    A DEFAULT, not a lock: `serving()` and the inbox tests below patch
+    `_inbox_dir` themselves afterwards and still win, because monkeypatch
+    applies in call order. The one reader this cannot reach is the CHILD
+    dashboard in `test_a_stale_dashboard_ends_up_serving_the_new_code` — a
+    separate process — which states a `workers_root` in its own config instead.
+    """
+    import autoloop.dashboard as dash
+
+    default = tmp_path / "operator-inbox"
+    monkeypatch.setattr(dash, "_inbox_dir", lambda _repo: default)
+
+
+#: Loopback, and it must STAY loopback. `urlopen`'s default opener is built from
+#: `http_proxy`/`HTTP_PROXY`, so on a machine with a proxy configured — and a
+#: `no_proxy` that does not spell out `127.0.0.1` — these requests would leave
+#: the box and reach a host this test does not own. An explicit empty
+#: `ProxyHandler` is how the stdlib says "no proxy, ever"; `build_opener` drops
+#: its own default handler of that class when it is given one.
+_LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def snapshot(root: Path) -> dict:
     """Every file under `root` with its mtime — the same shape the read-only
     test uses, so "did anything change" is one comparison."""
@@ -625,7 +658,7 @@ def post(base, path, payload, headers=None):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _LOOPBACK.open(req, timeout=5) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
@@ -5474,7 +5507,7 @@ def serving_dashboard(repo, monkeypatch):
 
 
 def get(base, path="/"):
-    with urllib.request.urlopen(base + path, timeout=10) as resp:
+    with _LOOPBACK.open(base + path, timeout=10) as resp:
         return resp.status, resp.read().decode()
 
 
@@ -6468,11 +6501,79 @@ def test_every_backend_upgrade_state_has_a_sentence_on_the_page():
 
 
 def free_port() -> int:
+    """An ephemeral port the OS has just said is free — never a fixed one.
+
+    It cannot HOLD what it found: the child has to bind that number itself, so
+    the probe must be closed first, and in the gap another process on the
+    machine (a second xdist worker running this very test) can win it. That is
+    why `serve_new_dashboard` retries a child that died with the bind refused —
+    losing a round to a port race is not the same as the feature being broken,
+    and only one of those two is worth reporting as a failure.
+    """
     import socket
 
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
+
+
+class ChildGone(AssertionError):
+    """The dashboard child exited instead of serving. Carries the log tail, so
+    the retry below can tell a lost port from a real fault."""
+
+
+#: What a lost port looks like in the child's traceback, on macOS (48) and
+#: Linux (98). Anything else is the feature failing and is never retried.
+_PORT_TAKEN = ("address already in use", "errno 48", "errno 98")
+
+
+def stop_child(child) -> None:
+    child.terminate()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        child.wait(timeout=10)
+
+
+def dashboard_page(child, base, log, deadline=30.0) -> str:
+    end = time.time() + deadline
+    last = None
+    while time.time() < end:
+        if child.poll() is not None:
+            raise ChildGone(
+                f"the dashboard exited {child.returncode}: "
+                f"{log.read_text(errors='replace')[-2000:]}"
+            )
+        try:
+            return get(base)[1]
+        except (urllib.error.URLError, OSError) as exc:
+            last = exc
+            time.sleep(0.1)
+    raise AssertionError(f"the dashboard never answered: {last}")
+
+
+def serve_new_dashboard(checkout, log, attempts=3):
+    """A child dashboard that really owns its port, plus its first page.
+
+    Retries ONLY the bind race `free_port` cannot close, and only that: a child
+    that died for any other reason raises on the first attempt, at full detail
+    and with no added wall-clock, exactly as before.
+    """
+    for attempt in range(attempts):
+        port = free_port()
+        base = f"http://127.0.0.1:{port}"
+        with log.open("wb") as sink:
+            child = subprocess.Popen(
+                [sys.executable, "-m", "autoloop.dashboard",
+                 "--repo", str(checkout), "--port", str(port)],
+                cwd=str(checkout), stdout=sink, stderr=subprocess.STDOUT,
+            )
+        try:
+            return child, base, dashboard_page(child, base, log)
+        except ChildGone as exc:
+            stop_child(child)
+            lost_the_port = any(marker in str(exc).lower() for marker in _PORT_TAKEN)
+            if attempt == attempts - 1 or not lost_the_port:
+                raise
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def test_a_stale_dashboard_ends_up_serving_the_new_code(tmp_path):
@@ -6492,12 +6593,20 @@ def test_a_stale_dashboard_ends_up_serving_the_new_code(tmp_path):
     unconfigured checkout — it reports a marker it cannot locate and replaces
     nothing. Stating it is what a real deployment does; without this line the
     test would fail for the reason the feature is now right about.
+
+    It names a `workers_root` for the same kind of reason. The child is a
+    SEPARATE PROCESS, so `_inbox_never_the_operators_own` cannot reach it, and
+    an unconfigured `workers_root` sends its `collect()` sweep at
+    `~/.autoloop/inbox` — the operator's own. Under `tmp_path` the child reads
+    this test's directory instead.
     """
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     (checkout / ".autoloop").mkdir()
     (checkout / ".autoloop" / "config.toml").write_text(
-        '[paths]\nstate_dir = ".autoloop"\n', encoding="utf-8"
+        '[paths]\nstate_dir = ".autoloop"\n'
+        f'workers_root = "{tmp_path / "outside" / "workers"}"\n',
+        encoding="utf-8",
     )
     shutil.copytree(
         REPO_ROOT / "autoloop",
@@ -6505,35 +6614,14 @@ def test_a_stale_dashboard_ends_up_serving_the_new_code(tmp_path):
         ignore=shutil.ignore_patterns("tests", "__pycache__"),
     )
     module = checkout / "autoloop" / "dashboard.py"
-    port = free_port()
     log = tmp_path / "child.log"
     child = None
     try:
-        with log.open("wb") as sink:
-            child = subprocess.Popen(
-                [sys.executable, "-m", "autoloop.dashboard",
-                 "--repo", str(checkout), "--port", str(port)],
-                cwd=str(checkout), stdout=sink, stderr=subprocess.STDOUT,
-            )
-        base = f"http://127.0.0.1:{port}"
+        child, base, before = serve_new_dashboard(checkout, log)
 
         def page(deadline=30.0):
-            end = time.time() + deadline
-            last = None
-            while time.time() < end:
-                if child.poll() is not None:  # pragma: no cover - a dead child
-                    raise AssertionError(
-                        f"the dashboard exited {child.returncode}: "
-                        f"{log.read_text(errors='replace')[-2000:]}"
-                    )
-                try:
-                    return get(base)[1]
-                except (urllib.error.URLError, OSError) as exc:
-                    last = exc
-                    time.sleep(0.1)
-            raise AssertionError(f"the dashboard never answered: {last}")
+            return dashboard_page(child, base, log, deadline)
 
-        before = page()
         assert "RELOADED-BY-LOOP-03" not in before
         assert "<!doctype html>" in before
 
@@ -6577,9 +6665,7 @@ def test_a_stale_dashboard_ends_up_serving_the_new_code(tmp_path):
         assert "restarting into" in log.read_text(errors="replace")
     finally:
         if child is not None:
-            child.terminate()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                child.wait(timeout=10)
+            stop_child(child)
 
 
 # ---- one state directory, and the unit it is dispatching NOW (dash-20) -------
