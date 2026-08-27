@@ -41,7 +41,10 @@ throws the round away while saying what it ran, and the two phases execute the
 SAME argv for the same change. It also pins the consequence the review packet
 now states (`validation.PRECOMMIT_EVIDENCE`): a narrowed round runs no full
 suite at either phase, so the sentence claiming the subset was ADDED to a
-full-suite run cannot quietly come back.
+full-suite run cannot quietly come back. One test in that block is about the
+INPUT rather than the decision — a round that DELETES a module must hand the
+selector a changed-path set containing it, or the widening that deletion is
+owed never fires and the run narrows blind.
 """
 
 from __future__ import annotations
@@ -72,7 +75,6 @@ from autoloop.worktask import TaskExecution
 from test_implement_executor import (
     FakeAgentRunner,
     implement_directive,
-    make_agent_runner_factory,
     run_git,
 )
 from test_orchestrator import URL, build_postcommit
@@ -1207,12 +1209,34 @@ def test_a_task_declaring_the_configured_default_still_runs_it_in_full(tmp_path,
 # ---- the pre-commit phase: the round's own authoritative run -----------------
 
 
+class _WritingDeletingAgent(FakeAgentRunner):
+    """`FakeAgentRunner` plus the one thing it cannot do: unlink a file.
+
+    A real agent removes files — by its own Edit/Write work, or through the
+    `DELETE-FILE:` / `REMOVE-OUT-OF-SCOPE:` passes the executor runs on its
+    behalf — and a removal is the changed-path kind the selector must NOT
+    narrow on. The stand-in has to be able to produce one, or the case cannot
+    be driven through a real round at all.
+    """
+
+    def __init__(self, worker_repo, write_files, delete_files):
+        super().__init__(worker_repo=worker_repo, write_files=write_files)
+        self.delete_files = tuple(delete_files)
+
+    def run(self, spec):
+        result = super().run(spec)
+        for rel in self.delete_files:
+            (self.worker_repo / rel).unlink()
+        return result
+
+
 def precommit_round(
     tmp_path,
     *,
     commands=(RUFF, SUITE),
     task=None,
     fails_on=None,
+    deletes=(),
     **kwargs,
 ):
     """One REAL `ImplementExecutor` round over a REAL git worker repo.
@@ -1226,7 +1250,8 @@ def precommit_round(
     selection reads an import graph off the filesystem, so a fake tree would
     prove a fake graph. `fails_on`, when given, is a TOKEN — a command whose argv
     contains it exits 1, which is how the failing-run cases pick out exactly the
-    narrowed command.
+    narrowed command. `deletes` are repo-relative paths the stand-in agent
+    UNLINKS, so a round can produce the one changed-path kind that must widen.
 
     `advisory_zero_call_returns=0`: since advis-01 (2026-08-26) a round whose
     agent never uses the advisory channel is handed back once and then WITHHELD
@@ -1256,8 +1281,10 @@ def precommit_round(
         command_runner=recorder,
         worker_repo_root_for=lambda task_id: worker,
         policy=policy,
-        agent_runner_factory=make_agent_runner_factory(
-            write_files={"pkg/publisher.py": "def publish():\n    return 2\n"}
+        agent_runner_factory=lambda root: _WritingDeletingAgent(
+            worker_repo=root,
+            write_files={"pkg/publisher.py": "def publish():\n    return 2\n"},
+            delete_files=deletes,
         ),
         advisory_zero_call_returns=0,
         **kwargs,
@@ -1416,6 +1443,45 @@ def test_a_failing_selected_command_still_fails_the_round_and_says_what_it_ran(t
     assert "FAIL" in outcome.validation
     assert "test selection: SUBSET" in outcome.validation
     assert any("suite/test_smoke.py" in argv for argv in ran)
+
+
+def test_a_module_the_round_deleted_widens_the_authoritative_run(tmp_path):
+    """The FAIL-OPEN that this phase's changed-path read prevents.
+
+    The round deletes `pkg/lonely.py`. Its importer `suite/test_lonely.py` names
+    it as a dotted module (`from pkg.lonely import unused`), never as a path, so
+    no content-reference scan can find the very test a deletion breaks — which
+    is why `select_validation_commands` treats a changed `.py` absent from the
+    graph as unattributable and widens, naming the path.
+
+    That branch is already pinned on the selector itself
+    (`test_a_deleted_python_module_is_named_as_the_cause`). What is pinned HERE
+    is the thing the pre-commit call site had to get right for it to fire at
+    all: `changed` is read from `git status` — never from anything the agent
+    SAID — at the ONE `dirty_paths_all()` read below `_apply_recorded_reverts`
+    in `implement_executor.py`, so a removal is IN the set the selector is
+    given. Read it earlier and the deletion is invisible: the run narrows to
+    the importers of what was WRITTEN, `suite/test_lonely.py` never executes,
+    and a round that broke an import ships green with a summary claiming a
+    subset was sufficient. A widened run is the loud direction; this is the
+    quiet one.
+
+    What this drives is an AGENT-initiated unlink. The three file-moving passes
+    (`DELETE-FILE:`, `REMOVE-OUT-OF-SCOPE:`, `REVERT-OUT-OF-SCOPE:`) are not
+    exercised here and do not need their own case for this property: they all
+    run ABOVE that same single read, so whatever they change is in the same
+    set by construction. Move the read above them and the pass to check is
+    those — this test would still be green.
+    """
+    outcome, ran, _worker = precommit_round(tmp_path, deletes=("pkg/lonely.py",))
+
+    assert outcome.status == "ok"
+    assert "pkg/lonely.py" in outcome.changed_paths, "git saw the removal"
+    assert "test selection: FULL SUITE" in outcome.validation
+    assert "test selection: SUBSET" not in outcome.validation
+    assert "absent from the import graph" in outcome.validation
+    assert "pkg/lonely.py" in outcome.validation, "the cause is NAMED, not counted"
+    assert SUITE in ran, "the whole configured tree ran, verbatim"
 
 
 def test_both_phases_run_the_same_commands_for_the_same_change(tmp_path):

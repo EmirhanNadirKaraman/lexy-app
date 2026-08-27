@@ -4240,8 +4240,9 @@ Four properties hold that up, and each was a way to get this wrong:
   collapsing to a single verdict would trade wall-clock for evidence.
 * **`NOT RUN` is not `SKIPPED`.** `TestSelection.skipped` (per-commit test
   selection, same module) already means "no reachable test lives under its
-  paths", and `orchestrator._run_post_commit_validation` concatenates both
-  strings into one summary.
+  paths", and BOTH validation phases concatenate the two strings into one
+  summary — `implement_executor._run_implementation` before the commit (since
+  val-04, 2026-08-27) and `orchestrator._run_post_commit_validation` after it.
 * **Nothing about the verdict changed.** `all_passed` is False in exactly the
   cases it was before; a refused binary, a missing binary and a timeout are still
   failures rather than exceptions; an empty list still reports passed; a PASSING
@@ -6380,7 +6381,14 @@ exists now is ONE fixed call with every input bound by the executor:
   `_run_implementation` already computes for its own run — the command list
   (`_validation_commands_for`), the working directory (`_validation_cwd_for`),
   the command runner and the `ValidationEnv`. Both runs read those two
-  functions, so they cannot drift into validating different things.
+  functions, so they cannot drift into validating different things. Since
+  val-04 (2026-08-27) the two are no longer IDENTICAL, and the difference runs
+  one way only: the executor's own run narrows that list to the tests reachable
+  from this round's changed paths, while an advisory run is bound BEFORE the
+  agent has written anything and therefore has no changed-path set to select
+  from — so it runs the list whole and is a SUPERSET of the run that grades the
+  round. The agent proving green over more than the executor executes is the
+  safe direction; the reverse would not be.
 * `AdvisoryValidation.run()` takes **no parameter**. There is no channel
   through which a command, a path, a flag or an environment value could arrive
   from the agent, and `serve_advisory_tool_call` accepts a transport's payload
@@ -6396,10 +6404,14 @@ exists now is ONE fixed call with every input bound by the executor:
   missing `validation_cwd`, and a launcher that raises: an advisory channel
   that answered "green" when it had nothing to run would be the fail-open it
   exists to prevent.
-* **Step 4 is unchanged and still owns the verdict.** The executor's own run
-  happens unconditionally after the agent returns, runs the full configured
-  list, sets `ExecutionOutcome.validation`, and decides the status. A green
-  advisory run skips, shortens and replaces nothing.
+* **Step 4 still owns the verdict.** The executor's own run happens
+  unconditionally after the agent returns, sets `ExecutionOutcome.validation`,
+  and decides the status. A green advisory run skips, shortens and replaces
+  nothing. What DID change is which tests it runs: since val-04 (2026-08-27) it
+  no longer runs the full configured list but the subset
+  `validation.select_validation_commands` selects from this round's changed
+  paths, exactly as the post-commit re-run does, and its summary says what it
+  selected — or names the reason it widened to everything.
 * **The round reports it, from the loop's own counters.**
   `AdvisoryValidation.note()` is appended to every post-agent outcome summary:
   how many times the suite ran and whether the last run was green. It never

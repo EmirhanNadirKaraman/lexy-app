@@ -984,12 +984,15 @@ def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> 
         "name": ADVISORY_TOOL_NAME,
         "description": (
             "Run this repository's configured validation (lint/tests) against "
-            "your own worker repo, exactly as the executor will run it after "
-            "you return. It takes NO arguments: the commands, the working "
+            "your own worker repo — every configured command, in full. It "
+            "takes NO arguments: the commands, the working "
             "directory and the environment are fixed by the executor, and "
             "nothing you supply can change any of them. The result comes back "
             "to you as text. This run is ADVISORY — the executor runs "
-            "validation itself afterwards and that run is the verdict. At most "
+            "validation itself afterwards and that run is the verdict. That "
+            "run is NARROWED to the tests your changed paths reach, so it is a "
+            "subset of what runs here: a green answer covers it rather than "
+            "reproducing it. At most "
             f"{max_calls} run(s) per round; past that the request executes "
             f"nothing and says {NOT_RUN}, which is not a pass."
         ),
@@ -1008,11 +1011,20 @@ class AdvisoryValidation:
 
     Constructed by `ImplementExecutor._advisory_for` from the same four values
     `_run_implementation` uses for its authoritative run — so the agent's run
-    and the executor's run are the same commands in the same directory under
-    the same environment, and a green advisory run means what the agent will
-    naturally read it to mean. They are two SEPARATE runs: nothing here is
+    and the executor's run are the same command list in the same directory
+    under the same environment, and a green advisory run means what the agent
+    will naturally read it to mean. They are two SEPARATE runs: nothing here is
     consulted by, shortens, or stands in for the executor's own call, which
     happens unconditionally after the agent returns.
+
+    Since val-04 (2026-08-27) they are not the same ARGV, and the asymmetry is
+    deliberate and one-directional. The executor's own run narrows that list
+    through `validation.select_validation_commands`; this one is bound before
+    the agent has written anything, so there is no changed-path set to select
+    from and it runs the list whole. An advisory run is therefore a SUPERSET of
+    the run that grades the round — the agent proving green over more than the
+    executor will execute. The reverse would be the fail-open: an agent shown a
+    narrower run than the verdict's.
 
     **The agent supplies nothing.** `run()` takes no parameter, so there is no
     channel through which a command, a path, a flag or an environment value
