@@ -264,7 +264,17 @@ def test_the_advisory_run_and_the_executors_own_run_launch_the_same_thing(
 ):
     """Same commands, same working directory, same launcher. Two computations
     of "what this round validates with" would let the agent prove a green run
-    against something the executor was never going to execute."""
+    against something the executor was never going to execute.
+
+    EQUALITY here is the WIDENED case, not the general contract. This task
+    declares both its own `validation` and a `validation_cwd`, either of which
+    makes `_select_validation` hand the resolved list back verbatim, so the two
+    runs launch identical argv. The general relation since val-04 (2026-08-27)
+    is ⊇ — the advisory run is never narrower than the executor's own, and is
+    strictly larger on a round that narrowed. That direction is pinned in
+    `test_test_selection.py::test_the_authoritative_run_is_never_wider_than_an_advisory_one`;
+    what is pinned HERE is that both ends read the same two functions.
+    """
     (worker_repo / "backend").mkdir()
     task = make_task(validation=(RUFF, SUITE), validation_cwd="backend")
     runner = RecordingRunner()
@@ -717,6 +727,52 @@ def test_the_tool_description_states_that_it_is_advisory_and_capped():
     assert "2" in description
     # It must not promise the agent a lever it does not have.
     assert "argument" in description
+
+
+def test_the_description_never_promises_the_verdict_run_is_always_narrowed():
+    """The claim the agent reads has to hold on EVERY round, including the ones
+    where nothing narrows (val-04 revision, 2026-08-27).
+
+    The first draft said the executor's own run "is NARROWED to the tests your
+    changed paths reach, so it is a subset of what runs here". That is false the
+    moment `_select_validation` widens — a task-declared `validation` or
+    `validation_cwd`, `[audit] test_selection = "full"`, a module the round
+    deleted, a pytest command that cannot be retargeted, a selection of zero
+    test files, or the selector raising — and on those rounds the verdict run
+    takes the SAME resolved list this one takes. An agent told "it is a subset"
+    is being told something the round it is in may already have falsified.
+
+    Asserted in both directions, like
+    `test_test_selection.py::test_the_pre_commit_evidence_no_longer_claims_a_
+    full_run`: the negative alone would pass if the old sentence came back in a
+    different casing, and the positive alone would pass if it came back BESIDE
+    the new one. The four properties the descriptor already carried are
+    re-asserted here too, because the easiest way to break this text is to lose
+    one of them while rewriting the sentence next to it.
+    """
+    description = advisory_tool_descriptor(max_calls=2)["description"]
+    lowered = description.lower()
+
+    # The relation, in the conditional form that is true on every round.
+    assert "never wider" in lowered, "the ⊇ relation is stated"
+    assert "may be narrowed" in lowered, "and stated as a possibility, not a fact"
+    # The advisory run's OWN half of the relation: it takes the list whole.
+    # Asserted on the distinguishing clause, not on "in full" — that appears
+    # twice (here and in the widened-authoritative case), so the looser needle
+    # would stay green with this half deleted.
+    assert "every command this round validates with" in lowered
+
+    # The unconditional claims, in both the shipped casing and any other.
+    assert "is narrowed to the tests" not in lowered
+    assert "subset of what runs here" not in lowered
+    assert "NARROWED" not in description, "no unconditional emphasis either"
+
+    # Still true of the same string, and still the string the brief renders.
+    assert "ADVISORY" in description
+    assert NOT_RUN in description
+    assert "2" in description
+    assert "argument" in description
+    assert description in implement_executor._advisory_instruction(2)
 
 
 def test_a_service_built_with_no_bounds_still_carries_the_module_defaults(tmp_path):

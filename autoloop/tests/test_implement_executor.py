@@ -1296,6 +1296,82 @@ def test_empty_task_validation_keeps_the_configured_default(main_repo, worker_re
     assert ("ruff", "check", ".") in ran
 
 
+# ---- val-04: the authoritative run is narrowed, and says nothing when it isn't
+
+
+def test_a_ruff_only_round_reports_no_test_selection_decision(main_repo, worker_repo):
+    """Since val-04 (2026-08-27) this executor selects which TESTS its own
+    authoritative run executes. A configured list with no pytest command in it
+    had no decision to make, so it reports none.
+
+    Asserted BYTE-EXACT rather than by substring, because the failure mode is
+    additive: an evidence sentence appended unconditionally would reach
+    `state.last_validation` — state.json, the transcript, blocker records and the
+    CONTEXT block of every message — on every round of every ruff-only
+    deployment. `test_orchestrator.py` makes the identical equality on the
+    post-commit side. The narrowing behaviour itself lives in
+    `test_test_selection.py`'s pre-commit block.
+    """
+    executor = build_executor(
+        main_repo, worker_repo,
+        lambda root: implement_agent_runner(root, runner=_writing_stub),
+        validation=(("ruff", "check", "."),),
+        command_runner=ok_command,
+    )
+
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert outcome.validation == "ruff check .: PASS"
+
+
+def test_a_selector_that_raises_runs_everything_and_says_so(
+    main_repo, worker_repo, monkeypatch
+):
+    """The fail-safe direction, forced rather than argued.
+
+    Selection reads the filesystem — it walks and parses every `.py` file in the
+    worker repo — so it has failure modes the rest of this round does not. An
+    exception there must not throw away a round whose agent has already done its
+    work, and it must not silently look like a narrowed run either: every
+    configured command runs, and the summary NAMES the failure.
+    """
+    suite = ("python3", "-m", "pytest", "-q", "autoloop/tests")
+    ran = []
+
+    def command_runner(argv, cwd=None, **kw):
+        ran.append(tuple(argv))
+
+        class Proc:
+            returncode = 0
+            stdout = "ok\n"
+            stderr = ""
+
+        return Proc()
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("graph walk exploded")
+
+    monkeypatch.setattr(
+        "autoloop.implement_executor.select_validation_commands", explode
+    )
+    executor = build_executor(
+        main_repo, worker_repo,
+        lambda root: implement_agent_runner(root, runner=_writing_stub),
+        validation=(("ruff", "check", "."), suite),
+        command_runner=command_runner,
+    )
+
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert ("ruff", "check", ".") in ran
+    assert any("autoloop/tests" in argv for argv in ran), "the whole tree still ran"
+    assert "FULL SUITE" in outcome.validation
+    assert "the selector itself failed" in outcome.validation
+    assert "RuntimeError" in outcome.validation
+
+
 def test_missing_validation_cwd_is_an_honest_error_not_a_silent_pass(main_repo, worker_repo):
     """A declared directory that does not exist must not fall back to the repo
     root and report success — that is the vacuous pass all over again."""

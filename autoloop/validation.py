@@ -55,13 +55,22 @@ together would make a pure argv rewrite depend on the filesystem.
 
 `select_validation_commands` is deliberately PHASE-AGNOSTIC: it takes a command
 list, a set of changed repo-relative paths and a repo root, and knows nothing
-about commits. Pre-commit inputs satisfy that signature exactly — `git
-status`-derived dirty paths and the worker-repo root — which is why adopting it
-at the executor's own call site (`implement_executor.py`, where `changed` and
-`git.repo_root` are already in hand) needs no change here at all. Only ONE call
-site consumes it today (`orchestrator._run_post_commit_validation`); the
-pre-commit run is still full, `PRECOMMIT_EVIDENCE` says so in the packet, and
-`test_test_selection.py` pins both halves of that statement.
+about commits. BOTH call sites satisfy that signature and BOTH consume it since
+val-04 (2026-08-27): `implement_executor._select_validation` before the commit,
+from `git.dirty_paths_all()` and the worker-repo root, and
+`orchestrator._run_post_commit_validation` after it, from git's own account of
+the commit range. Adopting it at the second site needed no change here at all,
+which is what phase-agnostic was for.
+
+The consequence is the one `PRECOMMIT_EVIDENCE` below has to state rather than
+imply: a full-suite run is no longer GUARANTEED at either phase, and a round
+that narrows at both has none at all. The pre-commit run used to be an
+independent full backstop under the narrowed post-commit re-run, and it is not
+one now — the two runs share this model, this command list and (bar the commit
+itself) these inputs, so they are correlated rather than independent. Each phase
+still reports its own decision where it ran, so the two can disagree honestly:
+one widening does not make the other's evidence false.
+`test_test_selection.py` pins both ends.
 
 Caveat for anyone editing `audit/executor.py`: that module has its OWN
 validation runner (`AuditExecutor._run_validation`) which shares
@@ -645,17 +654,37 @@ _EVIDENCE_MAX_CONSIDERED = 8
 #:
 #: It is a claim about a DIFFERENT module, so it is stated as the fact it is
 #: rather than as an argument, and it is pinned by a test:
-#: `test_test_selection.py::test_the_pre_commit_run_is_not_narrowed_today`
-#: drives a real `ImplementExecutor` round and asserts the configured command
-#: ran unnarrowed. **When `implement_executor.py`'s call site is narrowed, this
-#: sentence becomes false and that test fails — both are the reminder to
-#: rewrite it here.**
+#: `test_test_selection.py::test_the_pre_commit_run_is_narrowed_too` drives a
+#: real `ImplementExecutor` round and asserts the configured pytest command ran
+#: NARROWED and that the round's own summary says so. **When either call site's
+#: behaviour changes, this sentence has to change with it — that test is the
+#: alarm.**
+#:
+#: REWRITTEN by val-04 (2026-08-27), which narrowed the pre-commit run too. The
+#: sentence it replaced said the recorded subset was "ADDED to a full-suite run
+#: of the same tree", which stopped being true the moment that call site
+#: narrowed; the version below states the consequence — a full-suite run is no
+#: longer guaranteed at either phase — instead of leaving a reviewer to infer
+#: it. It is deliberately a claim about the MODEL both phases use rather than
+#: about what the other phase decided this round: this function is called by
+#: each phase separately and cannot see the other's answer, so a sentence
+#: asserting "the other run also narrowed" would be unverifiable from here.
+#:
+#: BUDGETED, not just written: `evidence()` is bounded to under 3,000
+#: characters by `test_the_evidence_is_bounded`, and everything around this
+#: sentence is fixed, so this constant has roughly 690 characters of room and
+#: the first draft of the val-04 rewrite (830) failed that test. The facts it
+#: had to keep are the four below; the elaboration went to this module's own
+#: docstring, which no message carries.
 PRECOMMIT_EVIDENCE = (
-    "Scope of the narrowing: the POST-COMMIT re-run only. The executor's own "
-    "PRE-COMMIT run of this same change (`implement_executor.py`) executed "
-    "every configured command in full, so what is recorded here is a "
-    "reachability-selected subset ADDED to a full-suite run of the same tree, "
-    "never a replacement for one."
+    "Scope of the narrowing: BOTH runs of this round, since 2026-08-27. The "
+    "authoritative PRE-COMMIT run (`implement_executor.py`) selects through "
+    "this same function, over the same command list, from its own changed "
+    "paths. So this is NOT a subset added to a full-suite run of the same "
+    "tree — no full-suite run is guaranteed at either phase, and the "
+    "post-commit re-run, though it does re-run the COMMITTED tree a hook can "
+    "have changed, is no longer an independent backstop under it. Each phase "
+    "reports its own decision where it ran."
 )
 
 #: pytest flags that consume the NEXT argv token. A token following one of
@@ -1182,8 +1211,8 @@ class TestSelection:
         return (
             "test selection: SUBSET by import-graph reachability — "
             f"{len(self.selected)} of {self.total_test_files} test file(s) are "
-            f"selected from the {len(self.considered)} changed path(s) in this "
-            f"commit range [{', '.join(considered)}] by following the reverse of "
+            f"selected from the {len(self.considered)} changed path(s) this run "
+            f"was given [{', '.join(considered)}] by following the reverse of "
             "every import edge in the repository, transitively, so a test file "
             "the commit did not touch is still selected whenever it can reach "
             f"the change: [{', '.join(selected)}]. Each configured pytest command "
@@ -1205,9 +1234,9 @@ class TestSelection:
             f"{dropped} {PRECOMMIT_EVIDENCE} To widen, "
             "either OPERATOR lever (a `plan` directive can set neither): "
             '`[audit] test_selection = "full"` in the loop config, which takes '
-            "effect on the next round and — since the pre-commit run is not "
-            "narrowed either — restores exactly the pre-2026-08-20 behaviour; "
-            "or this task's own `validation` commands (`autoloop task-add "
+            "effect on the next round and — since BOTH phases read that one "
+            "setting — restores exactly the pre-2026-08-20 behaviour; or this "
+            "task's own `validation` commands (`autoloop task-add "
             "--validation ...`, or the same key through the operator inbox), "
             "which are run exactly as declared and never narrowed at either "
             "phase."
@@ -1355,8 +1384,9 @@ def select_validation_commands(
 ) -> TestSelection:
     """Decide which of `commands`' tests this commit actually needs.
 
-    `changed_paths` is what git says the commit range touched — never what an
-    executor reported. `full_reason`, when non-empty, forces the full suite and
+    `changed_paths` is what GIT says changed — the commit range after the commit
+    exists, `git status` before it — never what an executor or an agent reported.
+    `full_reason`, when non-empty, forces the full suite and
     is used verbatim as the recorded reason; that is how a caller says "this
     task declared its own validation" without this function having to know what
     a task is.
@@ -1428,7 +1458,7 @@ def select_validation_commands(
     if mode != TEST_SELECTION_REACHABLE:
         return full('[audit] test_selection = "full"')
     if not considered:
-        return full("no changed paths were established for this commit range")
+        return full("no changed paths were established for this run")
     try:
         graph = build_import_graph(repo_root)
     except OSError as exc:
