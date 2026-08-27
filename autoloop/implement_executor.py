@@ -342,7 +342,13 @@ from .tasks import (
     deletable_paths,
     effective_approved_paths,
 )
-from .validation import NOT_RUN, run_validation_commands
+from .validation import (
+    NOT_RUN,
+    TEST_SELECTION_REACHABLE,
+    TestSelection,
+    run_validation_commands,
+    select_validation_commands,
+)
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
 
@@ -3248,6 +3254,7 @@ class ImplementExecutor:
         advisory_zero_call_returns: int = ADVISORY_ZERO_CALL_RETURNS,
         abort_file: Path | None = None,
         abort_ledger: AbortLedger | None = None,
+        test_selection: str = TEST_SELECTION_REACHABLE,
     ):
         """`git` / `agent_runner` are the STANDALONE bindings — used verbatim
         whenever `worker_repo_root_for` is not supplied (every direct
@@ -3347,6 +3354,16 @@ class ImplementExecutor:
         # so a negative reads as zero rather than as "unbounded" — the bound is
         # the whole point (see `ADVISORY_ZERO_CALL_RETURNS`).
         self._advisory_zero_call_returns = advisory_zero_call_returns
+        # WHICH tests the authoritative run below executes, in the two values
+        # `[audit] test_selection` accepts. A tuning value, not an authority —
+        # so it defaults to production's default (`"reachable"`) the way
+        # `advisory_max_calls` defaults to its constant, rather than to a third
+        # "unwired" state the selector does not model. `cli._build_executor`
+        # passes `config.audit.test_selection`, which is the operator's lever and
+        # is validated by `load_config` against `TEST_SELECTION_MODES`; an
+        # unrecognised value reaching here widens (see
+        # `select_validation_commands`), which is the safe direction.
+        self._test_selection = test_selection
 
     # ---- TaskExecutor -------------------------------------------------------
 
@@ -3682,6 +3699,86 @@ class ImplementExecutor:
         never going to use.
         """
         return tuple(task.validation) or self._validation_commands
+
+    def _select_validation(
+        self,
+        task: Task,
+        commands: tuple[tuple[str, ...], ...],
+        changed: Sequence[str],
+        repo_root: Path,
+    ) -> TestSelection:
+        """WHICH tests this round's AUTHORITATIVE run executes, and why.
+
+        The same decision `orchestrator._run_post_commit_validation` makes after
+        the commit, made here from this phase's own inputs: `changed` is
+        `git.dirty_paths_all()` — git's account of the worker tree, never the
+        agent's word — and `repo_root` is the worker repo the commands are about
+        to run against. `select_validation_commands` is phase-agnostic (see its
+        module docstring), so both ends run the same model over the same shape of
+        input and neither knows about the other.
+
+        `commands` is passed IN rather than recomputed: it is
+        `_validation_commands_for(task)`, the one resolution of
+        `tuple(task.validation) or self._validation_commands` this round makes,
+        and selection is applied strictly downstream of it. That is what keeps
+        constraint 3 true by construction — this method cannot change WHICH list
+        is used, only which of its pytest commands' paths are narrowed.
+
+        BOTH refusal rules the post-commit site honours are honoured here, for
+        the same reasons and in the same order:
+
+        * **A task that declared its own `validation` is never narrowed.** That
+          list exists because the default does not cover the change, so it is
+          taken literally — and it is the per-task way to demand a full run.
+          Read through `task.validation or ()`, so a hand-built `Task` carrying
+          `validation=None` refuses narrowing rather than raising (the record
+          `_advisory_for` already guards against).
+        * **A declared `validation_cwd` is never narrowed.** Selection resolves
+          repo-relative changed paths against the repo root; a command running
+          from a subdirectory takes its paths relative to THAT directory and the
+          two would not line up. The backend suite is exactly this case.
+
+        Never raises. A selector that failed here would throw away a round whose
+        agent has already done its work, so any unexpected failure falls back to
+        the configured commands — every command runs, exactly as before this
+        change — and NAMES the failure in the evidence rather than reporting
+        nothing. That is the same direction every widening rule inside the
+        selector takes: widen, and say why.
+        """
+        declared = tuple(task.validation or ())
+        full_reason = ""
+        if declared:
+            full_reason = (
+                "this task declares its own validation commands, which are run "
+                "exactly as declared and never narrowed"
+            )
+        if task.validation_cwd:
+            full_reason = (
+                f"validation runs from {task.validation_cwd!r}, not the repo "
+                "root, so repo-relative reachability does not apply"
+            )
+        try:
+            return select_validation_commands(
+                commands,
+                tuple(changed),
+                repo_root,
+                mode=self._test_selection,
+                full_reason=full_reason,
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            return TestSelection(
+                commands=commands,
+                widened=True,
+                reason=(
+                    "the selector itself failed "
+                    f"({type(exc).__name__}: {str(exc).strip() or '(no detail)'})"
+                ),
+                considered=tuple(sorted(changed)),
+                # Reported even for a list with no pytest command in it: this
+                # branch means the DECISION could not be made, which a reviewer
+                # is owed whether or not there was a test command to narrow.
+                applicable=True,
+            )
 
     @staticmethod
     def _validation_cwd_for(task: Task, git: GitGateway) -> Path:
@@ -4260,22 +4357,51 @@ class ImplementExecutor:
                 changed_paths=tuple(changed),
             )
 
+        # WHICH TESTS THE RUN BELOW EXECUTES (val-04, 2026-08-27). Decided from
+        # `changed` — the same `git.dirty_paths_all()` read the outcome carries —
+        # and the worker repo root, which is deliberately NOT `validation_cwd`:
+        # selection resolves repo-relative paths against the repo root, and a
+        # declared `validation_cwd` refuses narrowing outright rather than
+        # resolving against a subdirectory. `commands` is passed in, never
+        # recomputed, so the list this round validates with is still the ONE
+        # resolution `_validation_commands_for` made.
+        #
+        # Until this change only the POST-COMMIT re-run narrowed, and the full
+        # run here was the independent backstop underneath it. It is not one any
+        # more: a full-suite run is no longer guaranteed at either phase, and a
+        # round that narrows at both has none at all — the fact
+        # `validation.PRECOMMIT_EVIDENCE` now states outright rather than implies.
+        selection = self._select_validation(task, commands, changed, git.repo_root)
         # THE AUTHORITATIVE RUN. Independent of every advisory RESULT above it:
-        # it runs the full configured list and is the only thing that sets
-        # `validation` and decides the status. A green advisory run does not skip
-        # it, shorten it or stand in for it — the agent's runs are evidence for
-        # the AGENT, and this one is evidence for the reviewer. The only things
-        # that can keep it from running are the branches above that already
-        # decided this round produces NO candidate (a failed agent, an unreadable
-        # repo, no files changed, a missing validation directory, and — since the
-        # advis-01 revision — a withheld round); none of them is an advisory
-        # verdict, and none of them lets the round be reviewed.
+        # it runs the selected list and is the only thing that sets `validation`
+        # and decides the status. A green advisory run does not skip it, shorten
+        # it or stand in for it — the agent's runs are evidence for the AGENT,
+        # and this one is evidence for the reviewer. (The agent's advisory runs
+        # are NOT narrowed: `_advisory_for` binds them before the agent has
+        # written anything, so there is no changed-path set to select from, which
+        # leaves them a SUPERSET of this run — the safe direction.) The only
+        # things that can keep this from running are the branches above that
+        # already decided this round produces NO candidate (a failed agent, an
+        # unreadable repo, no files changed, a missing validation directory, and
+        # — since the advis-01 revision — a withheld round); none of them is an
+        # advisory verdict, and none of them lets the round be reviewed.
         passed, validation_summary = run_validation_commands(
-            commands,
+            selection.commands,
             validation_cwd,
             command_runner=self._command_runner,
             validation_env=self._validation_env,
         )
+        # APPENDED HERE, before the abort check and before the failure branch, so
+        # every exit below carries it: an aborted round, a failed round and a
+        # green round each report what this run actually executed. A narrowed run
+        # that cannot say it narrowed is the evidence gap that gets a packet
+        # refused. A configured list with no pytest command in it appends
+        # nothing, exactly as at the post-commit site — no decision was made, so
+        # there is nothing to report, and a ruff-only deployment's summary is
+        # byte-identical to what it was.
+        evidence = selection.evidence()
+        if evidence:
+            validation_summary = f"{validation_summary}; {evidence}"
         if abort_in_effect(self._abort_file, self._abort_ledger):
             # THE SECOND HALF OF THE ABORT-THEN-RESUME RACE (abort-01 revision,
             # 2026-08-26), and the one the earlier round left open. The check at

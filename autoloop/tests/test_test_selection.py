@@ -31,16 +31,22 @@ is the one that matters — no test that names a tracker is ever skipped on a
 tracker change — and it is asserted against the REAL repository over the whole
 population, not against a fixture that would only prove the fixture.
 
-A third block, at the bottom, pins the PHASE this round reached. A loop round
-validates twice — once inside `ImplementExecutor` before the commit, once
-against the committed worktree — and only the second is narrowed here, because
-the first one's call site is outside this task's approved paths. That is
-asserted rather than described, so the sentence the review packet carries about
-it (`validation.PRECOMMIT_EVIDENCE`) cannot quietly go stale.
+A third block, at the bottom, pins BOTH PHASES. A loop round validates twice —
+once inside `ImplementExecutor` before the commit, once against the committed
+worktree — and since val-04 (2026-08-27) both are narrowed by this same
+selector. The block asserts that against a real executor over a real git worker
+repo: the authoritative pre-commit run narrows, both refusal rules still refuse,
+the operator's one setting reaches both ends, a failing narrowed run still
+throws the round away while saying what it ran, and the two phases execute the
+SAME argv for the same change. It also pins the consequence the review packet
+now states (`validation.PRECOMMIT_EVIDENCE`): a narrowed round runs no full
+suite at either phase, so the sentence claiming the subset was ADDED to a
+full-suite run cannot quietly come back.
 """
 
 from __future__ import annotations
 
+from inspect import signature
 from pathlib import Path
 
 import pytest
@@ -1198,37 +1204,47 @@ def test_a_task_declaring_the_configured_default_still_runs_it_in_full(tmp_path,
     assert not any(any("test_smoke" in token for token in argv) for argv in ran)
 
 
-# ---- the pre-commit phase: what this task could NOT reach --------------------
+# ---- the pre-commit phase: the round's own authoritative run -----------------
 
 
-def test_the_pre_commit_run_is_not_narrowed_today(tmp_path):
-    """SCOPE BLOCKER, pinned rather than described.
+def precommit_round(
+    tmp_path,
+    *,
+    commands=(RUFF, SUITE),
+    task=None,
+    fails_on=None,
+    **kwargs,
+):
+    """One REAL `ImplementExecutor` round over a REAL git worker repo.
 
-    `ImplementExecutor` runs the configured commands once BEFORE the commit
-    (`implement_executor.py`, the `run_validation_commands` call after it reads
-    `changed = sorted(git.dirty_paths_all())`). That file is outside val-02's
-    approved paths and its only constructor — `cli.py`'s `ImplementExecutor(...)`,
-    which would have to thread `config.audit.test_selection` through — is too,
-    so this round narrowed the post-commit re-run only.
+    Returns `(outcome, ran, worker)` — the round's outcome, every argv the
+    validation runner was handed in order, and the worker repo the round ran
+    against (so a second phase can be pointed at the same tree).
 
-    Two assertions, and the pair is the point:
+    Real on purpose, at both ends. The claim these tests carry is about the
+    executor's own call site, so a fake executor would prove a fake; and
+    selection reads an import graph off the filesystem, so a fake tree would
+    prove a fake graph. `fails_on`, when given, is a TOKEN — a command whose argv
+    contains it exits 1, which is how the failing-run cases pick out exactly the
+    narrowed command.
 
-    * the executor really does still run the whole configured tree, so
-      `validation.PRECOMMIT_EVIDENCE`'s claim in the review packet is true;
-    * the selector, handed exactly the two values already in scope at that call
-      site, narrows them — so nothing about the mechanism is missing and the
-      outstanding work is authorization, not design.
-
-    When the call site is narrowed, the first assertion fails. That is the
-    intended alarm: `PRECOMMIT_EVIDENCE` must be rewritten in the same change.
+    `advisory_zero_call_returns=0`: since advis-01 (2026-08-26) a round whose
+    agent never uses the advisory channel is handed back once and then WITHHELD
+    from review, and a withheld round never reaches the validation run these
+    tests measure. `FakeAgentRunner` cannot ask, so that contract is pinned off
+    here and graded in `test_agent_self_validation.py` §10a.
     """
     main = git_scaffold(tmp_path / "main", "main")
     worker = git_scaffold(tmp_path / "worker", "autoloop/sel-2")
     ran: list[tuple[str, ...]] = []
 
-    def recorder(argv, **kwargs):
+    def recorder(argv, **kw):
         ran.append(tuple(argv))
-        return _Completed(list(argv))
+        proc = _Completed(list(argv))
+        if fails_on is not None and fails_on in tuple(argv):
+            proc.returncode = 1
+            proc.stdout = "FAILED suite/test_smoke.py::test_publish\n1 failed"
+        return proc
 
     policy = PolicyEngine(PolicyConfig())
     executor = ImplementExecutor(
@@ -1236,44 +1252,216 @@ def test_the_pre_commit_run_is_not_narrowed_today(tmp_path):
         # Standalone binding, never reached: `worker_repo_root_for` + `policy`
         # win, exactly as in production.
         agent_runner=FakeAgentRunner(),
-        validation_commands=(RUFF, SUITE),
+        validation_commands=commands,
         command_runner=recorder,
         worker_repo_root_for=lambda task_id: worker,
         policy=policy,
         agent_runner_factory=make_agent_runner_factory(
             write_files={"pkg/publisher.py": "def publish():\n    return 2\n"}
         ),
-        # Since advis-01 (2026-08-26) a round whose agent never uses the advisory
-        # channel is handed back once and then WITHHELD from review — and a
-        # withheld round never reaches the pre-commit validation run this test
-        # measures. `FakeAgentRunner` cannot ask, so the contract is pinned off
-        # here and graded in `test_agent_self_validation.py` §10a.
         advisory_zero_call_returns=0,
+        **kwargs,
     )
 
     outcome = executor.execute(
         implement_directive(task_id="sel-2"),
-        Task(id="sel-2", title="publisher", description="change the publisher"),
+        task or Task(id="sel-2", title="publisher", description="change the publisher"),
     )
+    return outcome, ran, worker
+
+
+def test_the_pre_commit_run_is_narrowed_too(tmp_path):
+    """THE CLAIM (val-04, 2026-08-27), and the test that used to assert its
+    opposite.
+
+    `ImplementExecutor` runs the configured commands once BEFORE the commit —
+    the authoritative run, the one that sets `validation` and decides the
+    round's status. Until this change it executed every configured command in
+    full while the cheap post-commit re-run narrowed, which is the wrong way
+    round: the expensive run paid full price.
+
+    Three assertions, and the third is the one constraint 4 is about:
+
+    * the reachable test really runs, so the change is still exercised;
+    * the whole tree does NOT, so the round is actually cheaper;
+    * the round's own `validation` string SAYS it narrowed and what to. A
+      narrowed run that cannot say so is the evidence gap that gets a packet
+      refused.
+    """
+    outcome, ran, _worker = precommit_round(tmp_path)
 
     assert outcome.status == "ok"
     assert outcome.changed_paths == ("pkg/publisher.py",)
-    assert any("suite" in argv for argv in ran), "the whole tree still runs pre-commit"
+    assert any("suite/test_smoke.py" in argv for argv in ran), "the reachable test ran"
+    assert any("suite/test_orchestra.py" in argv for argv in ran), "transitively too"
+    assert not any("suite" in argv for argv in ran), "the whole tree did not run"
+    assert not any("suite/test_unrelated.py" in argv for argv in ran)
+    assert any(argv[0] == "ruff" for argv in ran), "the non-test command is untouched"
+
+    assert "test selection: SUBSET" in outcome.validation
+    assert "suite/test_smoke.py" in outcome.validation
+
+
+def test_the_pre_commit_evidence_no_longer_claims_a_full_run(tmp_path):
+    """The sentence that had to change in the same commit.
+
+    `PRECOMMIT_EVIDENCE` told the reviewer the recorded subset was ADDED to a
+    full-suite run of the same tree. Narrowing this call site makes that false:
+    a full-suite run is no longer guaranteed at either phase, and a round that
+    narrowed at both has none at all. A reviewer reading the old guarantee would
+    be reading one that no longer holds.
+    """
+    outcome, _ran, _worker = precommit_round(tmp_path)
+
+    # Both directions on purpose. The negative alone would still pass if the old
+    # sentence were reintroduced ALONGSIDE the new one in a different casing, and
+    # the positive alone would still pass if it were reintroduced beside it.
+    assert "ADDED to a full-suite run" not in outcome.validation
+    assert "NOT a subset added to a full-suite run" in outcome.validation
+    assert "BOTH runs of this round" in outcome.validation
+    assert "no full-suite run is guaranteed at either phase" in outcome.validation
+
+
+def test_a_task_declaring_its_own_validation_is_never_narrowed_pre_commit(tmp_path):
+    """The first refusal rule, and the per-task way to demand a full run.
+
+    Also pins constraint 3 from the other side: the declared list is what runs,
+    so the configured `ruff` never launches. Both phases resolve
+    `tuple(task.validation) or <configured>` and selection is applied strictly
+    downstream of that one resolution.
+    """
+    task = Task(
+        id="sel-2",
+        title="publisher",
+        description="change the publisher",
+        validation=(SUITE,),
+    )
+    outcome, ran, _worker = precommit_round(tmp_path, commands=(RUFF,), task=task)
+
+    assert "test selection: FULL SUITE" in outcome.validation
+    assert "declares its own validation" in outcome.validation
+    assert any("suite" in argv for argv in ran), "the whole declared tree ran"
+    assert not any(any("test_smoke" in token for token in argv) for argv in ran)
+    assert not any(argv[0] == "ruff" for argv in ran), "the configured list lost"
+
+
+def test_a_record_with_no_validation_tuple_refuses_to_raise(tmp_path):
+    """`Task.validation = None` — the malformed record `_advisory_for` already
+    guards against — must not reach the selector as a crash.
+
+    It is read through `or ()`, so it means "declared nothing" and the round
+    narrows normally. Asserted on `_select_validation` directly because the
+    round would die earlier, in `_validation_commands_for`'s own unguarded
+    `tuple(task.validation)`; that is pre-existing behaviour this change
+    deliberately does not paper over, and this test says which of the two reads
+    is guarded.
+    """
+    worker = git_scaffold(tmp_path / "worker", "autoloop/sel-3")
+    policy = PolicyEngine(PolicyConfig())
+    executor = ImplementExecutor(
+        git=GitGateway(worker, policy),
+        agent_runner=FakeAgentRunner(),
+        validation_commands=(RUFF, SUITE),
+    )
+    task = Task(id="sel-3", title="t", description="d")
+    task.validation = None
+
+    chosen = executor._select_validation(task, (RUFF, SUITE), ["pkg/publisher.py"], worker)
+
+    assert not chosen.widened
+    assert "suite/test_smoke.py" in chosen.selected
+
+
+def test_a_declared_validation_cwd_is_never_narrowed_pre_commit(tmp_path):
+    """The second refusal rule. Selection resolves repo-relative paths against
+    the repo root; a command running from a subdirectory takes its paths
+    relative to THAT directory, and the two would not line up."""
+    task = Task(
+        id="sel-2",
+        title="publisher",
+        description="change the publisher",
+        validation_cwd="suite",
+    )
+    outcome, ran, _worker = precommit_round(tmp_path, task=task)
+
+    assert "test selection: FULL SUITE" in outcome.validation
+    assert "not the repo" in outcome.validation
+    assert any("suite" in argv for argv in ran), "the command ran as configured"
+
+
+def test_the_operator_full_switch_is_honoured_at_the_pre_commit_phase(tmp_path):
+    """`[audit] test_selection = "full"` is what the evidence tells a reviewer
+    restores the pre-2026-08-20 behaviour. That is only true if BOTH phases read
+    it, which is why `cli._build_executor` threads it here."""
+    outcome, ran, _worker = precommit_round(tmp_path, test_selection=TEST_SELECTION_FULL)
+
+    assert "test selection: FULL SUITE" in outcome.validation
+    assert 'test_selection = "full"' in outcome.validation
+    assert any("suite" in argv for argv in ran)
     assert not any(any("test_smoke" in token for token in argv) for argv in ran)
 
-    would = select_validation_commands((RUFF, SUITE), outcome.changed_paths, worker)
-    assert not would.widened, "the selector needs no change to serve this phase"
-    assert "suite/test_smoke.py" in would.selected
-    assert "suite/test_unrelated.py" not in would.selected
+
+def test_a_failing_selected_command_still_fails_the_round_and_says_what_it_ran(tmp_path):
+    """Constraint 4, on the path that matters most: the run stays authoritative.
+
+    A narrowed run that fails throws the round away exactly as a full one did,
+    and the summary a reviewer reads carries BOTH the failure and the selection
+    — otherwise a red narrowed run looks like a red full run and nobody can tell
+    what was actually executed.
+    """
+    outcome, ran, _worker = precommit_round(tmp_path, fails_on="suite/test_smoke.py")
+
+    assert outcome.status == "error"
+    assert "validation failed after implementation" in outcome.summary
+    assert "FAIL" in outcome.validation
+    assert "test selection: SUBSET" in outcome.validation
+    assert any("suite/test_smoke.py" in argv for argv in ran)
 
 
-def test_the_evidence_names_the_unnarrowed_pre_commit_run_and_how_to_widen(repo):
+def test_both_phases_run_the_same_commands_for_the_same_change(tmp_path):
+    """The two ends agree BY CONSTRUCTION, and this is what that buys.
+
+    Same command list (`tuple(task.validation) or <configured>` at both ends),
+    same selector, same tree, same changed paths — so the argv the executor ran
+    before the commit is the argv the orchestrator re-runs after it. A drift
+    between the two would mean the reviewed commit was graded by a different
+    suite from the one that produced it.
+    """
+    outcome, pre_ran, worker = precommit_round(tmp_path)
+    orch, execution, post_ran = postcommit_orchestrator(tmp_path, worker, (RUFF, SUITE))
+
+    ok, summary = orch._run_post_commit_validation(execution, outcome.changed_paths)
+
+    assert ok
+    assert pre_ran == post_ran, "the two phases executed different commands"
+    assert "test selection: SUBSET" in summary
+
+
+def test_the_operator_setting_is_wired_into_the_production_executor():
+    """Structural, and it carries what no behavioural test here can: production
+    gets this because `cli._build_executor` — the ONE place a write-capable
+    executor is constructed from configuration — passes the operator's setting,
+    and because the constructor's own default is production's default rather
+    than a third "unwired" state the selector does not model."""
+    source = (Path(__file__).resolve().parents[1] / "cli.py").read_text(encoding="utf-8")
+    build = source.split("def _build_executor(")[1].split("\ndef ")[0]
+
+    assert "test_selection=config.audit.test_selection" in build
+    assert (
+        signature(ImplementExecutor).parameters["test_selection"].default
+        == TEST_SELECTION_REACHABLE
+    )
+
+
+def test_the_evidence_names_both_narrowed_phases_and_how_to_widen(repo):
     """What stops a narrowed packet reading as LESS evidence than the round
-    before it: the reviewer is told a full run of the same tree also happened,
-    and told two ways to demand one outright."""
+    before it. It no longer claims a full run happened alongside — it says
+    outright that none is guaranteed at either phase — and it still names two
+    ways to demand one."""
     evidence = selection(repo, ["pkg/publisher.py"]).evidence()
 
     assert "PRE-COMMIT" in evidence
-    assert "ADDED to a full-suite run" in evidence
+    assert "NOT a subset added to a full-suite run" in evidence
+    assert "no full-suite run is guaranteed at either phase" in evidence
     assert 'test_selection = "full"' in evidence, "the global lever"
     assert "task-add --validation" in evidence, "the per-task lever"

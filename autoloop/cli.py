@@ -520,6 +520,14 @@ def _build_executor(
         # there is no separate `[implement]` config section (kept minimal;
         # add one if the two ever need to diverge).
         validation_commands=config.audit.validation_commands,
+        # And the same selection mode the post-commit re-run reads
+        # (`orchestrator._run_post_commit_validation` takes it off
+        # `self._config.audit.test_selection`). ONE operator setting, read by
+        # both phases of a round, so `[audit] test_selection = "full"` really
+        # does restore the pre-2026-08-20 behaviour everywhere rather than at
+        # one end of the round only — which is what `validation.evidence()`
+        # tells the reviewer that lever does.
+        test_selection=config.audit.test_selection,
         # ONLY the implement executor gets the credentials — the audit
         # executor above deliberately does not (read-only agents, no writer,
         # no reason for a database).
