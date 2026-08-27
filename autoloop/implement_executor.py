@@ -979,20 +979,34 @@ def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> 
     somehow sends a payload anyway is handled by `serve_advisory_tool_call`,
     which discards it unread — the schema states the rule, the handler does not
     depend on the rule being honoured.
+
+    **What it says about the executor's own run is a ⊇, not a ⊂** (val-04
+    revision, 2026-08-27). The first draft told the agent that run "is NARROWED
+    … so it is a subset of what runs here", which is false whenever selection
+    WIDENS — `[audit] test_selection = "full"`, a task-declared `validation` or
+    `validation_cwd`, a changed `.py` path absent from the import graph (a
+    deletion), a pytest command that cannot be retargeted, a selection of zero
+    test files, or the selector raising. In every one of those the authoritative
+    run takes the same resolved list this one takes, so the two are EQUAL rather
+    than the advisory being strictly larger. The sentence below therefore states
+    the relation that holds in both cases — never wider, MAY be narrower — which
+    is still enough for the only inference the agent draws from it: a green
+    answer here covers the verdict run rather than having to reproduce it.
     """
     return {
         "name": ADVISORY_TOOL_NAME,
         "description": (
             "Run this repository's configured validation (lint/tests) against "
-            "your own worker repo — every configured command, in full. It "
-            "takes NO arguments: the commands, the working "
+            "your own worker repo — every command this round validates with, "
+            "in full. It takes NO arguments: the commands, the working "
             "directory and the environment are fixed by the executor, and "
             "nothing you supply can change any of them. The result comes back "
             "to you as text. This run is ADVISORY — the executor runs "
             "validation itself afterwards and that run is the verdict. That "
-            "run is NARROWED to the tests your changed paths reach, so it is a "
-            "subset of what runs here: a green answer covers it rather than "
-            "reproducing it. At most "
+            "run is never WIDER than this one: it MAY be narrowed to the tests "
+            "your changed paths reach, and when it cannot narrow it runs this "
+            "same list in full. Either way a green answer here covers it "
+            "rather than reproducing it. At most "
             f"{max_calls} run(s) per round; past that the request executes "
             f"nothing and says {NOT_RUN}, which is not a pass."
         ),
@@ -1017,14 +1031,30 @@ class AdvisoryValidation:
     consulted by, shortens, or stands in for the executor's own call, which
     happens unconditionally after the agent returns.
 
-    Since val-04 (2026-08-27) they are not the same ARGV, and the asymmetry is
-    deliberate and one-directional. The executor's own run narrows that list
-    through `validation.select_validation_commands`; this one is bound before
-    the agent has written anything, so there is no changed-path set to select
-    from and it runs the list whole. An advisory run is therefore a SUPERSET of
-    the run that grades the round — the agent proving green over more than the
-    executor will execute. The reverse would be the fail-open: an agent shown a
-    narrower run than the verdict's.
+    Since val-04 (2026-08-27) they may not be the same ARGV, and the asymmetry
+    is deliberate and one-directional. This run is bound before the agent has
+    written anything, so there is no changed-path set to select from and it
+    always runs the resolved list WHOLE. The executor's own run puts that same
+    list through `validation.select_validation_commands`, which either narrows
+    it to the tests this round's changed paths reach or hands it back unchanged
+    — every widening rule returns the configured commands verbatim (see
+    `_select_validation`: declared `validation`, declared `validation_cwd`,
+    `test_selection = "full"`, a deleted module, an unretargetable command, a
+    selector that raised).
+
+    So the relation is ⊇, not ⊂: an advisory run is never NARROWER than the run
+    that grades the round, and is strictly larger only when that run narrowed.
+    The agent proving green over at least what the executor will execute is the
+    safe direction; the reverse would be the fail-open — an agent shown a
+    narrower run than the verdict's. `advisory_tool_descriptor` states it in
+    that conditional form, because "the executor's run is narrowed" is false on
+    every widened round.
+
+    The ONE case where this run is smaller is the malformed record `_advisory_for`
+    guards below: `commands` falls back to `()`, and an empty list answers
+    `NOT_RUN` rather than green — so the agent is never told a run covered
+    anything. The authoritative run meets that same record unguarded and does not
+    happen at all, which is why the relation is not violated by it.
 
     **The agent supplies nothing.** `run()` takes no parameter, so there is no
     channel through which a command, a path, a flag or an environment value
@@ -4390,8 +4420,10 @@ class ImplementExecutor:
         # it or stand in for it — the agent's runs are evidence for the AGENT,
         # and this one is evidence for the reviewer. (The agent's advisory runs
         # are NOT narrowed: `_advisory_for` binds them before the agent has
-        # written anything, so there is no changed-path set to select from, which
-        # leaves them a SUPERSET of this run — the safe direction.) The only
+        # written anything, so there is no changed-path set to select from. This
+        # run is therefore never WIDER than one of those — equal on a widened
+        # round, a strict subset on a narrowed one — which is the safe
+        # direction.) The only
         # things that can keep this from running are the branches above that
         # already decided this round produces NO candidate (a failed agent, an
         # unreadable repo, no files changed, a missing validation directory, and

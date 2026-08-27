@@ -44,7 +44,10 @@ suite at either phase, so the sentence claiming the subset was ADDED to a
 full-suite run cannot quietly come back. One test in that block is about the
 INPUT rather than the decision — a round that DELETES a module must hand the
 selector a changed-path set containing it, or the widening that deletion is
-owed never fires and the run narrows blind.
+owed never fires and the run narrows blind. A last one is about what the AGENT
+is told: the authoritative run is never WIDER than the agent's own advisory run
+of the same round, which is the containment `advisory_tool_descriptor` promises
+and the only reason a green advisory answer covers the verdict run.
 """
 
 from __future__ import annotations
@@ -1230,20 +1233,24 @@ class _WritingDeletingAgent(FakeAgentRunner):
         return result
 
 
-def precommit_round(
+def precommit_executor(
     tmp_path,
     *,
     commands=(RUFF, SUITE),
-    task=None,
     fails_on=None,
     deletes=(),
     **kwargs,
 ):
-    """One REAL `ImplementExecutor` round over a REAL git worker repo.
+    """A REAL `ImplementExecutor` over a REAL git worker repo, not yet run.
 
-    Returns `(outcome, ran, worker)` — the round's outcome, every argv the
-    validation runner was handed in order, and the worker repo the round ran
-    against (so a second phase can be pointed at the same tree).
+    Returns `(executor, worker, ran)` — the executor, the worker repo it will
+    run in, and the list every argv the validation runner is handed is appended
+    to, in order.
+
+    Split out of `precommit_round` so a test can hold the executor itself: the
+    ⊇ relation between the authoritative run and an advisory one is a statement
+    about two runs of the SAME executor, and `_advisory_for` is reachable only
+    from the object.
 
     Real on purpose, at both ends. The claim these tests carry is about the
     executor's own call site, so a fake executor would prove a fake; and
@@ -1289,7 +1296,17 @@ def precommit_round(
         advisory_zero_call_returns=0,
         **kwargs,
     )
+    return executor, worker, ran
 
+
+def precommit_round(tmp_path, *, task=None, **kwargs):
+    """One REAL `ImplementExecutor` round, executed.
+
+    Returns `(outcome, ran, worker)` — the round's outcome, every argv the
+    validation runner was handed in order, and the worker repo the round ran
+    against (so a second phase can be pointed at the same tree).
+    """
+    executor, worker, ran = precommit_executor(tmp_path, **kwargs)
     outcome = executor.execute(
         implement_directive(task_id="sel-2"),
         task or Task(id="sel-2", title="publisher", description="change the publisher"),
@@ -1501,6 +1518,57 @@ def test_both_phases_run_the_same_commands_for_the_same_change(tmp_path):
     assert ok
     assert pre_ran == post_ran, "the two phases executed different commands"
     assert "test selection: SUBSET" in summary
+
+
+def test_the_authoritative_run_is_never_wider_than_an_advisory_one(tmp_path):
+    """The relation the agent is TOLD, driven through a real round.
+
+    `advisory_tool_descriptor` promises the agent that the executor's own run is
+    never WIDER than an advisory one and MAY be narrower. That is the whole
+    reason a green advisory answer is worth anything: it covers the verdict run
+    rather than having to reproduce it. This drives the NARROWED half — the one
+    where the two genuinely differ — and pins the containment rather than the
+    two strings being equal.
+
+    The widened half is the easy one and is pinned elsewhere: every widening rule
+    hands the resolved list back verbatim, so the two runs launch identical argv
+    (`test_agent_self_validation.py::test_the_advisory_run_and_the_executors_own
+    _run_launch_the_same_thing`, whose task declares both `validation` and
+    `validation_cwd`).
+    """
+    executor, worker, ran = precommit_executor(tmp_path)
+    task = Task(id="sel-2", title="publisher", description="change the publisher")
+
+    outcome = executor.execute(implement_directive(task_id="sel-2"), task)
+    authoritative = tuple(ran)
+    ran.clear()
+    # The same executor's own binding, built exactly as the round built it —
+    # never a second description of "what this round validates with".
+    executor._advisory_for(task, GitGateway(worker, PolicyEngine(PolicyConfig()))).run()
+    advisory = tuple(ran)
+
+    assert outcome.status == "ok"
+    assert "test selection: SUBSET" in outcome.validation, "this round narrowed"
+
+    # The advisory run took the resolved list WHOLE: the configured pytest
+    # command verbatim, whole-tree path and all.
+    assert SUITE in advisory
+    assert RUFF in advisory
+    # The authoritative run did not — and every path it DID target lives under
+    # the path the advisory command ran, which is what "never wider" means for a
+    # pytest command.
+    assert SUITE not in authoritative
+    assert RUFF in authoritative, "a non-pytest command is untouched at both ends"
+    targeted = [
+        token
+        for argv in authoritative
+        if argv[0] != "ruff"
+        for token in argv
+        if token.endswith(".py")
+    ]
+    assert targeted, "the narrowed command really named test files"
+    assert all(token.startswith("suite/") for token in targeted)
+    assert authoritative != advisory, "the narrowed round is a STRICT subset"
 
 
 def test_the_operator_setting_is_wired_into_the_production_executor():
